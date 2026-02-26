@@ -1,194 +1,365 @@
-import uuid  # для генерации UUID (id пользователя) прямо в бэкенде
+# /Users/maftunamurtazaeva/Desktop/vzaimno_backend/app/main.py
+from __future__ import annotations
 
-# FastAPI: основной класс приложения + типовые инструменты
-from fastapi import FastAPI, HTTPException, Depends
+import json
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
 
-# HTTPBearer — стандартный способ принять заголовок Authorization: Bearer <token>
-# HTTPAuthorizationCredentials — объект, в котором хранится токен
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-# CORS нужен, чтобы iOS/браузер могли делать запросы на сервер без блокировки
-from fastapi.middleware.cors import CORSMiddleware
-
-from app import db  # наш модуль для работы с БД (fetch_one/fetch_all/execute)
-from app.schemas import RegisterIn, LoginIn, TokenOut, UserOut  # pydantic-схемы входа/выхода
-from app.security import hash_password, verify_password, create_access_token, decode_token  # пароль + JWT
-
-
-# Создаём FastAPI приложение.
-# title отображается в /docs (Swagger UI)
-app = FastAPI(title="iCuno Backend (MVP)")
-
-
-# Подключаем middleware CORS.
-# Это важно если запросы приходят не "с этого же домена" (на iOS, в браузере, с другого порта и т.д.)
-# Пока allow_origins=["*"] — разрешаем всем.
-# В проде так нельзя: нужно указать конкретные домены/адреса приложения.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],          # разрешить запросы от любых источников (на старте удобно)
-    allow_credentials=True,       # разрешить отправку cookies/authorization заголовков
-    allow_methods=["*"],          # разрешить любые HTTP методы (GET/POST/PUT/DELETE)
-    allow_headers=["*"],          # разрешить любые заголовки (включая Authorization)
+from app.db import execute, fetch_all, fetch_one
+from app.geocoding import geocode_address
+from app.schemas import (
+    AnnouncementOut,
+    CreateAnnouncementIn,
+    LoginIn,
+    RegisterIn,
+    TokenOut,
+    UserOut,
 )
+from app.security import create_access_token, decode_token, hash_password, verify_password
 
-# Создаём "схему авторизации" Bearer.
-# Это НЕ токен, это инструмент FastAPI:
-# он автоматически:
-# 1) вытащит Authorization заголовок,
-# 2) проверит формат "Bearer ....",
-# 3) передаст креды в функцию через Depends()
-auth_scheme = HTTPBearer()
+app = FastAPI(title="Slayma Backend (MVP)")
+bearer = HTTPBearer(auto_error=True)
 
 
-# ----------------- ТЕСТОВЫЕ ЭНДПОИНТЫ -----------------
-
-# @app.get(...) — декоратор: говорит FastAPI "эта функция обслуживает GET /health"
-@app.get("/health")
-def health():
-    # Просто отдаём JSON, чтобы проверить что сервер жив
-    return {"status": "ok"}
-
-
-@app.get("/db/ping")
-def db_ping():
-    # Проверяем, что БД доступна:
-    # SELECT now() возвращает текущее время на стороне PostgreSQL
-    row = db.fetch_one("SELECT now()")
-    # row — это кортеж (например (datetime,))
-    return {"db_time": str(row[0])}
-
-
-@app.get("/db/postgis")
-def db_postgis():
-    # Проверяем PostGIS.
-    # Если расширение не установлено — здесь будет ошибка (это норм для диагностики)
-    row = db.fetch_one("SELECT PostGIS_Version()")
-    return {"postgis_version": row[0]}
-
-
-# ----------------- JWT DEPENDENCY (ключевая часть) -----------------
-
-# Это "зависимость" (dependency).
-# Она будет вызываться автоматически, если ты в Depends() укажешь get_current_user.
-#
-# Что делает:
-# 1) достаёт JWT из Authorization: Bearer <token>
-# 2) декодирует и проверяет токен (exp, подпись)
-# 3) вытаскивает user_id из payload['sub']
-# 4) идёт в БД и получает пользователя
-# 5) возвращает объект UserOut (id, email, role)
-#
-# Если что-то не так — кидает HTTPException(401) и запрос не продолжается.
-def get_current_user(
-    creds: HTTPAuthorizationCredentials = Depends(auth_scheme)  # автоматически извлекаем Bearer-токен
-) -> UserOut:
-    token = creds.credentials  # строка токена (без слова Bearer)
-
-    try:
-        # decode_token проверяет подпись и срок действия (exp)
-        payload = decode_token(token)
-
-        # sub = "subject" — обычно там кладут id пользователя
-        user_id = payload.get("sub")
-
-        # Если sub отсутствует — токен некорректный
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Некорректный токен (нет sub)")
-
-    except Exception:
-        # Любая ошибка декодирования/проверки exp — считаем токен невалидным
-        raise HTTPException(status_code=401, detail="Невалидный или просроченный токен")
-
-    # Если токен валиден — проверяем, что пользователь реально существует в БД
-    row = db.fetch_one(
-        # id::text — приводим UUID к строке, чтобы удобно отдавать в JSON
-        "SELECT id::text, email, role FROM users WHERE id = %s AND deleted_at IS NULL",
-        (user_id,),  # params передаём кортежем, чтобы не было SQL-инъекций
+# ----------------------------
+# DB bootstrap (MVP)
+# ----------------------------
+@app.on_event("startup")
+def ensure_tables() -> None:
+    # users (нужно, потому что /auth/register и /auth/login ссылаются на users)
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        """
     )
 
-    if not row:
-        # Токен может быть "валидный", но пользователь уже удалён/заблокирован
-        raise HTTPException(status_code=401, detail="Пользователь не найден")
+    # announcements
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS announcements (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            data JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            deleted_at TIMESTAMPTZ
+        );
+        """
+    )
 
-    # Собираем pydantic-модель ответа (или внутреннего использования)
+    execute("CREATE INDEX IF NOT EXISTS idx_announcements_user_id ON announcements(user_id);")
+    execute("CREATE INDEX IF NOT EXISTS idx_announcements_created_at ON announcements(created_at DESC);")
+    execute("CREATE INDEX IF NOT EXISTS idx_announcements_status ON announcements(status);")
+
+
+# ----------------------------
+# Auth
+# ----------------------------
+def get_current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> UserOut:
+    token = creds.credentials
+
+    # DEV режим из iOS (AppConfig.authEnabled == false)
+    # if token == "DEV_TOKEN":
+    #     return UserOut(id="dev", email="dev@local", role="user")
+
+    if token == "DEV_TOKEN":
+        return UserOut(id="dev", email="dev@localdomain.com", role="user")
+
+    try:
+        payload = decode_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    row = fetch_one("SELECT id::text, email, role FROM users WHERE id = %s", (user_id,))
+    if not row:
+        raise HTTPException(status_code=401, detail="User not found")
+
     return UserOut(id=row[0], email=row[1], role=row[2])
 
 
-# ----------------- AUTH -----------------
-
-# response_model=UserOut означает:
-# 1) Swagger покажет ответ как UserOut
-# 2) FastAPI приведёт возвращаемые данные к UserOut (валидирует)
-@app.post("/auth/register", response_model=UserOut)
-def register(data: RegisterIn):
-    # Проверяем, есть ли уже пользователь с таким email
-    existing = db.fetch_one("SELECT id FROM users WHERE email = %s", (data.email,))
+@app.post("/auth/register", response_model=TokenOut)
+def register(data: RegisterIn) -> TokenOut:
+    existing = fetch_one("SELECT 1 FROM users WHERE email=%s", (data.email,))
     if existing:
-        # 409 Conflict — логично: конфликт данных (email уже занят)
-        raise HTTPException(status_code=409, detail="Email уже зарегистрирован")
+        raise HTTPException(status_code=400, detail="Email already registered")
 
-    # Генерируем UUID пользователя.
-    # Важно: если в БД id генерируется автоматически — тут будет по-другому.
     user_id = str(uuid.uuid4())
+    pwd_hash = hash_password(data.password)
 
-    # Хэшируем пароль (bcrypt).
-    # Никогда не храним пароль в чистом виде.
-    password_hash = hash_password(data.password)
-
-    # Пишем пользователя в БД.
-    # %s — плейсхолдеры psycopg, params передаются отдельно (защита от SQL-инъекций)
-    db.execute(
-        """
-        INSERT INTO users (id, role, email, password_hash, is_email_verified, is_phone_verified)
-        VALUES (%s, %s, %s, %s, false, false)
-        """,
-        (user_id, "user", data.email, password_hash),
+    execute(
+        "INSERT INTO users (id, email, password_hash, role) VALUES (%s,%s,%s,%s)",
+        (user_id, data.email, pwd_hash, "user"),
     )
 
-    # Отдаём данные нового пользователя (без пароля)
-    return UserOut(id=user_id, email=data.email, role="user")
-
-
-@app.post("/auth/login", response_model=TokenOut)
-def login(data: LoginIn):
-    # Ищем пользователя по email, берём hash пароля
-    row = db.fetch_one(
-        "SELECT id::text, password_hash FROM users WHERE email = %s AND deleted_at IS NULL",
-        (data.email,),
-    )
-    if not row:
-        # Не говорим "email не существует", чтобы не давать атакующим информацию
-        raise HTTPException(status_code=401, detail="Неверный email или пароль")
-
-    user_id, password_hash_db = row[0], row[1]
-
-    # Проверяем пароль: сравниваем введённый пароль с хэшом из БД
-    if not verify_password(data.password, password_hash_db):
-        raise HTTPException(status_code=401, detail="Неверный email или пароль")
-
-    # Создаём JWT (в sub кладём user_id)
-    token = create_access_token(sub=user_id)
-
-    # Возвращаем токен по стандарту "bearer"
+    token = create_access_token({"sub": user_id, "role": "user"})
     return TokenOut(access_token=token)
 
 
-# /me — пример защищённого эндпоинта
-# user получает результат get_current_user автоматически
+@app.post("/auth/login", response_model=TokenOut)
+def login(data: LoginIn) -> TokenOut:
+    row = fetch_one(
+        "SELECT id::text, password_hash, role FROM users WHERE email=%s",
+        (data.email,),
+    )
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    user_id, pwd_hash, role = row
+    if not verify_password(data.password, pwd_hash):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = create_access_token({"sub": user_id, "role": role})
+    return TokenOut(access_token=token)
+
+
 @app.get("/me", response_model=UserOut)
-def me(user: UserOut = Depends(get_current_user)):
+def me(user: UserOut = Depends(get_current_user)) -> UserOut:
     return user
 
 
-# ----------------- DEBUG -----------------
+# ----------------------------
+# Announcements (Ads)
+# ----------------------------
+def _row_to_announcement(row) -> AnnouncementOut:
+    raw_data = row[5]
+    if raw_data is None:
+        data_obj: Dict[str, Any] = {}
+    elif isinstance(raw_data, str):
+        try:
+            data_obj = json.loads(raw_data)
+        except Exception:
+            data_obj = {}
+    else:
+        data_obj = raw_data
 
-@app.get("/debug/tasks")
-def debug_tasks(user: UserOut = Depends(get_current_user)):
-    # Просто проверяем, что доступ к tasks работает
-    rows = db.fetch_all(
-        "SELECT id::text, title FROM tasks ORDER BY created_at DESC LIMIT 5"
+    return AnnouncementOut(
+        id=row[0],
+        user_id=row[1],
+        category=row[2],
+        title=row[3],
+        status=row[4],
+        data=data_obj,
+        created_at=row[6],
     )
 
-    # Преобразуем rows -> список словарей
-    return {"items": [{"id": r[0], "title": r[1]} for r in rows]}
+
+def _extract_primary_address(category: str, data: Dict[str, Any]) -> Optional[str]:
+    """
+    MVP-правило: точку строим по одному адресу.
+    - delivery: pickup_address
+    - help: address
+    """
+    cat = (category or "").strip().lower()
+    if cat == "delivery":
+        return _normalize_address(data.get("pickup_address"))
+    if cat == "help":
+        return _normalize_address(data.get("address"))
+
+    # запасной вариант
+    return _normalize_address(data.get("address"))
+
+
+def _normalize_address(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.strip().split())
+    return normalized or None
+
+
+def _parse_float(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    if isinstance(value, str):
+        raw = value.strip().replace(",", ".")
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    return None
+
+
+def _extract_point(value: Any) -> Optional[Tuple[float, float]]:
+    if not isinstance(value, dict):
+        return None
+
+    lat = _parse_float(value.get("lat"))
+    lon = _parse_float(value.get("lon"))
+    if lat is None or lon is None:
+        return None
+
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+
+    return lat, lon
+
+
+def _point_obj(point: Tuple[float, float]) -> Dict[str, float]:
+    return {"lat": point[0], "lon": point[1]}
+
+
+def _resolve_point(
+    data: Dict[str, Any],
+    preferred_key: str,
+    fallback_key: Optional[str],
+    address: Optional[str],
+) -> Optional[Tuple[float, float]]:
+    # 1) точка уже пришла от клиента в нужном поле
+    point = _extract_point(data.get(preferred_key))
+    if point:
+        return point
+
+    # 2) fallback (например старое поле point)
+    if fallback_key:
+        point = _extract_point(data.get(fallback_key))
+        if point:
+            return point
+
+    # 3) геокодим по адресу
+    if address:
+        return geocode_address(address)
+
+    return None
+
+
+@app.post("/announcements", response_model=AnnouncementOut, status_code=201)
+def create_announcement(
+    payload: CreateAnnouncementIn,
+    user: UserOut = Depends(get_current_user),
+) -> AnnouncementOut:
+    ann_id = str(uuid.uuid4())
+
+    # Берём data как dict и дополняем точками, сохраняя обратную совместимость
+    data: Dict[str, Any] = dict(payload.data or {})
+    category = (payload.category or "").strip().lower()
+
+    if category == "delivery":
+        pickup_address = _normalize_address(data.get("pickup_address"))
+        dropoff_address = _normalize_address(data.get("dropoff_address"))
+
+        if pickup_address:
+            data["pickup_address"] = pickup_address
+        if dropoff_address:
+            data["dropoff_address"] = dropoff_address
+
+        pickup_point = _resolve_point(
+            data=data,
+            preferred_key="pickup_point",
+            fallback_key="point",
+            address=pickup_address,
+        )
+        dropoff_point = _resolve_point(
+            data=data,
+            preferred_key="dropoff_point",
+            fallback_key=None,
+            address=dropoff_address,
+        )
+
+        if pickup_point:
+            # Базовая точка для старых клиентов = pickup
+            data["pickup_point"] = _point_obj(pickup_point)
+            data["point"] = _point_obj(pickup_point)
+            if pickup_address:
+                data["address_text"] = pickup_address
+
+        if dropoff_point:
+            data["dropoff_point"] = _point_obj(dropoff_point)
+
+    elif category == "help":
+        help_address = _normalize_address(data.get("address"))
+        if help_address:
+            data["address"] = help_address
+
+        help_point = _resolve_point(
+            data=data,
+            preferred_key="help_point",
+            fallback_key="point",
+            address=help_address,
+        )
+
+        if help_point:
+            # Базовая точка для старых клиентов = help
+            data["help_point"] = _point_obj(help_point)
+            data["point"] = _point_obj(help_point)
+            if help_address:
+                data["address_text"] = help_address
+
+    else:
+        # Для остальных категорий сохраняем старую логику по одному адресу
+        addr = _extract_primary_address(payload.category, data)
+        point = _resolve_point(data=data, preferred_key="point", fallback_key=None, address=addr)
+        if point:
+            data["point"] = _point_obj(point)
+            if addr:
+                data["address_text"] = addr
+
+    execute(
+        """
+        INSERT INTO announcements (id, user_id, category, title, status, data)
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+        """,
+        (ann_id, user.id, payload.category, payload.title, payload.status, json.dumps(data, ensure_ascii=False)),
+    )
+
+    row = fetch_one(
+        """
+        SELECT id, user_id, category, title, status, data, created_at
+        FROM announcements
+        WHERE id = %s
+        """,
+        (ann_id,),
+    )
+    if not row:
+        raise HTTPException(status_code=500, detail="Failed to create announcement")
+
+    return _row_to_announcement(row)
+
+
+@app.get("/announcements/me", response_model=List[AnnouncementOut])
+def my_announcements(user: UserOut = Depends(get_current_user)) -> List[AnnouncementOut]:
+    rows = fetch_all(
+        """
+        SELECT id, user_id, category, title, status, data, created_at
+        FROM announcements
+        WHERE user_id = %s AND deleted_at IS NULL
+        ORDER BY created_at DESC
+        """,
+        (user.id,),
+    )
+    return [_row_to_announcement(r) for r in rows]
+
+
+# Публичная лента для карты (другие пользователи видят точки)
+@app.get("/announcements/public", response_model=List[AnnouncementOut])
+def public_announcements(limit: int = 200) -> List[AnnouncementOut]:
+    lim = max(1, min(int(limit), 500))
+    rows = fetch_all(
+        """
+        SELECT id, user_id, category, title, status, data, created_at
+        FROM announcements
+        WHERE deleted_at IS NULL AND status = 'active'
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (lim,),
+    )
+    return [_row_to_announcement(r) for r in rows]

@@ -1,59 +1,35 @@
-import os  # работа с переменными окружения (DATABASE_URL)
-from dotenv import load_dotenv  # читает .env файл и добавляет переменные в окружение
-from psycopg_pool import ConnectionPool  # пул соединений для psycopg3 (PostgreSQL)
+# app/db.py
+# Productionized minimal DB helper (psycopg3)
 
-load_dotenv()  # загружаем переменные из .env в окружение процесса
+import os
+from dotenv import load_dotenv
+import psycopg
+from psycopg.rows import tuple_row
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # берём строку подключения из окружения
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    # Если переменной нет — дальше работать нельзя, сразу падаем с понятным сообщением
-    raise RuntimeError("DATABASE_URL не задан в .env")
+    raise RuntimeError("DATABASE_URL is not set")
 
-
-# Создаём пул соединений.
-# Почему пул нужен:
-# - каждый HTTP запрос может нуждаться в БД
-# - создавать соединение каждый раз дорого
-# - пул держит несколько соединений и переиспользует их
-pool = ConnectionPool(
-    conninfo=DATABASE_URL,  # строка подключения
-    min_size=1,             # минимум 1 соединение всегда готово
-    max_size=10             # максимум 10 (на старте хватает)
-)
+# global connection (MVP)
+conn = psycopg.connect(DATABASE_URL, row_factory=tuple_row)
+conn.autocommit = True
 
 
 def fetch_one(query: str, params: tuple = ()):
-    """
-    Выполняет SELECT и возвращает ОДНУ строку (fetchone).
-    Подходит для "получить пользователя", "получить время", "получить одну задачу" и т.п.
-    """
-    # pool.connection() — берём соединение из пула (и потом возвращаем обратно автоматически)
-    with pool.connection() as conn:
-        # cursor нужен для выполнения SQL
-        with conn.cursor() as cur:
-            cur.execute(query, params)   # выполняем запрос с параметрами
-            row = cur.fetchone()         # берём одну строку
-            return row                   # возвращаем кортеж или None
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        return cur.fetchone()
 
 
 def fetch_all(query: str, params: tuple = ()):
-    """
-    Выполняет SELECT и возвращает ВСЕ строки (fetchall).
-    Подходит для списков: задачи, чаты, сообщения.
-    """
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, params)
-            rows = cur.fetchall()
-            return rows
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        return cur.fetchall()
 
 
 def execute(query: str, params: tuple = ()):
-    """
-    Выполняет запрос без возврата результата (INSERT/UPDATE/DELETE).
-    Важно: здесь делаем conn.commit(), иначе изменения не сохранятся.
-    """
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, params)
-            conn.commit()  # фиксируем транзакцию
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        return True

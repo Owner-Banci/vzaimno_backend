@@ -1,62 +1,49 @@
-import os
-from datetime import datetime, timedelta, timezone  # время для exp/iat в JWT
-from dotenv import load_dotenv
+# app/security.py
 
-import jwt  # PyJWT — библиотека для создания и проверки JWT
-from passlib.context import CryptContext  # удобная обёртка для bcrypt
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict
+
+from dotenv import load_dotenv
+from jose import jwt, JWTError
+from passlib.context import CryptContext
 
 load_dotenv()
 
-# Секрет — ключ, которым подписываются токены.
-# Если его украдут — смогут подделывать токены. Держим в .env и не коммитим.
-JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME")
+# ---- Password hashing (bcrypt) ----
 
-# Алгоритм подписи. HS256 = HMAC SHA-256 (симметричный ключ)
-JWT_ALG = os.getenv("JWT_ALG", "HS256")
-
-# Через сколько минут токен истекает
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
-
-# Настраиваем хэширование паролей.
-# bcrypt — стандарт для паролей.
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+_pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 def hash_password(password: str) -> str:
-    # Возвращает bcrypt-хэш пароля (внутри соль + параметры сложности)
-    return pwd_context.hash(password)
+    return _pwd.hash(password)
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    # Проверяет пароль: сравнивает введённый пароль с bcrypt-хэшем
-    return pwd_context.verify(password, password_hash)
+    return _pwd.verify(password, password_hash)
 
 
-def create_access_token(sub: str) -> str:
-    """
-    Создаём JWT.
-    sub — идентификатор пользователя (обычно user_id)
-    """
-    now = datetime.now(timezone.utc)  # текущее время UTC
-    exp = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)  # время истечения
+# ---- JWT ----
 
-    # payload — "начинка" токена
-    payload = {
-        "sub": sub,                    # кому принадлежит токен
-        "iat": int(now.timestamp()),   # issued at — когда выдан
-        "exp": int(exp.timestamp()),   # expire — когда истекает
-    }
-
-    # jwt.encode подписывает payload секретом и возвращает строку токена
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+JWT_SECRET = os.getenv("JWT_SECRET", "DEV_JWT_SECRET_CHANGE_ME")
+JWT_ALG = os.getenv("JWT_ALG", "HS256")
+JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "10080"))  # 7 days by default
 
 
-def decode_token(token: str) -> dict:
-    """
-    Проверяет JWT:
-    - подпись (JWT_SECRET)
-    - срок действия exp
-    Если всё ок — возвращает payload (dict).
-    Если нет — кидает исключение.
-    """
-    return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+def create_access_token(payload: Dict[str, Any], expires_minutes: int | None = None) -> str:
+    data = dict(payload)
+
+    exp_minutes = expires_minutes if expires_minutes is not None else JWT_EXPIRE_MINUTES
+    exp = datetime.now(timezone.utc) + timedelta(minutes=exp_minutes)
+
+    data["exp"] = exp
+    data["iat"] = datetime.now(timezone.utc)
+
+    return jwt.encode(data, JWT_SECRET, algorithm=JWT_ALG)
+
+
+def decode_token(token: str) -> Dict[str, Any]:
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except JWTError as e:
+        raise ValueError("Invalid token") from e

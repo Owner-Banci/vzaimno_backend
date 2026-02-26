@@ -1,27 +1,48 @@
-from pydantic import BaseModel, EmailStr, Field  # Pydantic: валидация данных
+# app/schemas.py
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict
+
+from pydantic import BaseModel, EmailStr, Field
 
 
-# Входные данные для /auth/register
 class RegisterIn(BaseModel):
-    email: EmailStr                 # EmailStr валидирует формат почты
-    password: str = Field(min_length=6)  # пароль минимум 6 символов
-    name: str | None = None         # опциональное имя (может быть None)
+    email: EmailStr
+    password: str
 
 
-# Входные данные для /auth/login
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
 
 
-# Ответ /auth/login
 class TokenOut(BaseModel):
-    access_token: str               # сам JWT
-    token_type: str = "bearer"      # стандарт: "bearer"
+    access_token: str
+    token_type: str = "bearer"
 
 
-# Как мы отдаём пользователя наружу (без password_hash!)
 class UserOut(BaseModel):
     id: str
     email: EmailStr
     role: str
+
+
+# ----------------------------
+# Announcements (Ads)
+# ----------------------------
+class CreateAnnouncementIn(BaseModel):
+    category: str = Field(..., min_length=1, max_length=64)
+    title: str = Field(..., min_length=1, max_length=200)
+    status: str = Field(default="active", max_length=32)
+    data: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AnnouncementOut(BaseModel):
+    id: str
+    user_id: str
+    category: str
+    title: str
+    status: str
+    data: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
