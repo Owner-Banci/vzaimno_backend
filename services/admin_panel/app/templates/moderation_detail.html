@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block content %}
+{% set data = announcement.data or {} %}
+{% set moderation = data.get("moderation", {}) %}
+{% set media = data.get("media", []) %}
+<section class="panel">
+  <p class="eyebrow">Карточка объявления</p>
+  <h2>{{ announcement.title }}</h2>
+  <p><strong>ID:</strong> {{ announcement.id }}</p>
+  <p><strong>Пользователь:</strong> {{ announcement.user_email or announcement.user_id }}</p>
+  <p><strong>Статус:</strong> {{ labels.announcement_statuses.get(announcement.status, announcement.status) }}</p>
+  <p><strong>Категория:</strong> {{ announcement.category }}</p>
+  <p><strong>Создано:</strong> {{ format_dt(announcement.created_at) }}</p>
+  <p><strong>Обновлено:</strong> {{ format_dt(announcement.updated_at) }}</p>
+</section>
+
+<section class="grid two">
+  <article class="panel">
+    <h3>Данные объявления</h3>
+    <pre>{{ data | tojson(indent=2) }}</pre>
+  </article>
+  <article class="panel">
+    <h3>Данные модерации</h3>
+    <pre>{{ moderation | tojson(indent=2) }}</pre>
+  </article>
+</section>
+
+<section class="panel">
+  <h3>Медиа</h3>
+  <div class="media-grid">
+    {% for item in media %}
+    <div class="media-card">
+      {% if item.path %}
+      <img src="/{{ item.path }}" alt="{{ item.filename or 'media' }}">
+      {% endif %}
+      <p>{{ item.filename }}</p>
+      <p><strong>NSFW:</strong> {{ item.nsfw }}</p>
+      <p><strong>Метка:</strong> {{ item.top_label }}</p>
+    </div>
+    {% else %}
+    <p>Медиа не загружены.</p>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel">
+  <h3>Решение модератора</h3>
+  <form method="post" action="/admin/announcements/{{ announcement.id }}/decision" class="stack">
+    <label>Сообщение пользователю</label>
+    <textarea name="message" rows="4" required>{{ moderation.get("decision", {}).get("message", "") }}</textarea>
+
+    <div class="grid two">
+      <div>
+        <label>Поле причины</label>
+        <input type="text" name="reason_field" placeholder="media / title / notes">
+      </div>
+      <div>
+        <label>Код причины</label>
+        <input type="text" name="reason_code" placeholder="NSFW_REVIEW / TEXT_ILLEGAL">
+      </div>
+    </div>
+
+    <label>Описание причины</label>
+    <textarea name="reason_details" rows="2"></textarea>
+
+    <label>Рекомендации для исправления (по одной на строку)</label>
+    <textarea name="suggestions" rows="4">{% for suggestion in moderation.get("suggestions", []) %}{{ suggestion }}
+{% endfor %}</textarea>
+
+    <label>Можно ли оспорить</label>
+    <select name="can_appeal">
+      <option value="true">Да</option>
+      <option value="false">Нет</option>
+    </select>
+
+    <div class="actions">
+      <button type="submit" name="decision" value="approve">Одобрить</button>
+      <button type="submit" name="decision" value="needs_fix">На доработку</button>
+      <button type="submit" name="decision" value="reject">Отклонить</button>
+      <button type="submit" name="decision" value="archive">В архив</button>
+      <button type="submit" name="decision" value="delete" class="danger">Удалить</button>
+    </div>
+  </form>
+</section>
+{% endblock %}

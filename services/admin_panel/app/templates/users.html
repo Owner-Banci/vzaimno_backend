@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <div class="section-head">
+    <div>
+      <p class="eyebrow">Команда и доступы</p>
+      <h2>Пользователи</h2>
+    </div>
+  </div>
+  <form class="toolbar" method="get">
+    <input type="search" name="search" placeholder="Поиск по email" value="{{ search }}">
+    <button type="submit">Найти</button>
+  </form>
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Почта</th>
+        <th>Роль</th>
+        <th>Создан</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for user in users %}
+      <tr>
+        <td>{{ user.email }}</td>
+        <td><span class="badge">{{ labels.roles.get(user.role, user.role) }}</span></td>
+        <td>{{ format_dt(user.created_at) }}</td>
+        <td><a class="action-link" href="/admin/users/{{ user.id }}">Открыть</a></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="4">Пользователи не найдены.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

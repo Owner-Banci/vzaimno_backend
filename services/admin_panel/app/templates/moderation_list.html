@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <div class="section-head">
+    <div>
+      <p class="eyebrow">Ручная проверка контента</p>
+      <h2>Модерация объявлений</h2>
+    </div>
+  </div>
+  <form class="toolbar" method="get">
+    <input type="search" name="search" placeholder="Заголовок, категория или email" value="{{ search }}">
+    <select name="status">
+      <option value="">Только очередь</option>
+      {% for value in ["pending_review", "needs_fix", "rejected", "active", "archived"] %}
+      <option value="{{ value }}" {% if status_filter == value %}selected{% endif %}>{{ labels.announcement_statuses.get(value, value) }}</option>
+      {% endfor %}
+    </select>
+    <label class="checkbox">
+      <input type="checkbox" name="appeals" value="1" {% if appeals_only %}checked{% endif %}>
+      Только апелляции
+    </label>
+    <button type="submit">Показать</button>
+  </form>
+
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Статус</th>
+        <th>Апелляция</th>
+        <th>Заголовок</th>
+        <th>Пользователь</th>
+        <th>Категория</th>
+        <th>Обновлено</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in announcements %}
+      <tr>
+        <td><span class="badge">{{ labels.announcement_statuses.get(item.status, item.status) }}</span></td>
+        <td>{% if item.appeal_requested %}Да{% else %}Нет{% endif %}</td>
+        <td>{{ item.title }}</td>
+        <td>{{ item.user_email or item.user_id }}</td>
+        <td>{{ item.category }}</td>
+        <td>{{ format_dt(item.updated_at) }}</td>
+        <td><a class="action-link" href="/admin/announcements/{{ item.id }}">Открыть</a></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7">В очереди объявлений нет.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

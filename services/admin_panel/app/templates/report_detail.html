@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <p class="eyebrow">Карточка жалобы</p>
+  <h2>Жалоба {{ report.id }}</h2>
+  <p><strong>Статус:</strong> {{ labels.report_statuses.get(report.status, report.status) }}</p>
+  <p><strong>Кто отправил:</strong> {{ report.reporter_email or report.reporter_id }}</p>
+  <p><strong>Объект:</strong> {{ labels.target_types.get(report.target_type, report.target_type) }} / {{ report.target_id }}</p>
+  <p><strong>Код причины:</strong> {{ report.reason_code }}</p>
+  <p><strong>Описание:</strong> {{ report.reason_text or "—" }}</p>
+  <p><strong>Решение:</strong> {{ labels.report_resolutions.get(report.resolution, report.resolution or "—") }}</p>
+  <p><strong>Кем обработано:</strong> {{ report.resolved_by_email or report.resolved_by or "—" }}</p>
+  <p><strong>Комментарий модератора:</strong> {{ report.moderator_comment or "—" }}</p>
+</section>
+
+{% if report.status != "resolved" %}
+<section class="panel">
+  <h3>Принять решение</h3>
+  <form method="post" action="/admin/reports/{{ report.id }}/resolve" class="stack">
+    <label>Комментарий модератора</label>
+    <textarea name="moderator_comment" rows="4"></textarea>
+    <div class="actions">
+      <button type="submit" name="resolution" value="valid">Обоснована</button>
+      <button type="submit" name="resolution" value="invalid">Не обоснована</button>
+    </div>
+  </form>
+</section>
+{% endif %}
+{% endblock %}

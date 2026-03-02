@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ admin.title }} | Вход</title>
+  <link rel="stylesheet" href="/static/admin.css">
+</head>
+<body class="auth-screen">
+  <div class="auth-layout">
+    <section class="auth-hero">
+      <div>
+        <p class="eyebrow">Панель сотрудников</p>
+        <h1>Vzaimno<br>Admin</h1>
+        <p>Единый интерфейс для модерации объявлений, разбора апелляций, поддержки пользователей и просмотра аудита действий.</p>
+      </div>
+      <div class="auth-points">
+        <div class="auth-point">Модерация объявлений и апелляций в одном месте.</div>
+        <div class="auth-point">Чаты поддержки без отдельного инструмента.</div>
+        <div class="auth-point">Жалобы, ограничения и журнал действий команды.</div>
+      </div>
+    </section>
+
+    <form class="auth-card auth-form" action="{{ url_for('admin:login') }}" method="POST" autocomplete="off">
+      <div>
+        <p class="eyebrow">Вход</p>
+        <h1>{{ admin.title }}</h1>
+        <p class="muted">Используйте email и пароль сотрудника с ролью администратора, модератора или поддержки.</p>
+      </div>
+
+      {% if error %}
+      <div class="error-banner">Неверный email или пароль.</div>
+      {% endif %}
+
+      <label class="field">
+        <span class="field-label">Email</span>
+        <input name="username" type="text" placeholder="name@example.com" autocomplete="username">
+      </label>
+
+      <label class="field">
+        <span class="field-label">Пароль</span>
+        <input name="password" type="password" placeholder="Введите пароль" autocomplete="current-password">
+      </label>
+
+      <button type="submit">Войти</button>
+      <p class="auth-note">Если вход не проходит, проверьте роль пользователя в таблице <code>users.role</code>.</p>
+    </form>
+  </div>
+</body>
+</html>

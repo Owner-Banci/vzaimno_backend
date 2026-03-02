@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <div class="section-head">
+    <div>
+      <p class="eyebrow">Чаты с пользователями</p>
+      <h2>Поддержка</h2>
+    </div>
+  </div>
+  <form class="toolbar" method="get">
+    <input type="search" name="search" placeholder="Поиск по email пользователя" value="{{ search }}">
+    <button type="submit">Найти</button>
+  </form>
+
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Пользователь</th>
+        <th>Тред</th>
+        <th>Последнее сообщение</th>
+        <th>Последняя активность</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for thread in threads %}
+      <tr>
+        <td>{{ thread.user_email or thread.user_id }}</td>
+        <td>{{ thread.id }}</td>
+        <td>{{ thread.last_message_text or "—" }}</td>
+        <td>{{ format_dt(thread.last_message_at or thread.created_at) }}</td>
+        <td><a class="action-link" href="/admin/support/{{ thread.id }}">Открыть</a></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5">Диалогов поддержки пока нет.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

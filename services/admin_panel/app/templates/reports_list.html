@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <div class="section-head">
+    <div>
+      <p class="eyebrow">Очередь обращений</p>
+      <h2>Жалобы</h2>
+    </div>
+  </div>
+  <form class="toolbar" method="get">
+    <input type="search" name="search" placeholder="Email автора жалобы или объект" value="{{ search }}">
+    <select name="status">
+      <option value="">Все статусы</option>
+      {% for value in ["open", "resolved"] %}
+      <option value="{{ value }}" {% if status == value %}selected{% endif %}>{{ labels.report_statuses.get(value, value) }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit">Показать</button>
+  </form>
+
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Статус</th>
+        <th>Кто отправил</th>
+        <th>Объект</th>
+        <th>Причина</th>
+        <th>Создано</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for report in reports %}
+      <tr>
+        <td><span class="badge">{{ labels.report_statuses.get(report.status, report.status) }}</span></td>
+        <td>{{ report.reporter_email or report.reporter_id }}</td>
+        <td>{{ labels.target_types.get(report.target_type, report.target_type) }} / {{ report.target_id }}</td>
+        <td>{{ report.reason_code }}</td>
+        <td>{{ format_dt(report.created_at) }}</td>
+        <td><a class="action-link" href="/admin/reports/{{ report.id }}">Открыть</a></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6">Жалоб нет.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

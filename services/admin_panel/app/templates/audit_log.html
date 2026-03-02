@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <div class="section-head">
+    <div>
+      <p class="eyebrow">История действий команды</p>
+      <h2>Аудит</h2>
+    </div>
+  </div>
+  <form class="toolbar" method="get">
+    <input type="search" name="moderator" placeholder="Email модератора" value="{{ moderator }}">
+    <input type="text" name="action_type" placeholder="Тип действия" value="{{ action_type }}">
+    <input type="text" name="target_type" placeholder="Тип объекта" value="{{ target_type }}">
+    <button type="submit">Показать</button>
+  </form>
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Когда</th>
+        <th>Модератор</th>
+        <th>Действие</th>
+        <th>Объект</th>
+        <th>Причина</th>
+        <th>Payload</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for action in actions %}
+      <tr>
+        <td>{{ format_dt(action.created_at) }}</td>
+        <td>{{ action.moderator_email or action.moderator_id }}</td>
+        <td>{{ labels.actions.get(action.action_type, action.action_type) }}</td>
+        <td>{{ labels.target_types.get(action.target_type, action.target_type) }} / {{ action.target_id }}</td>
+        <td>{{ action.reason or "—" }}</td>
+        <td><pre>{{ action.payload | tojson(indent=2) }}</pre></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6">Действий модерации пока нет.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

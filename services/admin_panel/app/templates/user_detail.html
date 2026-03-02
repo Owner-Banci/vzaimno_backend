@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <p class="eyebrow">Карточка пользователя</p>
+  <h2>{{ user.email }}</h2>
+  <p><strong>ID:</strong> {{ user.id }}</p>
+  <p><strong>Роль:</strong> {{ labels.roles.get(user.role, user.role) }}</p>
+  <p><strong>Создан:</strong> {{ format_dt(user.created_at) }}</p>
+</section>
+
+{% if is_admin %}
+<section class="panel">
+  <h3>Изменить роль</h3>
+  <form method="post" action="/admin/users/{{ user.id }}/role" class="stack">
+    <select name="role">
+      {% for role in ["user", "support", "moderator", "admin"] %}
+      <option value="{{ role }}" {% if role == user.role %}selected{% endif %}>{{ labels.roles.get(role, role) }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit">Сохранить роль</button>
+  </form>
+</section>
+{% endif %}
+
+<section class="panel">
+  <h3>Ограничения</h3>
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Тип</th>
+        <th>Статус</th>
+        <th>Начало</th>
+        <th>Окончание</th>
+        <th>Снято</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for restriction in user.restrictions %}
+      <tr>
+        <td>{{ labels.restriction_types.get(restriction.type, restriction.type or "—") }}</td>
+        <td>{{ labels.restriction_statuses.get(restriction.status, restriction.status) }}</td>
+        <td>{{ format_dt(restriction.starts_at) }}</td>
+        <td>{{ format_dt(restriction.ends_at) }}</td>
+        <td>{{ format_dt(restriction.revoked_at) }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5">Ограничений нет.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

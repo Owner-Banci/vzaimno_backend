@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <p class="eyebrow">Диалог поддержки</p>
+  <h2>Обращение {{ thread.id }}</h2>
+  <p><strong>Пользователь:</strong> {{ thread.user_email or thread.user_id }}</p>
+  <p><strong>Создано:</strong> {{ format_dt(thread.created_at) }}</p>
+  <p><strong>Последнее сообщение:</strong> {{ format_dt(thread.last_message_at) }}</p>
+</section>
+
+<section class="panel">
+  <h3>Переписка</h3>
+  <div class="chat">
+    {% for message in messages %}
+    <article class="message {% if message.sender_role == 'support' %}support{% else %}user{% endif %}">
+      <header>
+        <strong>{{ message.sender_email or message.sender_id }}</strong>
+        <span>{{ labels.sender_roles.get(message.sender_role, message.sender_role) }}</span>
+        <time>{{ format_dt(message.created_at) }}</time>
+      </header>
+      <p>{{ message.text }}</p>
+    </article>
+    {% else %}
+    <p>Сообщений пока нет.</p>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel">
+  <h3>Ответить</h3>
+  <form method="post" action="/admin/support/{{ thread.id }}/reply" class="stack">
+    <textarea name="text" rows="4" required placeholder="Напишите ответ пользователю"></textarea>
+    <button type="submit">Отправить</button>
+  </form>
+</section>
+{% endblock %}

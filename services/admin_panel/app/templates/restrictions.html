@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="grid two">
+  <article class="panel">
+    <p class="eyebrow">Модераторские меры</p>
+    <h2>Назначить ограничение</h2>
+    <form method="post" action="/admin/restrictions/create" class="stack">
+      <label>ID пользователя</label>
+      <input type="text" name="user_id" required placeholder="UUID или текстовый ID">
+      <label>Тип</label>
+      <select name="type">
+        <option value="warning">Предупреждение</option>
+        <option value="ban">Блокировка</option>
+        <option value="shadowban">Теневая блокировка</option>
+      </select>
+      <label>До какого времени</label>
+      <input type="datetime-local" name="ends_at">
+      <label>Комментарий</label>
+      <textarea name="comment" rows="3"></textarea>
+      <button type="submit">Назначить ограничение</button>
+    </form>
+  </article>
+
+  <article class="panel">
+    <h2>Список ограничений</h2>
+    <form class="toolbar" method="get">
+      <input type="search" name="search" placeholder="Поиск по email пользователя" value="{{ search }}">
+      <select name="status">
+        <option value="">Все статусы</option>
+        {% for value in ["active", "revoked"] %}
+        <option value="{{ value }}" {% if status == value %}selected{% endif %}>{{ labels.restriction_statuses.get(value, value) }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit">Показать</button>
+    </form>
+  </article>
+</section>
+
+<section class="panel">
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Пользователь</th>
+        <th>Тип</th>
+        <th>Статус</th>
+        <th>Кем назначено</th>
+        <th>Начало</th>
+        <th>Окончание</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for restriction in restrictions %}
+      <tr>
+        <td>{{ restriction.user_email or restriction.user_id }}</td>
+        <td>{{ labels.restriction_types.get(restriction.type, restriction.type or "—") }}</td>
+        <td>{{ labels.restriction_statuses.get(restriction.status, restriction.status) }}</td>
+        <td>{{ restriction.issued_by_email or restriction.issued_by }}</td>
+        <td>{{ format_dt(restriction.starts_at) }}</td>
+        <td>{{ format_dt(restriction.ends_at) }}</td>
+        <td>
+          {% if restriction.status == "active" %}
+          <form method="post" action="/admin/restrictions/{{ restriction.id }}/revoke">
+            <input type="hidden" name="comment" value="Снято из админ-панели">
+            <button type="submit">Снять</button>
+          </form>
+          {% else %}
+          —
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7">Ограничений нет.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}
