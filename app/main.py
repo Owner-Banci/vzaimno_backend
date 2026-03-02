@@ -5,6 +5,7 @@ import os
 import uuid
 import itsdangerous
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,11 +19,17 @@ from app.geocoding import geocode_address
 from app.moderation_image import get_nsfw_detector
 from app.moderation_text import classify_text
 from app.ops import create_report, ensure_appeal_report, report_status_select_sql
+from app.schema_compat import table_has_column
 from app.schemas import (
     AnnouncementOut,
     AppealIn,
     CreateAnnouncementIn,
+    DeviceRegisterIn,
+    DeviceUnregisterIn,
+    GeoPointOut,
     LoginIn,
+    MeProfileOut,
+    OKOut,
     RegisterIn,
     ReportCreateIn,
     ReportOut,
@@ -30,6 +37,11 @@ from app.schemas import (
     SupportMessageOut,
     SupportThreadOut,
     TokenOut,
+    UpdateMyProfileIn,
+    UserProfileOut,
+    UserReviewListOut,
+    UserReviewOut,
+    UserStatsOut,
     UserOut,
 )
 from app.security import create_access_token, decode_token, hash_password, verify_password
@@ -100,6 +112,7 @@ def register(data: RegisterIn) -> TokenOut:
         "INSERT INTO users (id, email, password_hash, role) VALUES (%s,%s,%s,%s)",
         (user_id, data.email, pwd_hash, "user"),
     )
+    _ensure_profile_and_stats(user_id)
 
     token = create_access_token({"sub": user_id, "role": "user"})
     return TokenOut(access_token=token)
@@ -125,6 +138,528 @@ def login(data: LoginIn) -> TokenOut:
 @app.get("/me", response_model=UserOut)
 def me(user: UserOut = Depends(get_current_user)) -> UserOut:
     return user
+
+
+# ----------------------------
+# Profile / devices
+# ----------------------------
+def _model_dump(model: Any) -> Dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    if hasattr(model, "dict"):
+        return model.dict()
+    return {}
+
+
+def _normalize_optional_text(value: Optional[str], collapse_spaces: bool = False) -> Optional[str]:
+    if value is None:
+        return None
+
+    normalized = value.strip()
+    if collapse_spaces:
+        normalized = " ".join(normalized.split())
+
+    return normalized or None
+
+
+def _normalize_home_location(value: Any) -> Optional[Dict[str, float]]:
+    if value is None:
+        return None
+
+    raw_value = value
+    if isinstance(raw_value, str):
+        try:
+            raw_value = json.loads(raw_value)
+        except Exception:
+            return None
+
+    if not isinstance(raw_value, dict):
+        return None
+
+    try:
+        lat = float(raw_value.get("lat"))
+        lon = float(raw_value.get("lon"))
+    except (TypeError, ValueError):
+        return None
+
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+
+    return {"lat": lat, "lon": lon}
+
+
+def _point_out(value: Any) -> Optional[GeoPointOut]:
+    point = _normalize_home_location(value)
+    if not point:
+        return None
+    return GeoPointOut(**point)
+
+
+def _normalize_json_object(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+
+    raw_value = value
+    if isinstance(raw_value, str):
+        try:
+            raw_value = json.loads(raw_value)
+        except Exception:
+            return {}
+
+    if isinstance(raw_value, dict):
+        return dict(raw_value)
+
+    return {}
+
+
+def _preferred_address_from_extra(value: Any) -> Optional[str]:
+    extra = _normalize_json_object(value)
+    return _normalize_optional_text(extra.get("preferred_address"), collapse_spaces=True)
+
+
+@lru_cache(maxsize=1)
+def _profile_has_extra_column() -> bool:
+    return table_has_column("user_profiles", "extra")
+
+
+@lru_cache(maxsize=1)
+def _profile_home_location_udt_name() -> Optional[str]:
+    row = fetch_one(
+        """
+        SELECT udt_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'user_profiles'
+          AND column_name = 'home_location'
+        """,
+    )
+    if not row or not row[0]:
+        return None
+    return str(row[0]).lower()
+
+
+def _profile_extra_select_sql(alias: str) -> str:
+    if not _profile_has_extra_column():
+        return "NULL::jsonb AS profile_extra"
+
+    prefix = f"{alias}." if alias else ""
+    return f"{prefix}extra AS profile_extra"
+
+
+def _profile_home_location_select_sql(alias: str) -> str:
+    prefix = f"{alias}." if alias else ""
+    column_type = _profile_home_location_udt_name()
+
+    if not column_type:
+        return "NULL AS home_lat, NULL AS home_lon"
+
+    if column_type in {"geography", "geometry"}:
+        return (
+            f"CASE WHEN {prefix}home_location IS NULL THEN NULL ELSE ST_Y({prefix}home_location::geometry) END AS home_lat, "
+            f"CASE WHEN {prefix}home_location IS NULL THEN NULL ELSE ST_X({prefix}home_location::geometry) END AS home_lon"
+        )
+
+    if column_type in {"jsonb", "json"}:
+        return (
+            f"CASE WHEN {prefix}home_location IS NULL THEN NULL ELSE NULLIF({prefix}home_location->>'lat', '')::double precision END AS home_lat, "
+            f"CASE WHEN {prefix}home_location IS NULL THEN NULL ELSE NULLIF({prefix}home_location->>'lon', '')::double precision END AS home_lon"
+        )
+
+    return "NULL AS home_lat, NULL AS home_lon"
+
+
+def _fetch_profile_extra(user_id: str) -> Dict[str, Any]:
+    if not _profile_has_extra_column():
+        return {}
+
+    row = fetch_one(
+        """
+        SELECT extra
+        FROM user_profiles
+        WHERE user_id = %s
+        """,
+        (user_id,),
+    )
+    if not row:
+        return {}
+
+    return _normalize_json_object(row[0])
+
+
+def _ensure_profile_and_stats(user_id: str) -> None:
+    if user_id == "dev":
+        return
+
+    execute(
+        """
+        INSERT INTO user_profiles (user_id, display_name, created_at, updated_at)
+        SELECT
+            u.id,
+            COALESCE(NULLIF(BTRIM(u.phone), ''), NULLIF(BTRIM(u.email), ''), 'Пользователь'),
+            now(),
+            now()
+        FROM users u
+        WHERE u.id = %s
+        ON CONFLICT (user_id) DO NOTHING
+        """,
+        (user_id,),
+    )
+    execute(
+        """
+        INSERT INTO user_stats (user_id, created_at, updated_at)
+        VALUES (%s, now(), now())
+        ON CONFLICT (user_id) DO NOTHING
+        """,
+        (user_id,),
+    )
+
+
+def _dev_me_profile() -> MeProfileOut:
+    return MeProfileOut(
+        user={
+            "id": "dev",
+            "email": "dev@localdomain.com",
+            "phone": None,
+            "created_at": datetime.now(timezone.utc),
+        },
+        profile={
+            "display_name": "Dev User",
+            "bio": None,
+            "city": None,
+            "preferred_address": None,
+            "home_location": None,
+        },
+        stats={
+            "rating_avg": 0.0,
+            "rating_count": 0,
+            "completed_count": 0,
+            "cancelled_count": 0,
+        },
+    )
+
+
+def _fetch_me_profile(user_id: str) -> MeProfileOut:
+    if user_id == "dev":
+        return _dev_me_profile()
+
+    _ensure_profile_and_stats(user_id)
+
+    row = fetch_one(
+        f"""
+        SELECT
+            u.id::text,
+            u.email,
+            u.phone,
+            u.created_at,
+            up.display_name,
+            up.bio,
+            up.city,
+            {_profile_extra_select_sql("up")},
+            {_profile_home_location_select_sql("up")},
+            COALESCE(us.rating_avg, 0),
+            COALESCE(us.rating_count, 0),
+            COALESCE(us.completed_count, 0),
+            COALESCE(us.cancelled_count, 0)
+        FROM users u
+        LEFT JOIN user_profiles up ON up.user_id = u.id
+        LEFT JOIN user_stats us ON us.user_id = u.id
+        WHERE u.id = %s
+        """,
+        (user_id,),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return MeProfileOut(
+        user={
+            "id": row[0],
+            "email": row[1],
+            "phone": row[2],
+            "created_at": row[3],
+        },
+        profile={
+            "display_name": _normalize_optional_text(row[4], collapse_spaces=True),
+            "bio": _normalize_optional_text(row[5]),
+            "city": _normalize_optional_text(row[6], collapse_spaces=True),
+            "preferred_address": _preferred_address_from_extra(row[7]),
+            "home_location": _point_out({"lat": row[8], "lon": row[9]}) if row[8] is not None and row[9] is not None else None,
+        },
+        stats=UserStatsOut(
+            rating_avg=float(row[10] or 0),
+            rating_count=int(row[11] or 0),
+            completed_count=int(row[12] or 0),
+            cancelled_count=int(row[13] or 0),
+        ),
+    )
+
+
+def _fetch_profile_section(user_id: str) -> UserProfileOut:
+    if user_id == "dev":
+        return UserProfileOut(display_name="Dev User", preferred_address=None)
+
+    _ensure_profile_and_stats(user_id)
+
+    row = fetch_one(
+        f"""
+        SELECT
+            display_name,
+            bio,
+            city,
+            {_profile_extra_select_sql("")},
+            {_profile_home_location_select_sql("")}
+        FROM user_profiles
+        WHERE user_id = %s
+        """,
+        (user_id,),
+    )
+
+    if not row:
+        return UserProfileOut()
+
+    return UserProfileOut(
+        display_name=_normalize_optional_text(row[0], collapse_spaces=True),
+        bio=_normalize_optional_text(row[1]),
+        city=_normalize_optional_text(row[2], collapse_spaces=True),
+        preferred_address=_preferred_address_from_extra(row[3]),
+        home_location=_point_out({"lat": row[4], "lon": row[5]}) if row[4] is not None and row[5] is not None else None,
+    )
+
+
+@app.get("/users/me", response_model=MeProfileOut)
+def users_me(user: UserOut = Depends(get_current_user)) -> MeProfileOut:
+    return _fetch_me_profile(user.id)
+
+
+@app.patch("/users/me/profile", response_model=UserProfileOut)
+def update_my_profile(
+    payload: UpdateMyProfileIn,
+    user: UserOut = Depends(get_current_user),
+) -> UserProfileOut:
+    display_name = _normalize_optional_text(payload.display_name, collapse_spaces=True)
+    bio = _normalize_optional_text(payload.bio)
+    city = _normalize_optional_text(payload.city, collapse_spaces=True)
+    preferred_address = _normalize_optional_text(payload.preferred_address, collapse_spaces=True)
+    if not display_name or len(display_name) < 2:
+        raise HTTPException(status_code=422, detail="Display name must contain at least 2 characters")
+
+    if user.id == "dev":
+        return UserProfileOut(
+            display_name=display_name,
+            bio=bio,
+            city=city,
+            preferred_address=preferred_address,
+            home_location=payload.home_location,
+        )
+
+    _ensure_profile_and_stats(user.id)
+
+    current_profile = _fetch_profile_section(user.id)
+
+    resolved_home_location = payload.home_location
+    if resolved_home_location is None:
+        if preferred_address:
+            geocoded = geocode_address(preferred_address)
+            if geocoded:
+                resolved_home_location = GeoPointOut(lat=geocoded[0], lon=geocoded[1])
+            else:
+                resolved_home_location = current_profile.home_location
+        else:
+            resolved_home_location = None
+
+    set_clauses = [
+        "display_name = %s",
+        "bio = %s",
+        "city = %s",
+    ]
+    params: List[Any] = [display_name, bio, city]
+
+    if _profile_has_extra_column():
+        extra_payload = _fetch_profile_extra(user.id)
+        if preferred_address:
+            extra_payload["preferred_address"] = preferred_address
+        else:
+            extra_payload.pop("preferred_address", None)
+
+        set_clauses.append("extra = %s::jsonb")
+        params.append(json.dumps(extra_payload, ensure_ascii=False) if extra_payload else None)
+
+    home_location_type = _profile_home_location_udt_name()
+    if home_location_type in {"geography", "geometry"}:
+        if resolved_home_location is not None:
+            geometry_expression = "ST_SetSRID(ST_MakePoint(%s::double precision, %s::double precision), 4326)"
+            if home_location_type == "geography":
+                geometry_expression = f"{geometry_expression}::geography"
+
+            set_clauses.append(f"home_location = {geometry_expression}")
+            params.extend([resolved_home_location.lon, resolved_home_location.lat])
+        else:
+            set_clauses.append("home_location = NULL")
+    elif home_location_type in {"jsonb", "json"}:
+        if resolved_home_location is not None:
+            set_clauses.append("home_location = %s::jsonb")
+            params.append(
+                json.dumps(
+                    {"lat": resolved_home_location.lat, "lon": resolved_home_location.lon},
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            set_clauses.append("home_location = NULL")
+
+    set_clauses.append("updated_at = now()")
+    params.append(user.id)
+
+    execute(
+        f"""
+        UPDATE user_profiles
+        SET {", ".join(set_clauses)}
+        WHERE user_id = %s
+        """,
+        tuple(params),
+    )
+
+    return _fetch_profile_section(user.id)
+
+
+@app.get("/users/me/reviews", response_model=UserReviewListOut)
+def my_reviews(
+    limit: int = 2,
+    offset: int = 0,
+    user: UserOut = Depends(get_current_user),
+) -> UserReviewListOut:
+    if user.id == "dev":
+        return UserReviewListOut(items=[])
+
+    lim = max(1, min(int(limit), 100))
+    off = max(0, int(offset))
+
+    rows = fetch_all(
+        """
+        SELECT
+            COALESCE(NULLIF(up.display_name, ''), u.email, 'Пользователь') AS from_user_display_name,
+            r.stars,
+            r.text,
+            r.created_at
+        FROM reviews r
+        LEFT JOIN user_profiles up ON up.user_id = r.from_user_id
+        LEFT JOIN users u ON u.id = r.from_user_id
+        WHERE r.to_user_id = %s
+        ORDER BY r.created_at DESC
+        LIMIT %s OFFSET %s
+        """,
+        (user.id, lim, off),
+    )
+
+    return UserReviewListOut(
+        items=[
+            UserReviewOut(
+                from_user_display_name=row[0],
+                stars=int(row[1]),
+                text=row[2],
+                created_at=row[3],
+            )
+            for row in rows
+        ]
+    )
+
+
+@app.post("/devices/register", response_model=OKOut)
+def register_device(
+    payload: DeviceRegisterIn,
+    user: UserOut = Depends(get_current_user),
+) -> OKOut:
+    if user.id == "dev":
+        return OKOut(ok=True)
+
+    device_id = _normalize_optional_text(payload.device_id)
+    if not device_id:
+        raise HTTPException(status_code=422, detail="device_id is required")
+
+    existing = fetch_one(
+        """
+        SELECT id
+        FROM user_devices
+        WHERE device_id = %s
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (device_id,),
+    )
+
+    if existing:
+        execute(
+            """
+            UPDATE user_devices
+            SET user_id = %s,
+                platform = %s,
+                push_token = %s,
+                locale = %s,
+                timezone = %s,
+                device_name = %s,
+                last_seen_at = now(),
+                deleted_at = NULL
+            WHERE id = %s
+            """,
+            (
+                user.id,
+                payload.platform,
+                payload.push_token,
+                payload.locale,
+                payload.timezone,
+                payload.device_name,
+                existing[0],
+            ),
+        )
+    else:
+        execute(
+            """
+            INSERT INTO user_devices (
+                id, user_id, platform, device_id, push_token, locale, timezone, device_name, created_at, last_seen_at, deleted_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now(), now(), NULL)
+            """,
+            (
+                str(uuid.uuid4()),
+                user.id,
+                payload.platform,
+                device_id,
+                payload.push_token,
+                payload.locale,
+                payload.timezone,
+                payload.device_name,
+            ),
+        )
+    return OKOut(ok=True)
+
+
+@app.delete("/devices/me", response_model=OKOut)
+def unregister_device(
+    payload: DeviceUnregisterIn,
+    user: UserOut = Depends(get_current_user),
+) -> OKOut:
+    if user.id == "dev":
+        return OKOut(ok=True)
+
+    device_id = _normalize_optional_text(payload.device_id)
+    if not device_id:
+        raise HTTPException(status_code=422, detail="device_id is required")
+
+    execute(
+        """
+        UPDATE user_devices
+        SET deleted_at = now(),
+            last_seen_at = now(),
+            push_token = NULL
+        WHERE user_id = %s
+          AND deleted_at IS NULL
+          AND (
+              device_id = %s
+              OR (%s IS NOT NULL AND push_token = %s)
+          )
+        """,
+        (user.id, device_id, payload.push_token, payload.push_token),
+    )
+    return OKOut(ok=True)
 
 
 # ----------------------------

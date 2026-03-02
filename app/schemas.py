@@ -1,4 +1,3 @@
-# app/schemas.py
 from __future__ import annotations
 
 from datetime import datetime
@@ -28,6 +27,76 @@ class UserOut(BaseModel):
     role: str
 
 
+class GeoPointOut(BaseModel):
+    lat: float = Field(..., ge=-90, le=90)
+    lon: float = Field(..., ge=-180, le=180)
+
+
+class CurrentUserDetailsOut(BaseModel):
+    id: str
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
+    created_at: datetime
+
+
+class UserProfileOut(BaseModel):
+    display_name: Optional[str] = None
+    bio: Optional[str] = None
+    city: Optional[str] = None
+    preferred_address: Optional[str] = None
+    home_location: Optional[GeoPointOut] = None
+
+
+class UserStatsOut(BaseModel):
+    rating_avg: float = 0.0
+    rating_count: int = 0
+    completed_count: int = 0
+    cancelled_count: int = 0
+
+
+class MeProfileOut(BaseModel):
+    user: CurrentUserDetailsOut
+    profile: UserProfileOut
+    stats: UserStatsOut
+
+
+class UpdateMyProfileIn(BaseModel):
+    display_name: str = Field(..., min_length=2, max_length=80)
+    bio: Optional[str] = Field(default=None, max_length=300)
+    city: Optional[str] = Field(default=None, max_length=120)
+    preferred_address: Optional[str] = Field(default=None, max_length=180)
+    home_location: Optional[GeoPointOut] = None
+
+
+class UserReviewOut(BaseModel):
+    from_user_display_name: str
+    stars: int = Field(..., ge=1, le=5)
+    text: Optional[str] = None
+    created_at: datetime
+
+
+class UserReviewListOut(BaseModel):
+    items: list[UserReviewOut] = Field(default_factory=list)
+
+
+class DeviceRegisterIn(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=200)
+    platform: str = Field(..., min_length=1, max_length=32)
+    push_token: Optional[str] = Field(default=None, max_length=500)
+    locale: Optional[str] = Field(default=None, max_length=50)
+    timezone: Optional[str] = Field(default=None, max_length=120)
+    device_name: Optional[str] = Field(default=None, max_length=120)
+
+
+class DeviceUnregisterIn(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=200)
+    push_token: Optional[str] = Field(default=None, max_length=500)
+
+
+class OKOut(BaseModel):
+    ok: bool = True
+
+
 # ----------------------------
 # Announcements (Ads)
 # ----------------------------
@@ -48,7 +117,6 @@ class AnnouncementOut(BaseModel):
     created_at: datetime
 
 
-# --- Moderation ---
 class AppealIn(BaseModel):
     reason: Optional[str] = Field(default=None, max_length=2000)
 
@@ -99,14 +167,16 @@ class SupportMessageOut(BaseModel):
 class TextCheckIn(BaseModel):
     text: str
 
+
 class TextCheckOut(BaseModel):
     label: str
     reason: str = ""
     t: float | None = None
 
+
 class MediaUploadOut(BaseModel):
     announcement: AnnouncementOut
     max_nsfw: float
-    decision: str  # "active" | "draft"
+    decision: str
     can_appeal: bool
     message: str

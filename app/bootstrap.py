@@ -11,9 +11,11 @@ CORE_TABLES: Dict[str, str] = {
         CREATE TABLE IF NOT EXISTS users (
           id TEXT PRIMARY KEY,
           email TEXT NOT NULL UNIQUE,
+          phone TEXT NULL,
           password_hash TEXT NOT NULL,
           role TEXT NOT NULL DEFAULT 'user',
-          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          deleted_at TIMESTAMPTZ NULL
         );
     """,
     "announcements": """
@@ -33,6 +35,55 @@ CORE_TABLES: Dict[str, str] = {
 
 
 AUX_TABLES: Dict[str, str] = {
+    "user_profiles": """
+        CREATE TABLE IF NOT EXISTS user_profiles (
+          user_id TEXT PRIMARY KEY,
+          display_name TEXT NOT NULL DEFAULT 'Пользователь',
+          bio TEXT NULL,
+          city TEXT NULL,
+          home_location JSONB NULL,
+          extra JSONB NULL DEFAULT '{}'::jsonb,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+    """,
+    "user_stats": """
+        CREATE TABLE IF NOT EXISTS user_stats (
+          user_id TEXT PRIMARY KEY,
+          rating_avg DOUBLE PRECISION NOT NULL DEFAULT 0,
+          rating_count INTEGER NOT NULL DEFAULT 0,
+          completed_count INTEGER NOT NULL DEFAULT 0,
+          cancelled_count INTEGER NOT NULL DEFAULT 0,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+    """,
+    "reviews": """
+        CREATE TABLE IF NOT EXISTS reviews (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NULL,
+          from_user_id TEXT NOT NULL,
+          to_user_id TEXT NOT NULL,
+          stars INTEGER NOT NULL,
+          text TEXT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+    """,
+    "user_devices": """
+        CREATE TABLE IF NOT EXISTS user_devices (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          platform TEXT NOT NULL,
+          device_id TEXT NOT NULL,
+          push_token TEXT NULL,
+          locale TEXT NULL,
+          timezone TEXT NULL,
+          device_name TEXT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          deleted_at TIMESTAMPTZ NULL
+        );
+    """,
     "chat_threads": """
         CREATE TABLE IF NOT EXISTS chat_threads (
           id TEXT PRIMARY KEY,
@@ -131,6 +182,45 @@ AUX_TABLES: Dict[str, str] = {
 }
 
 
+COMPAT_DDLS: Iterable[str] = (
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT NULL;",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL;",
+    "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS display_name TEXT NULL;",
+    "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS bio TEXT NULL;",
+    "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS city TEXT NULL;",
+    "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS home_location JSONB NULL;",
+    "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS extra JSONB NULL DEFAULT '{}'::jsonb;",
+    "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS rating_avg DOUBLE PRECISION NOT NULL DEFAULT 0;",
+    "ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS rating_count INTEGER NOT NULL DEFAULT 0;",
+    "ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS completed_count INTEGER NOT NULL DEFAULT 0;",
+    "ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS cancelled_count INTEGER NOT NULL DEFAULT 0;",
+    "ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS id TEXT NULL;",
+    "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS task_id TEXT NULL;",
+    "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS from_user_id TEXT NULL;",
+    "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS to_user_id TEXT NULL;",
+    "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS stars INTEGER NULL;",
+    "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS text TEXT NULL;",
+    "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS id TEXT NULL;",
+    "ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS user_id TEXT NULL;",
+    "ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS platform TEXT NULL;",
+    "ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS device_id TEXT NULL;",
+    "ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS push_token TEXT NULL;",
+    "ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS locale TEXT NULL;",
+    "ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS timezone TEXT NULL;",
+    "ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS device_name TEXT NULL;",
+    "ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL;",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique ON users(phone) WHERE phone IS NOT NULL;",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_id_unique ON reviews(id) WHERE id IS NOT NULL;",
+)
+
+
 INDEX_DDLS: Iterable[tuple[str, str, Sequence[str]]] = (
     ("announcements", "CREATE INDEX IF NOT EXISTS idx_announcements_user_id ON announcements(user_id);", ("user_id",)),
     (
@@ -139,6 +229,31 @@ INDEX_DDLS: Iterable[tuple[str, str, Sequence[str]]] = (
         ("created_at",),
     ),
     ("announcements", "CREATE INDEX IF NOT EXISTS idx_announcements_status ON announcements(status);", ("status",)),
+    (
+        "reviews",
+        "CREATE INDEX IF NOT EXISTS idx_reviews_to_user_created_at ON reviews(to_user_id, created_at DESC);",
+        ("to_user_id", "created_at"),
+    ),
+    (
+        "reviews",
+        "CREATE INDEX IF NOT EXISTS idx_reviews_from_user_created_at ON reviews(from_user_id, created_at DESC);",
+        ("from_user_id", "created_at"),
+    ),
+    (
+        "user_devices",
+        "CREATE INDEX IF NOT EXISTS idx_user_devices_device_id ON user_devices(device_id);",
+        ("device_id",),
+    ),
+    (
+        "user_devices",
+        "CREATE INDEX IF NOT EXISTS idx_user_devices_user_id_deleted_at ON user_devices(user_id, deleted_at);",
+        ("user_id", "deleted_at"),
+    ),
+    (
+        "user_devices",
+        "CREATE INDEX IF NOT EXISTS idx_user_devices_push_token ON user_devices(push_token);",
+        ("push_token",),
+    ),
     (
         "chat_threads",
         "CREATE INDEX IF NOT EXISTS idx_chat_threads_last_message_at ON chat_threads(last_message_at DESC NULLS LAST);",
@@ -210,6 +325,11 @@ def ensure_auxiliary_tables() -> None:
             execute(ddl)
 
 
+def ensure_compat_columns() -> None:
+    for ddl in COMPAT_DDLS:
+        execute(ddl)
+
+
 def ensure_indexes() -> None:
     clear_schema_cache()
     for table_name, ddl, required_columns in INDEX_DDLS:
@@ -220,5 +340,6 @@ def ensure_indexes() -> None:
 def ensure_all_tables() -> None:
     ensure_core_tables()
     ensure_auxiliary_tables()
+    ensure_compat_columns()
     clear_schema_cache()
     ensure_indexes()
