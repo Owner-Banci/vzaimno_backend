@@ -84,6 +84,19 @@ AUX_TABLES: Dict[str, str] = {
           deleted_at TIMESTAMPTZ NULL
         );
     """,
+    "announcement_offers": """
+        CREATE TABLE IF NOT EXISTS announcement_offers (
+          id TEXT PRIMARY KEY,
+          announcement_id TEXT NOT NULL,
+          performer_id TEXT NOT NULL,
+          message TEXT NULL,
+          proposed_price INTEGER NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          chat_thread_id TEXT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          deleted_at TIMESTAMPTZ NULL
+        );
+    """,
     "chat_threads": """
         CREATE TABLE IF NOT EXISTS chat_threads (
           id TEXT PRIMARY KEY,
@@ -216,8 +229,18 @@ COMPAT_DDLS: Iterable[str] = (
     "ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();",
     "ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now();",
     "ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL;",
+    "ALTER TABLE announcement_offers ADD COLUMN IF NOT EXISTS id TEXT NULL;",
+    "ALTER TABLE announcement_offers ADD COLUMN IF NOT EXISTS announcement_id TEXT NULL;",
+    "ALTER TABLE announcement_offers ADD COLUMN IF NOT EXISTS performer_id TEXT NULL;",
+    "ALTER TABLE announcement_offers ADD COLUMN IF NOT EXISTS message TEXT NULL;",
+    "ALTER TABLE announcement_offers ADD COLUMN IF NOT EXISTS proposed_price INTEGER NULL;",
+    "ALTER TABLE announcement_offers ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';",
+    "ALTER TABLE announcement_offers ADD COLUMN IF NOT EXISTS chat_thread_id TEXT NULL;",
+    "ALTER TABLE announcement_offers ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE announcement_offers ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL;",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique ON users(phone) WHERE phone IS NOT NULL;",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_id_unique ON reviews(id) WHERE id IS NOT NULL;",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_announcement_offers_unique_pending ON announcement_offers(announcement_id, performer_id) WHERE deleted_at IS NULL AND status = 'pending';",
 )
 
 
@@ -255,9 +278,34 @@ INDEX_DDLS: Iterable[tuple[str, str, Sequence[str]]] = (
         ("push_token",),
     ),
     (
+        "announcement_offers",
+        "CREATE INDEX IF NOT EXISTS idx_announcement_offers_announcement_id ON announcement_offers(announcement_id);",
+        ("announcement_id",),
+    ),
+    (
+        "announcement_offers",
+        "CREATE INDEX IF NOT EXISTS idx_announcement_offers_performer_id ON announcement_offers(performer_id);",
+        ("performer_id",),
+    ),
+    (
+        "announcement_offers",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_announcement_offers_chat_thread_id ON announcement_offers(chat_thread_id) WHERE chat_thread_id IS NOT NULL;",
+        ("chat_thread_id",),
+    ),
+    (
+        "announcement_offers",
+        "CREATE INDEX IF NOT EXISTS idx_announcement_offers_status_deleted_at ON announcement_offers(status, deleted_at);",
+        ("status", "deleted_at"),
+    ),
+    (
         "chat_threads",
         "CREATE INDEX IF NOT EXISTS idx_chat_threads_last_message_at ON chat_threads(last_message_at DESC NULLS LAST);",
         ("last_message_at",),
+    ),
+    (
+        "chat_threads",
+        "CREATE INDEX IF NOT EXISTS idx_chat_threads_offer_id ON chat_threads(offer_id);",
+        ("offer_id",),
     ),
     (
         "chat_participants",
@@ -337,9 +385,29 @@ def ensure_indexes() -> None:
             execute(ddl)
 
 
+def ensure_chat_thread_kind_compat() -> None:
+    row = fetch_one(
+        """
+        SELECT data_type, udt_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'chat_threads'
+          AND column_name = 'kind'
+        """,
+    )
+    if not row:
+        return
+
+    data_type = str(row[0] or "").lower()
+    udt_name = str(row[1] or "").lower()
+    if data_type == "user-defined" and udt_name == "chat_thread_kind":
+        execute("ALTER TYPE chat_thread_kind ADD VALUE IF NOT EXISTS 'offer';")
+
+
 def ensure_all_tables() -> None:
     ensure_core_tables()
     ensure_auxiliary_tables()
     ensure_compat_columns()
+    ensure_chat_thread_kind_compat()
     clear_schema_cache()
     ensure_indexes()

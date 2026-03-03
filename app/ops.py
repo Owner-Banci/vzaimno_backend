@@ -44,6 +44,21 @@ def report_status_select_sql(alias: str = "reports") -> str:
     return "'open'"
 
 
+def _notification_user_id_requires_uuid() -> bool:
+    row = fetch_one(
+        """
+        SELECT udt_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'notifications'
+          AND column_name = 'user_id'
+        """,
+    )
+    if not row or not row[0]:
+        return False
+    return str(row[0]).lower() == "uuid"
+
+
 def create_notification(
     user_id: str,
     notif_type: str,
@@ -51,6 +66,12 @@ def create_notification(
     payload: Optional[Dict[str, Any]] = None,
 ) -> str:
     notification_id = str(uuid.uuid4())
+    if _notification_user_id_requires_uuid():
+        try:
+            uuid.UUID(str(user_id))
+        except Exception:
+            return notification_id
+
     columns = get_table_columns("notifications")
     values: Dict[str, Any] = {"id": notification_id, "user_id": user_id, "type": notif_type, "body": body}
     if "payload" in columns:

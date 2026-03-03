@@ -14,16 +14,28 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.bootstrap import ensure_all_tables
+from app.chat import (
+    assert_thread_access,
+    get_or_create_offer_thread,
+    list_thread_messages,
+    list_user_threads,
+    post_thread_message,
+)
 from app.db import execute, fetch_all, fetch_one
 from app.geocoding import geocode_address
 from app.moderation_image import get_nsfw_detector
 from app.moderation_text import classify_text
-from app.ops import create_report, ensure_appeal_report, report_status_select_sql
+from app.ops import create_notification, create_report, ensure_appeal_report, report_status_select_sql
 from app.schema_compat import table_has_column
 from app.schemas import (
+    AcceptOfferOut,
     AnnouncementOut,
     AppealIn,
+    ChatMessageIn,
+    ChatMessageOut,
+    ChatThreadOut,
     CreateAnnouncementIn,
+    CreateOfferIn,
     DeviceRegisterIn,
     DeviceUnregisterIn,
     GeoPointOut,
@@ -38,6 +50,8 @@ from app.schemas import (
     SupportThreadOut,
     TokenOut,
     UpdateMyProfileIn,
+    OfferOut,
+    OfferOutExpanded,
     UserProfileOut,
     UserReviewListOut,
     UserReviewOut,
@@ -769,6 +783,13 @@ def _normalize_address(value: Any) -> Optional[str]:
     return normalized or None
 
 
+def _normalize_message(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.strip().split())
+    return normalized or None
+
+
 def _parse_float(value: Any) -> Optional[float]:
     if isinstance(value, (int, float)):
         return float(value)
@@ -797,6 +818,20 @@ def _extract_point(value: Any) -> Optional[Tuple[float, float]]:
 
 def _point_obj(point: Tuple[float, float]) -> Dict[str, float]:
     return {"lat": point[0], "lon": point[1]}
+
+
+def _normalize_budget_fields(data: Dict[str, Any]) -> None:
+    for key in ("budget", "budget_min", "budget_max"):
+        if key not in data:
+            continue
+
+        parsed = _parse_float(data.get(key))
+        if parsed is None:
+            if data.get(key) in ("", None):
+                data[key] = None
+            continue
+
+        data[key] = int(parsed)
 
 
 def _extract_primary_address(category: str, data: Dict[str, Any]) -> Optional[str]:
@@ -835,11 +870,168 @@ def _save_upload(ann_id: str, file: UploadFile, content: bytes) -> str:
     folder.mkdir(parents=True, exist_ok=True)
     out = folder / f"{uuid.uuid4().hex}_{safe_name}"
     out.write_bytes(content)
-    return str(out)
+    return "/" + out.as_posix().lstrip("/")
 
 
 def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _fetch_announcement_or_404(ann_id: str) -> AnnouncementOut:
+    row = fetch_one(
+        """
+        SELECT id, user_id, category, title, status, data, created_at
+        FROM announcements
+        WHERE id = %s
+          AND deleted_at IS NULL
+        """,
+        (ann_id,),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Announcement not found")
+    return _row_to_announcement(row)
+
+
+def _count_pending_offers(ann_id: str) -> int:
+    row = fetch_one(
+        """
+        SELECT COUNT(*)
+        FROM announcement_offers
+        WHERE announcement_id = %s
+          AND status IN ('pending', 'accepted')
+          AND deleted_at IS NULL
+        """,
+        (ann_id,),
+    )
+    return int(row[0] or 0) if row else 0
+
+
+def _sync_announcement_offers_count(ann_id: str) -> int:
+    row = fetch_one(
+        """
+        SELECT data
+        FROM announcements
+        WHERE id = %s
+        """,
+        (ann_id,),
+    )
+    if not row:
+        return 0
+
+    raw_data = row[0]
+    if raw_data is None:
+        data_obj: Dict[str, Any] = {}
+    elif isinstance(raw_data, str):
+        try:
+            data_obj = json.loads(raw_data)
+        except Exception:
+            data_obj = {}
+    else:
+        data_obj = dict(raw_data)
+
+    offers_count = _count_pending_offers(ann_id)
+    data_obj["offers_count"] = offers_count
+
+    execute(
+        """
+        UPDATE announcements
+        SET data = %s::jsonb,
+            updated_at = now()
+        WHERE id = %s
+        """,
+        (json.dumps(data_obj, ensure_ascii=False), ann_id),
+    )
+    return offers_count
+
+
+def _offer_avatar_select_sql() -> str:
+    if _profile_has_extra_column():
+        return "up.extra->>'avatar_url' AS avatar_url"
+    return "NULL AS avatar_url"
+
+
+def _offer_from_row(row) -> OfferOut:
+    return OfferOut(
+        id=row[0],
+        announcement_id=row[1],
+        performer_id=row[2],
+        message=_normalize_message(row[3]),
+        proposed_price=int(row[4]) if row[4] is not None else None,
+        status=row[5],
+        created_at=row[6],
+    )
+
+
+def _offer_expanded_from_row(row) -> OfferOutExpanded:
+    offer = _offer_from_row(row)
+    return OfferOutExpanded(
+        id=offer.id,
+        announcement_id=offer.announcement_id,
+        performer_id=offer.performer_id,
+        message=offer.message,
+        proposed_price=offer.proposed_price,
+        status=offer.status,
+        created_at=offer.created_at,
+        performer_profile={
+            "user_id": row[7],
+            "display_name": row[8],
+            "city": _normalize_optional_text(row[9], collapse_spaces=True),
+            "contact": _normalize_optional_text(row[10], collapse_spaces=True),
+            "avatar_url": row[11],
+        },
+        performer_stats={
+            "rating_avg": float(row[12] or 0),
+            "rating_count": int(row[13] or 0),
+            "completed_count": int(row[14] or 0),
+            "cancelled_count": int(row[15] or 0),
+        },
+    )
+
+
+def _fetch_expanded_offer(ann_id: str, offer_id: str) -> Optional[OfferOutExpanded]:
+    row = fetch_one(
+        f"""
+        SELECT
+            ao.id,
+            ao.announcement_id,
+            ao.performer_id,
+            ao.message,
+            ao.proposed_price,
+            ao.status,
+            ao.created_at,
+            ao.performer_id::text,
+            COALESCE(
+                NULLIF(BTRIM(up.display_name), ''),
+                NULLIF(BTRIM(u.phone), ''),
+                NULLIF(BTRIM(u.email), ''),
+                'Пользователь'
+            ) AS performer_display_name,
+            up.city,
+            COALESCE(
+                NULLIF(BTRIM(u.phone), ''),
+                NULLIF(BTRIM(u.email), '')
+            ) AS performer_contact,
+            {_offer_avatar_select_sql()},
+            COALESCE(us.rating_avg, 0),
+            COALESCE(us.rating_count, 0),
+            COALESCE(us.completed_count, 0),
+            COALESCE(us.cancelled_count, 0)
+        FROM announcement_offers ao
+        JOIN users u
+          ON u.id::text = ao.performer_id::text
+        LEFT JOIN user_profiles up
+          ON up.user_id::text = ao.performer_id::text
+        LEFT JOIN user_stats us
+          ON us.user_id::text = ao.performer_id::text
+        WHERE ao.announcement_id = %s
+          AND ao.id = %s
+          AND ao.deleted_at IS NULL
+        """,
+        (ann_id, offer_id),
+    )
+    if not row:
+        return None
+    return _offer_expanded_from_row(row)
 
 
 # ----------------------------
@@ -854,6 +1046,8 @@ def create_announcement(
 
     data: Dict[str, Any] = dict(payload.data or {})
     category = (payload.category or "").strip().lower()
+    _normalize_budget_fields(data)
+    data["offers_count"] = int(_parse_float(data.get("offers_count")) or 0)
 
     if category == "delivery":
         pickup_address = _normalize_address(data.get("pickup_address"))
@@ -1210,6 +1404,306 @@ def delete_announcement(
 
 
 # ----------------------------
+# Offers
+# ----------------------------
+@app.post("/announcements/{ann_id}/offers", response_model=OfferOut, status_code=201)
+def create_offer(
+    ann_id: str,
+    payload: CreateOfferIn,
+    user: UserOut = Depends(get_current_user),
+) -> OfferOut:
+    ann = _fetch_announcement_or_404(ann_id)
+
+    if ann.user_id == user.id:
+        raise HTTPException(status_code=403, detail="Нельзя откликаться на своё объявление")
+
+    if ann.status != STATUS_ACTIVE:
+        raise HTTPException(status_code=400, detail="Отклики доступны только для активных объявлений")
+
+    accepted_offer = fetch_one(
+        """
+        SELECT id
+        FROM announcement_offers
+        WHERE announcement_id = %s
+          AND status = 'accepted'
+          AND deleted_at IS NULL
+        LIMIT 1
+        """,
+        (ann_id,),
+    )
+    if accepted_offer:
+        raise HTTPException(status_code=409, detail="По объявлению уже выбран исполнитель")
+
+    message = _normalize_message(payload.message)
+    proposed_price = payload.proposed_price
+
+    existing = fetch_one(
+        """
+        SELECT id
+        FROM announcement_offers
+        WHERE announcement_id = %s
+          AND performer_id = %s
+          AND status = 'pending'
+          AND deleted_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (ann_id, user.id),
+    )
+
+    if existing:
+        offer_id = existing[0]
+        execute(
+            """
+            UPDATE announcement_offers
+            SET message = %s,
+                proposed_price = %s,
+                deleted_at = NULL
+            WHERE id = %s
+            """,
+            (message, proposed_price, offer_id),
+        )
+    else:
+        offer_id = str(uuid.uuid4())
+        execute(
+            """
+            INSERT INTO announcement_offers (
+                id, announcement_id, performer_id, message, proposed_price, status, created_at, deleted_at
+            )
+            VALUES (%s, %s, %s, %s, %s, 'pending', now(), NULL)
+            """,
+            (offer_id, ann_id, user.id, message, proposed_price),
+        )
+
+    _sync_announcement_offers_count(ann_id)
+    create_notification(
+        user_id=ann.user_id,
+        notif_type="offer",
+        body="Новый отклик на ваше объявление",
+        payload={"announcement_id": ann_id, "offer_id": offer_id},
+    )
+
+    row = fetch_one(
+        """
+        SELECT id, announcement_id, performer_id, message, proposed_price, status, created_at
+        FROM announcement_offers
+        WHERE id = %s
+        """,
+        (offer_id,),
+    )
+    if not row:
+        raise HTTPException(status_code=500, detail="Failed to create offer")
+
+    return _offer_from_row(row)
+
+
+@app.get("/announcements/{ann_id}/offers", response_model=List[OfferOutExpanded])
+def list_announcement_offers(
+    ann_id: str,
+    user: UserOut = Depends(get_current_user),
+) -> List[OfferOutExpanded]:
+    ann = _fetch_announcement_or_404(ann_id)
+    if ann.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Not your announcement")
+
+    rows = fetch_all(
+        f"""
+        SELECT
+            ao.id,
+            ao.announcement_id,
+            ao.performer_id,
+            ao.message,
+            ao.proposed_price,
+            ao.status,
+            ao.created_at,
+            ao.performer_id::text,
+            COALESCE(
+                NULLIF(BTRIM(up.display_name), ''),
+                NULLIF(BTRIM(u.phone), ''),
+                NULLIF(BTRIM(u.email), ''),
+                'Пользователь'
+            ) AS performer_display_name,
+            up.city,
+            COALESCE(
+                NULLIF(BTRIM(u.phone), ''),
+                NULLIF(BTRIM(u.email), '')
+            ) AS performer_contact,
+            {_offer_avatar_select_sql()},
+            COALESCE(us.rating_avg, 0),
+            COALESCE(us.rating_count, 0),
+            COALESCE(us.completed_count, 0),
+            COALESCE(us.cancelled_count, 0)
+        FROM announcement_offers ao
+        JOIN users u
+          ON u.id::text = ao.performer_id::text
+        LEFT JOIN user_profiles up
+          ON up.user_id::text = ao.performer_id::text
+        LEFT JOIN user_stats us
+          ON us.user_id::text = ao.performer_id::text
+        WHERE ao.announcement_id = %s
+          AND ao.status IN ('pending', 'accepted')
+          AND ao.deleted_at IS NULL
+        ORDER BY CASE WHEN ao.status = 'accepted' THEN 0 ELSE 1 END,
+                 ao.created_at DESC
+        """,
+        (ann_id,),
+    )
+
+    return [_offer_expanded_from_row(row) for row in rows]
+
+
+@app.post("/announcements/{ann_id}/offers/{offer_id}/accept", response_model=AcceptOfferOut)
+def accept_announcement_offer(
+    ann_id: str,
+    offer_id: str,
+    user: UserOut = Depends(get_current_user),
+) -> AcceptOfferOut:
+    ann = _fetch_announcement_or_404(ann_id)
+    if ann.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Not your announcement")
+
+    row = fetch_one(
+        """
+        SELECT performer_id, status
+        FROM announcement_offers
+        WHERE id = %s
+          AND announcement_id = %s
+          AND deleted_at IS NULL
+        """,
+        (offer_id, ann_id),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Offer not found")
+
+    performer_id, status = row
+    if status == "rejected":
+        raise HTTPException(status_code=409, detail="Отклик уже отклонён")
+
+    did_accept_now = False
+    thread_id = get_or_create_offer_thread(
+        offer_id=offer_id,
+        owner_id=ann.user_id,
+        performer_id=performer_id,
+    )
+
+    if status != "accepted":
+        if status != "pending":
+            raise HTTPException(status_code=409, detail="Отклик нельзя принять в текущем статусе")
+
+        execute(
+            """
+            UPDATE announcement_offers
+            SET status = 'accepted'
+            WHERE id = %s
+            """,
+            (offer_id,),
+        )
+        _sync_announcement_offers_count(ann_id)
+        did_accept_now = True
+
+    if did_accept_now:
+        create_notification(
+            user_id=performer_id,
+            notif_type="offer_accepted",
+            body="Ваш отклик принят. Открыт чат.",
+            payload={"thread_id": thread_id, "announcement_id": ann_id, "offer_id": offer_id},
+        )
+
+    expanded = _fetch_expanded_offer(ann_id, offer_id)
+    if expanded is None:
+        raise HTTPException(status_code=500, detail="Failed to load accepted offer")
+
+    return AcceptOfferOut(thread_id=thread_id, offer=expanded)
+
+
+@app.post("/announcements/{ann_id}/offers/{offer_id}/reject", response_model=OKOut)
+def reject_announcement_offer(
+    ann_id: str,
+    offer_id: str,
+    user: UserOut = Depends(get_current_user),
+) -> OKOut:
+    ann = _fetch_announcement_or_404(ann_id)
+    if ann.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Not your announcement")
+
+    row = fetch_one(
+        """
+        SELECT performer_id, status
+        FROM announcement_offers
+        WHERE id = %s
+          AND announcement_id = %s
+          AND deleted_at IS NULL
+        """,
+        (offer_id, ann_id),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Offer not found")
+
+    performer_id, status = row
+    if status == "accepted":
+        raise HTTPException(status_code=409, detail="Нельзя отклонить уже принятый отклик")
+
+    if status != "rejected":
+        execute(
+            """
+            UPDATE announcement_offers
+            SET status = 'rejected'
+            WHERE id = %s
+            """,
+            (offer_id,),
+        )
+        _sync_announcement_offers_count(ann_id)
+        create_notification(
+            user_id=performer_id,
+            notif_type="offer_rejected",
+            body="Ваш отклик отклонён.",
+            payload={"announcement_id": ann_id, "offer_id": offer_id},
+        )
+
+    return OKOut(ok=True)
+
+
+# ----------------------------
+# Chat (offer threads)
+# ----------------------------
+@app.get("/chats", response_model=List[ChatThreadOut])
+def get_chats(user: UserOut = Depends(get_current_user)) -> List[ChatThreadOut]:
+    if user.id == "dev":
+        return []
+
+    threads = list_user_threads(user.id)
+    return [ChatThreadOut(**thread) for thread in threads]
+
+
+@app.get("/chats/{thread_id}/messages", response_model=List[ChatMessageOut])
+def get_chat_messages(
+    thread_id: str,
+    limit: int = 50,
+    before: Optional[datetime] = None,
+    user: UserOut = Depends(get_current_user),
+) -> List[ChatMessageOut]:
+    if user.id == "dev":
+        return []
+
+    messages = list_thread_messages(thread_id=thread_id, user_id=user.id, limit=limit, before=before)
+    return [ChatMessageOut(**message) for message in messages]
+
+
+@app.post("/chats/{thread_id}/messages", response_model=ChatMessageOut, status_code=201)
+def send_chat_message(
+    thread_id: str,
+    payload: ChatMessageIn,
+    user: UserOut = Depends(get_current_user),
+) -> ChatMessageOut:
+    if user.id == "dev":
+        raise HTTPException(status_code=400, detail="DEV chat is not available")
+
+    assert_thread_access(thread_id, user.id)
+    message = post_thread_message(thread_id=thread_id, sender_id=user.id, text=payload.text)
+    return ChatMessageOut(**message)
+
+
+# ----------------------------
 # Reports
 # ----------------------------
 @app.post("/reports", response_model=ReportOut, status_code=201)
@@ -1300,7 +1794,14 @@ def public_announcements(limit: int = 200) -> List[AnnouncementOut]:
         """
         SELECT id, user_id, category, title, status, data, created_at
         FROM announcements
-        WHERE deleted_at IS NULL AND status = %s
+        WHERE deleted_at IS NULL
+          AND status = %s
+          AND announcements.user_id::text <> 'dev'
+          AND EXISTS (
+              SELECT 1
+              FROM users u
+              WHERE u.id::text = announcements.user_id::text
+          )
         ORDER BY created_at DESC
         LIMIT %s
         """,

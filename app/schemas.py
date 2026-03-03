@@ -117,6 +117,46 @@ class AnnouncementOut(BaseModel):
     created_at: datetime
 
 
+class CreateOfferIn(BaseModel):
+    message: Optional[str] = Field(default=None, max_length=1000)
+    proposed_price: Optional[int] = Field(default=None, ge=0)
+
+
+class OfferPerformerProfileOut(BaseModel):
+    user_id: str
+    display_name: str
+    city: Optional[str] = None
+    contact: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+
+class OfferPerformerStatsOut(BaseModel):
+    rating_avg: float = 0.0
+    rating_count: int = 0
+    completed_count: int = 0
+    cancelled_count: int = 0
+
+
+class OfferOut(BaseModel):
+    id: str
+    announcement_id: str
+    performer_id: str
+    message: Optional[str] = None
+    proposed_price: Optional[int] = None
+    status: str
+    created_at: datetime
+
+
+class OfferOutExpanded(OfferOut):
+    performer_profile: OfferPerformerProfileOut
+    performer_stats: OfferPerformerStatsOut
+
+
+class AcceptOfferOut(BaseModel):
+    thread_id: str
+    offer: OfferOutExpanded
+
+
 class AppealIn(BaseModel):
     reason: Optional[str] = Field(default=None, max_length=2000)
 
@@ -147,8 +187,33 @@ class SupportThreadOut(BaseModel):
     thread_id: str
 
 
+class ChatThreadOut(BaseModel):
+    thread_id: str
+    kind: str
+    partner_id: Optional[str] = None
+    partner_display_name: str
+    partner_avatar_url: Optional[str] = None
+    last_message_text: Optional[str] = None
+    last_message_at: Optional[datetime] = None
+    unread_count: int = 0
+    announcement_id: Optional[str] = None
+    announcement_title: Optional[str] = None
+
+
 class SupportMessageIn(BaseModel):
     text: str = Field(..., min_length=1, max_length=5000)
+
+
+class ChatMessageIn(BaseModel):
+    text: str = Field(..., min_length=1, max_length=5000)
+
+
+class ChatMessageOut(BaseModel):
+    id: str
+    thread_id: str
+    sender_id: str
+    text: str
+    created_at: datetime
 
 
 class SupportMessageOut(BaseModel):
