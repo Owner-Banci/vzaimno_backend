@@ -1,15 +1,90 @@
 from __future__ import annotations
 
+import anyio
+import asyncio
 import uuid
 from datetime import datetime
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
-from fastapi import HTTPException
+from fastapi import HTTPException, WebSocket
 
 from app.db import execute, fetch_all, fetch_one
 from app.ops import create_notification
 from app.schema_compat import table_has_column
+
+
+class ChatWebSocketHub:
+    def __init__(self) -> None:
+        self._connections: Dict[str, List[WebSocket]] = {}
+        self._lock = asyncio.Lock()
+
+    async def connect(self, thread_id: str, websocket: WebSocket) -> None:
+        await websocket.accept()
+        async with self._lock:
+            thread_sockets = self._connections.setdefault(thread_id, [])
+            thread_sockets.append(websocket)
+
+    async def disconnect(self, thread_id: str, websocket: WebSocket) -> None:
+        async with self._lock:
+            thread_sockets = self._connections.get(thread_id)
+            if not thread_sockets:
+                return
+
+            self._connections[thread_id] = [item for item in thread_sockets if item is not websocket]
+            if not self._connections[thread_id]:
+                self._connections.pop(thread_id, None)
+
+    async def broadcast(self, thread_id: str, payload: Dict[str, Any]) -> None:
+        async with self._lock:
+            thread_sockets = list(self._connections.get(thread_id, []))
+
+        if not thread_sockets:
+            return
+
+        stale: List[WebSocket] = []
+        for websocket in thread_sockets:
+            try:
+                await websocket.send_json(payload)
+            except Exception:
+                stale.append(websocket)
+
+        if stale:
+            async with self._lock:
+                existing = self._connections.get(thread_id, [])
+                self._connections[thread_id] = [item for item in existing if item not in stale]
+                if not self._connections[thread_id]:
+                    self._connections.pop(thread_id, None)
+
+
+_chat_ws_hub = ChatWebSocketHub()
+
+
+async def connect_chat_socket(thread_id: str, websocket: WebSocket) -> None:
+    await _chat_ws_hub.connect(thread_id, websocket)
+
+
+async def disconnect_chat_socket(thread_id: str, websocket: WebSocket) -> None:
+    await _chat_ws_hub.disconnect(thread_id, websocket)
+
+
+async def broadcast_chat_event(thread_id: str, payload: Dict[str, Any]) -> None:
+    await _chat_ws_hub.broadcast(thread_id, payload)
+
+
+async def broadcast_chat_message(thread_id: str, message: Dict[str, Any]) -> None:
+    await broadcast_chat_event(
+        thread_id=thread_id,
+        payload={"type": "message", "payload": message},
+    )
+
+
+def publish_chat_message_sync(thread_id: str, message: Dict[str, Any]) -> None:
+    try:
+        anyio.from_thread.run(broadcast_chat_message, thread_id, message)
+    except Exception:
+        # websocket-уведомление не должно валить REST-отправку
+        return
 
 
 def _normalize_text(text: str) -> str:

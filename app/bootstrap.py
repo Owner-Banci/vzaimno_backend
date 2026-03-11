@@ -196,8 +196,10 @@ AUX_TABLES: Dict[str, str] = {
 
 
 COMPAT_DDLS: Iterable[str] = (
+    "CREATE EXTENSION IF NOT EXISTS postgis;",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT NULL;",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL;",
+    "ALTER TABLE announcements ADD COLUMN IF NOT EXISTS location_point geography(Point,4326);",
     "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS display_name TEXT NULL;",
     "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS bio TEXT NULL;",
     "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS city TEXT NULL;",
@@ -238,6 +240,40 @@ COMPAT_DDLS: Iterable[str] = (
     "ALTER TABLE announcement_offers ADD COLUMN IF NOT EXISTS chat_thread_id TEXT NULL;",
     "ALTER TABLE announcement_offers ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();",
     "ALTER TABLE announcement_offers ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL;",
+    """
+    UPDATE announcements
+    SET location_point = ST_SetSRID(
+        ST_MakePoint(
+            COALESCE(
+                NULLIF(data -> 'point' ->> 'lon', ''),
+                NULLIF(data -> 'pickup_point' ->> 'lon', ''),
+                NULLIF(data -> 'help_point' ->> 'lon', '')
+            )::double precision,
+            COALESCE(
+                NULLIF(data -> 'point' ->> 'lat', ''),
+                NULLIF(data -> 'pickup_point' ->> 'lat', ''),
+                NULLIF(data -> 'help_point' ->> 'lat', '')
+            )::double precision
+        ),
+        4326
+    )::geography
+    WHERE location_point IS NULL
+      AND (
+            jsonb_typeof(data -> 'point') = 'object'
+            OR jsonb_typeof(data -> 'pickup_point') = 'object'
+            OR jsonb_typeof(data -> 'help_point') = 'object'
+      )
+      AND COALESCE(
+            NULLIF(data -> 'point' ->> 'lat', ''),
+            NULLIF(data -> 'pickup_point' ->> 'lat', ''),
+            NULLIF(data -> 'help_point' ->> 'lat', '')
+          ) ~ '^-?[0-9]+(\\.[0-9]+)?$'
+      AND COALESCE(
+            NULLIF(data -> 'point' ->> 'lon', ''),
+            NULLIF(data -> 'pickup_point' ->> 'lon', ''),
+            NULLIF(data -> 'help_point' ->> 'lon', '')
+          ) ~ '^-?[0-9]+(\\.[0-9]+)?$';
+    """,
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique ON users(phone) WHERE phone IS NOT NULL;",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_id_unique ON reviews(id) WHERE id IS NOT NULL;",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_announcement_offers_unique_pending ON announcement_offers(announcement_id, performer_id) WHERE deleted_at IS NULL AND status = 'pending';",
@@ -252,6 +288,11 @@ INDEX_DDLS: Iterable[tuple[str, str, Sequence[str]]] = (
         ("created_at",),
     ),
     ("announcements", "CREATE INDEX IF NOT EXISTS idx_announcements_status ON announcements(status);", ("status",)),
+    (
+        "announcements",
+        "CREATE INDEX IF NOT EXISTS idx_announcements_location_point_gist ON announcements USING GIST (location_point);",
+        ("location_point",),
+    ),
     (
         "reviews",
         "CREATE INDEX IF NOT EXISTS idx_reviews_to_user_created_at ON reviews(to_user_id, created_at DESC);",

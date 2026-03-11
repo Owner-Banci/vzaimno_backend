@@ -9,13 +9,18 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from starlette.concurrency import run_in_threadpool
 
 from app.bootstrap import ensure_all_tables
 from app.chat import (
     assert_thread_access,
+    broadcast_chat_event,
+    broadcast_chat_message,
+    connect_chat_socket,
+    disconnect_chat_socket,
     get_or_create_offer_thread,
     list_thread_messages,
     list_user_threads,
@@ -26,6 +31,7 @@ from app.geocoding import geocode_address
 from app.moderation_image import get_nsfw_detector
 from app.moderation_text import classify_text
 from app.ops import create_notification, create_report, ensure_appeal_report, report_status_select_sql
+from app.routes_module.router import router as routes_router
 from app.schema_compat import table_has_column
 from app.schemas import (
     AcceptOfferOut,
@@ -63,6 +69,7 @@ from app.support import get_or_create_support_thread, list_support_messages, pos
 
 app = FastAPI(title="Slayma Backend (MVP)")
 bearer = HTTPBearer(auto_error=True)
+app.include_router(routes_router)
 
 # ----------------------------
 # Statuses (string enum in DB)
@@ -91,9 +98,7 @@ def ensure_tables() -> None:
 # ----------------------------
 # Auth
 # ----------------------------
-def get_current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> UserOut:
-    token = creds.credentials
-
+def _user_from_token(token: str) -> UserOut:
     if token == "DEV_TOKEN":
         return UserOut(id="dev", email="dev@localdomain.com", role="user")
 
@@ -111,6 +116,33 @@ def get_current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> U
         raise HTTPException(status_code=401, detail="User not found")
 
     return UserOut(id=row[0], email=row[1], role=row[2])
+
+
+def get_current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> UserOut:
+    return _user_from_token(creds.credentials)
+
+
+def _extract_ws_token(websocket: WebSocket) -> Optional[str]:
+    auth_header = websocket.headers.get("authorization")
+    if auth_header:
+        prefix = "bearer "
+        if auth_header.lower().startswith(prefix):
+            token = auth_header[len(prefix) :].strip()
+            if token:
+                return token
+
+    query_token = websocket.query_params.get("token")
+    if query_token:
+        return query_token.strip() or None
+
+    return None
+
+
+def _ws_current_user(websocket: WebSocket) -> UserOut:
+    token = _extract_ws_token(websocket)
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    return _user_from_token(token)
 
 
 @app.post("/auth/register", response_model=TokenOut)
@@ -864,6 +896,15 @@ def _resolve_point(
     return None
 
 
+def _announcement_point_for_storage(category: str, data: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    normalized_category = (category or "").strip().lower()
+    if normalized_category == "delivery":
+        return _extract_point(data.get("pickup_point")) or _extract_point(data.get("point"))
+    if normalized_category == "help":
+        return _extract_point(data.get("help_point")) or _extract_point(data.get("point"))
+    return _extract_point(data.get("point"))
+
+
 def _save_upload(ann_id: str, file: UploadFile, content: bytes) -> str:
     safe_name = (file.filename or "image").replace("/", "_").replace("\\", "_")
     folder = UPLOADS_DIR / ann_id
@@ -1168,12 +1209,38 @@ def create_announcement(
 
     _set_mod(data, mod)
 
+    location_point = _announcement_point_for_storage(payload.category, data)
+    location_lon = location_point[1] if location_point else None
+    location_lat = location_point[0] if location_point else None
+
     execute(
         """
-        INSERT INTO announcements (id, user_id, category, title, status, data)
-        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+        INSERT INTO announcements (id, user_id, category, title, status, data, location_point)
+        VALUES (
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s::jsonb,
+            CASE
+                WHEN %s IS NULL OR %s IS NULL THEN NULL
+                ELSE ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography
+            END
+        )
         """,
-        (ann_id, user.id, payload.category, title, status, json.dumps(data, ensure_ascii=False)),
+        (
+            ann_id,
+            user.id,
+            payload.category,
+            title,
+            status,
+            json.dumps(data, ensure_ascii=False),
+            location_lon,
+            location_lat,
+            location_lon,
+            location_lat,
+        ),
     )
 
     row = fetch_one(
@@ -1690,7 +1757,7 @@ def get_chat_messages(
 
 
 @app.post("/chats/{thread_id}/messages", response_model=ChatMessageOut, status_code=201)
-def send_chat_message(
+async def send_chat_message(
     thread_id: str,
     payload: ChatMessageIn,
     user: UserOut = Depends(get_current_user),
@@ -1698,9 +1765,82 @@ def send_chat_message(
     if user.id == "dev":
         raise HTTPException(status_code=400, detail="DEV chat is not available")
 
-    assert_thread_access(thread_id, user.id)
-    message = post_thread_message(thread_id=thread_id, sender_id=user.id, text=payload.text)
+    await run_in_threadpool(assert_thread_access, thread_id, user.id)
+    message = await run_in_threadpool(post_thread_message, thread_id, user.id, payload.text)
+    await broadcast_chat_message(thread_id=thread_id, message=message)
     return ChatMessageOut(**message)
+
+
+def _parse_ws_chat_text(raw_message: str) -> Optional[str]:
+    raw = (raw_message or "").strip()
+    if not raw:
+        return None
+
+    if not raw.startswith("{"):
+        return raw
+
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return raw
+
+    if not isinstance(payload, dict):
+        return None
+
+    message_type = str(payload.get("type") or "").lower()
+    if message_type == "ping":
+        return None
+
+    text_value = payload.get("text")
+    if isinstance(text_value, str):
+        normalized = text_value.strip()
+        return normalized or None
+
+    return None
+
+
+@app.websocket("/ws/chats/{thread_id}")
+async def chat_websocket(thread_id: str, websocket: WebSocket) -> None:
+    try:
+        user = _ws_current_user(websocket)
+    except HTTPException:
+        await websocket.close(code=4401)
+        return
+
+    if user.id == "dev":
+        await websocket.close(code=4403)
+        return
+
+    try:
+        await run_in_threadpool(assert_thread_access, thread_id, user.id)
+    except HTTPException:
+        await websocket.close(code=4403)
+        return
+
+    await connect_chat_socket(thread_id, websocket)
+    try:
+        await websocket.send_json({"type": "ready", "thread_id": thread_id})
+        while True:
+            incoming = await websocket.receive_text()
+            text = _parse_ws_chat_text(incoming)
+            if text is None:
+                await websocket.send_json({"type": "pong"})
+                continue
+
+            message = await run_in_threadpool(post_thread_message, thread_id, user.id, text)
+            await broadcast_chat_event(
+                thread_id=thread_id,
+                payload={"type": "message", "payload": message},
+            )
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        try:
+            await websocket.send_json({"type": "error", "message": "Ошибка чата"})
+        except Exception:
+            pass
+    finally:
+        await disconnect_chat_socket(thread_id, websocket)
 
 
 # ----------------------------
