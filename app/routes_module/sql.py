@@ -69,6 +69,8 @@ SELECT
     c.category,
     c.status,
     c.data,
+    ST_Y(c.point_geog::geometry) AS latitude,
+    ST_X(c.point_geog::geometry) AS longitude,
     ST_Distance(c.point_geog, (SELECT geog FROM route)) AS distance_to_route_meters
 FROM candidates c
 WHERE c.point_geog IS NOT NULL
