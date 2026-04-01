@@ -26,6 +26,7 @@ WHERE ao.performer_id::text = %s
   AND ao.status = 'accepted'
   AND ao.deleted_at IS NULL
   AND a.deleted_at IS NULL
+  AND a.status = 'active'
 ORDER BY ao.created_at DESC
 LIMIT 1
 """
@@ -62,6 +63,13 @@ WHERE a.deleted_at IS NULL
   AND a.status = 'active'
   AND a.id::text <> %s
   AND a.user_id::text <> %s
+  AND NOT EXISTS (
+      SELECT 1
+      FROM announcement_offers ao
+      WHERE ao.announcement_id::text = a.id::text
+        AND ao.status = 'accepted'
+        AND ao.deleted_at IS NULL
+  )
 )
 SELECT
     c.id,

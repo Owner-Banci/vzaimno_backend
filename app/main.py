@@ -808,6 +808,27 @@ def _keep_stricter(current: str, candidate: str) -> str:
     return current if _status_priority(current) >= _status_priority(candidate) else candidate
 
 
+def _has_media_attachments(data: Dict[str, Any]) -> bool:
+    for key in ("media", "images", "photos", "media_local_identifiers"):
+        raw = data.get(key)
+
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, str) and item.strip():
+                    return True
+                if isinstance(item, dict) and item:
+                    return True
+            continue
+
+        if isinstance(raw, str) and raw.strip():
+            return True
+
+        if isinstance(raw, dict) and raw:
+            return True
+
+    return False
+
+
 def _normalize_address(value: Any) -> Optional[str]:
     if not isinstance(value, str):
         return None
@@ -1165,6 +1186,7 @@ def create_announcement(
 
     status = STATUS_PENDING
     suggestions: List[str] = []
+    has_media = _has_media_attachments(data)
 
     mod["text"] = {
         "label": label,
@@ -1193,13 +1215,18 @@ def create_announcement(
             "Уберите фразы, которые можно трактовать неоднозначно.",
         ]
     else:
-        status = STATUS_PENDING
-        _set_decision(mod, status, "На проверке: сначала проверим фото, затем объявление появится на карте.")
+        if has_media:
+            status = STATUS_PENDING
+            _set_decision(mod, status, "На проверке: сначала проверим фото, затем объявление появится на карте.")
+        else:
+            status = STATUS_ACTIVE
+            _set_decision(mod, status, "Одобрено: объявление без фото активно и отображается на карте.")
 
     mod["image"] = {
         "max_nsfw": None,
         "items": [],
         "can_appeal": None,
+        "has_media": has_media,
         "review_thr": NSFW_REVIEW,
         "hard_block_thr": NSFW_HARD_BLOCK,
     }
@@ -1936,6 +1963,13 @@ def public_announcements(limit: int = 200) -> List[AnnouncementOut]:
         FROM announcements
         WHERE deleted_at IS NULL
           AND status = %s
+          AND NOT EXISTS (
+              SELECT 1
+              FROM announcement_offers ao
+              WHERE ao.announcement_id::text = announcements.id::text
+                AND ao.status = 'accepted'
+                AND ao.deleted_at IS NULL
+          )
           AND announcements.user_id::text <> 'dev'
           AND EXISTS (
               SELECT 1
