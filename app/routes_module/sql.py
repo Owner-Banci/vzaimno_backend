@@ -1,33 +1,42 @@
 from __future__ import annotations
 
-FIND_ANNOUNCEMENT_SQL = """
-SELECT id, user_id, category, title, status, data
-FROM announcements
-WHERE id::text = %s
-  AND deleted_at IS NULL
-"""
-
-HAS_ACCEPTED_OFFER_SQL = """
-SELECT 1
-FROM announcement_offers
-WHERE announcement_id::text = %s
-  AND performer_id::text = %s
-  AND status = 'accepted'
-  AND deleted_at IS NULL
+FIND_TASK_ROUTE_CONTEXT_SQL = """
+SELECT
+    t.id::text,
+    t.customer_id::text,
+    COALESCE(c.slug, 'help') AS category_slug,
+    t.title,
+    t.extra,
+    ta.performer_id::text,
+    ta.assignment_status::text,
+    ta.execution_stage::text,
+    COALESCE(ta.route_visibility::text, 'performer_only')
+FROM tasks t
+LEFT JOIN categories c
+  ON c.id = t.category_id
+LEFT JOIN LATERAL (
+    SELECT performer_id, assignment_status, execution_stage, route_visibility
+    FROM task_assignments
+    WHERE task_id::text = t.id::text
+      AND assignment_status IN ('assigned', 'in_progress')
+    ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+    LIMIT 1
+) ta ON TRUE
+WHERE t.id::text = %s
+  AND t.deleted_at IS NULL
 LIMIT 1
 """
 
-FIND_CURRENT_ROUTE_ANNOUNCEMENT_SQL = """
-SELECT a.id
-FROM announcement_offers ao
-JOIN announcements a
-  ON a.id::text = ao.announcement_id::text
-WHERE ao.performer_id::text = %s
-  AND ao.status = 'accepted'
-  AND ao.deleted_at IS NULL
-  AND a.deleted_at IS NULL
-  AND a.status = 'active'
-ORDER BY ao.created_at DESC
+FIND_CURRENT_ROUTE_TASK_SQL = """
+SELECT ta.task_id::text
+FROM task_assignments ta
+JOIN tasks t
+  ON t.id::text = ta.task_id::text
+WHERE ta.performer_id::text = %s
+  AND ta.assignment_status IN ('assigned', 'in_progress')
+  AND COALESCE(ta.route_visibility::text, 'performer_only') <> 'hidden'
+  AND t.deleted_at IS NULL
+ORDER BY ta.updated_at DESC NULLS LAST, ta.created_at DESC NULLS LAST
 LIMIT 1
 """
 

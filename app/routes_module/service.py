@@ -9,12 +9,12 @@ from fastapi import HTTPException
 
 from app.db import fetch_all, fetch_one
 from app.geocoding import geocode_address
+from app.task_compat import ensure_task_payload
 
 from .schemas import CoordinateOut, RouteContextOut, RouteDetailsOut, RouteTaskByPathOut
 from .sql import (
-    FIND_ANNOUNCEMENT_SQL,
-    FIND_CURRENT_ROUTE_ANNOUNCEMENT_SQL,
-    HAS_ACCEPTED_OFFER_SQL,
+    FIND_CURRENT_ROUTE_TASK_SQL,
+    FIND_TASK_ROUTE_CONTEXT_SQL,
     NEARBY_TASKS_BY_ROUTE_SQL,
 )
 
@@ -159,31 +159,49 @@ def build_route_from_polyline(
 
 
 def _resolve_current_announcement_id(user_id: str) -> str:
-    row = fetch_one(FIND_CURRENT_ROUTE_ANNOUNCEMENT_SQL, (user_id,))
+    row = fetch_one(FIND_CURRENT_ROUTE_TASK_SQL, (user_id,))
     if not row:
         raise HTTPException(status_code=404, detail="Для вас пока нет активного маршрута")
     return str(row[0])
 
 
 def _load_route_context(*, announcement_id: str, user_id: str) -> dict[str, Any]:
-    row = fetch_one(FIND_ANNOUNCEMENT_SQL, (announcement_id,))
+    row = fetch_one(FIND_TASK_ROUTE_CONTEXT_SQL, (announcement_id,))
     if not row:
-        raise HTTPException(status_code=404, detail="Объявление не найдено")
+        raise HTTPException(status_code=404, detail="Задание не найдено")
 
     ann_id = str(row[0])
     ann_owner_id = str(row[1])
     category = str(row[2] or "")
-    status = str(row[4] or "")
-    data = _coerce_data(row[5])
+    title = str(row[3] or "")
+    performer_id = str(row[5]) if row[5] else None
+    assignment_status = str(row[6] or "")
+    execution_stage = str(row[7] or "")
+    route_visibility = str(row[8] or "")
+    data = ensure_task_payload(
+        _coerce_data(row[4]),
+        title=title,
+        announcement_status=_route_announcement_status(
+            assignment_status=assignment_status,
+            execution_stage=execution_stage,
+        ),
+        assignment={
+            "performer_id": performer_id,
+            "assignment_status": assignment_status,
+            "execution_stage": execution_stage,
+            "route_visibility": route_visibility,
+        },
+    )
 
     _assert_route_access(
-        announcement_id=ann_id,
         owner_id=ann_owner_id,
+        performer_id=performer_id,
+        assignment_status=assignment_status,
         user_id=user_id,
     )
 
-    if status != "active":
-        raise HTTPException(status_code=409, detail="Маршрут доступен только для активного объявления")
+    if assignment_status not in {"assigned", "in_progress"}:
+        raise HTTPException(status_code=409, detail="Маршрут появится после принятия активного задания")
 
     route_points = _extract_route_points(data, category)
     if not route_points:
@@ -203,19 +221,43 @@ def _load_route_context(*, announcement_id: str, user_id: str) -> dict[str, Any]
         "end_point": end_point,
         "start_address": start_address,
         "end_address": end_address,
-        "travel_mode": DEFAULT_TRAVEL_MODE,
+        "travel_mode": _task_travel_mode(data),
     }
 
 
-def _assert_route_access(announcement_id: str, owner_id: str, user_id: str) -> None:
+def _assert_route_access(
+    *,
+    owner_id: str,
+    performer_id: str | None,
+    assignment_status: str,
+    user_id: str,
+) -> None:
     if owner_id == user_id:
         return
 
-    offer = fetch_one(HAS_ACCEPTED_OFFER_SQL, (announcement_id, user_id))
-    if offer:
+    if performer_id == user_id and assignment_status in {"assigned", "in_progress"}:
         return
 
     raise HTTPException(status_code=403, detail="У вас нет доступа к маршруту этого объявления")
+
+
+def _route_announcement_status(*, assignment_status: str, execution_stage: str) -> str:
+    normalized_assignment = (assignment_status or "").strip().lower()
+    normalized_stage = (execution_stage or "").strip().lower()
+
+    if normalized_stage in {"en_route", "on_site", "in_progress", "handoff"}:
+        return "in_progress"
+    if normalized_assignment == "assigned":
+        return "assigned"
+    if normalized_assignment == "in_progress":
+        return "in_progress"
+    return "active"
+
+
+def _task_travel_mode(data: dict[str, Any]) -> str:
+    task = data.get("task") if isinstance(data.get("task"), dict) else {}
+    route = task.get("route") if isinstance(task.get("route"), dict) else {}
+    return _normalize_travel_mode(route.get("travel_mode") or data.get("travel_mode") or DEFAULT_TRAVEL_MODE)
 
 
 def _coerce_data(value: Any) -> dict[str, Any]:
@@ -269,18 +311,24 @@ def _extract_route_points(
     category: str,
 ) -> tuple[tuple[float, float], tuple[float, float]] | None:
     normalized_category = category.strip().lower()
+    task = data.get("task") if isinstance(data.get("task"), dict) else {}
+    route = task.get("route") if isinstance(task.get("route"), dict) else {}
+    route_source = route.get("source") if isinstance(route.get("source"), dict) else {}
+    route_destination = route.get("destination") if isinstance(route.get("destination"), dict) else {}
 
     start = (
         _extract_point(data.get("pickup_point"))
         or _extract_point(data.get("help_point"))
         or _extract_point(data.get("start_point"))
         or _extract_point(data.get("point"))
+        or _extract_point(route_source.get("point"))
     )
     end = (
         _extract_point(data.get("dropoff_point"))
         or _extract_point(data.get("end_point"))
         or _extract_point(data.get("destination_point"))
         or _extract_point(data.get("to_point"))
+        or _extract_point(route_destination.get("point"))
     )
 
     start_address = (
@@ -288,12 +336,14 @@ def _extract_route_points(
         or _normalize_address(data.get("address"))
         or _normalize_address(data.get("start_address"))
         or _normalize_address(data.get("address_text"))
+        or _normalize_address(route_source.get("address"))
     )
     end_address = (
         _normalize_address(data.get("dropoff_address"))
         or _normalize_address(data.get("end_address"))
         or _normalize_address(data.get("to_address"))
         or _normalize_address(data.get("destination_address"))
+        or _normalize_address(route_destination.get("address"))
     )
 
     if normalized_category == "delivery":
@@ -319,19 +369,25 @@ def _resolve_route_addresses(
     end_point: tuple[float, float],
 ) -> tuple[str, str]:
     category_key = category.strip().lower()
+    task = data.get("task") if isinstance(data.get("task"), dict) else {}
+    route = task.get("route") if isinstance(task.get("route"), dict) else {}
+    route_source = route.get("source") if isinstance(route.get("source"), dict) else {}
+    route_destination = route.get("destination") if isinstance(route.get("destination"), dict) else {}
     if category_key == "delivery":
-        start_address = _normalize_address(data.get("pickup_address"))
-        end_address = _normalize_address(data.get("dropoff_address"))
+        start_address = _normalize_address(data.get("pickup_address")) or _normalize_address(route_source.get("address"))
+        end_address = _normalize_address(data.get("dropoff_address")) or _normalize_address(route_destination.get("address"))
     else:
         start_address = (
             _normalize_address(data.get("start_address"))
             or _normalize_address(data.get("address"))
             or _normalize_address(data.get("address_text"))
+            or _normalize_address(route_source.get("address"))
         )
         end_address = (
             _normalize_address(data.get("end_address"))
             or _normalize_address(data.get("to_address"))
             or _normalize_address(data.get("destination_address"))
+            or _normalize_address(route_destination.get("address"))
         )
 
     if not start_address:

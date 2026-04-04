@@ -1,9 +1,25 @@
 from __future__ import annotations
 
+import json
+import uuid
 from typing import Dict, Iterable, Sequence
 
-from app.db import execute, fetch_one
+from app.db import execute, fetch_all, fetch_one
 from app.schema_compat import clear_schema_cache, table_has_columns
+from app.task_compat import (
+    TASK_PUBLIC_STATUSES,
+    announcement_status_to_task_fields,
+    builder_category_slug,
+    derive_budget_bounds,
+    derive_quick_offer_price,
+    derive_reward_amount,
+    ensure_task_payload,
+    is_uuid_like,
+    legacy_offer_status_to_canonical,
+    primary_map_point,
+    primary_source_address,
+    route_points_from_payload,
+)
 
 
 CORE_TABLES: Dict[str, str] = {
@@ -195,8 +211,49 @@ AUX_TABLES: Dict[str, str] = {
 }
 
 
+TASK_DOMAIN_TABLES: Dict[str, str] = {
+    "task_assignments": """
+        CREATE TABLE IF NOT EXISTS task_assignments (
+          id UUID PRIMARY KEY,
+          task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          offer_id UUID NOT NULL REFERENCES task_offers(id) ON DELETE CASCADE,
+          customer_id UUID NOT NULL REFERENCES users(id),
+          performer_id UUID NOT NULL REFERENCES users(id),
+          assignment_status TEXT NOT NULL DEFAULT 'assigned'
+            CHECK (assignment_status IN ('assigned', 'in_progress', 'completed', 'cancelled')),
+          execution_stage TEXT NOT NULL DEFAULT 'accepted'
+            CHECK (execution_stage IN ('accepted', 'en_route', 'on_site', 'in_progress', 'handoff', 'completed', 'cancelled')),
+          route_visibility TEXT NOT NULL DEFAULT 'performer_only'
+            CHECK (route_visibility IN ('hidden', 'performer_only', 'customer_visible')),
+          chat_thread_id UUID NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          started_at TIMESTAMPTZ NULL,
+          completed_at TIMESTAMPTZ NULL,
+          cancelled_at TIMESTAMPTZ NULL,
+          cancellation_reason TEXT NULL
+        );
+    """,
+    "task_assignment_events": """
+        CREATE TABLE IF NOT EXISTS task_assignment_events (
+          id UUID PRIMARY KEY,
+          assignment_id UUID NOT NULL REFERENCES task_assignments(id) ON DELETE CASCADE,
+          task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          event_type TEXT NOT NULL
+            CHECK (event_type IN ('assignment_status', 'execution_stage', 'route_visibility', 'chat_bound')),
+          from_value TEXT NULL,
+          to_value TEXT NOT NULL,
+          changed_by UUID NULL REFERENCES users(id),
+          payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+    """,
+}
+
+
 COMPAT_DDLS: Iterable[str] = (
     "CREATE EXTENSION IF NOT EXISTS postgis;",
+    "ALTER TYPE offer_status ADD VALUE IF NOT EXISTS 'withdrawn_by_sender';",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT NULL;",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL;",
     "ALTER TABLE announcements ADD COLUMN IF NOT EXISTS location_point geography(Point,4326);",
@@ -219,6 +276,8 @@ COMPAT_DDLS: Iterable[str] = (
     "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS to_user_id TEXT NULL;",
     "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS stars INTEGER NULL;",
     "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS text TEXT NULL;",
+    "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS author_role TEXT NULL;",
+    "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS target_role TEXT NULL;",
     "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();",
     "ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS id TEXT NULL;",
     "ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS user_id TEXT NULL;",
@@ -240,6 +299,22 @@ COMPAT_DDLS: Iterable[str] = (
     "ALTER TABLE announcement_offers ADD COLUMN IF NOT EXISTS chat_thread_id TEXT NULL;",
     "ALTER TABLE announcement_offers ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();",
     "ALTER TABLE announcement_offers ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL;",
+    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL;",
+    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS budget_min NUMERIC NULL;",
+    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS budget_max NUMERIC NULL;",
+    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS quick_offer_price NUMERIC NULL;",
+    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS reoffer_policy TEXT NOT NULL DEFAULT 'blocked_after_reject';",
+    "ALTER TABLE task_offers ADD COLUMN IF NOT EXISTS pricing_mode TEXT NOT NULL DEFAULT 'counter_price';",
+    "ALTER TABLE task_offers ADD COLUMN IF NOT EXISTS agreed_price NUMERIC NULL;",
+    "ALTER TABLE task_offers ADD COLUMN IF NOT EXISTS minimum_price_accepted BOOLEAN NOT NULL DEFAULT FALSE;",
+    "ALTER TABLE task_offers ADD COLUMN IF NOT EXISTS can_reoffer BOOLEAN NOT NULL DEFAULT TRUE;",
+    "ALTER TABLE task_offers ADD COLUMN IF NOT EXISTS reoffer_block_reason TEXT NULL;",
+    "ALTER TABLE task_offers ADD COLUMN IF NOT EXISTS chat_thread_id UUID NULL;",
+    "ALTER TABLE task_offers ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ NULL;",
+    "ALTER TABLE task_offers ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ NULL;",
+    "ALTER TABLE task_offers ADD COLUMN IF NOT EXISTS withdrawn_at TIMESTAMPTZ NULL;",
+    "ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS assignment_id UUID NULL;",
+    "ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ NULL;",
     """
     UPDATE announcements
     SET location_point = ST_SetSRID(
@@ -276,6 +351,7 @@ COMPAT_DDLS: Iterable[str] = (
     """,
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique ON users(phone) WHERE phone IS NOT NULL;",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_id_unique ON reviews(id) WHERE id IS NOT NULL;",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_reviews_task_from_user ON reviews(task_id, from_user_id) WHERE task_id IS NOT NULL AND from_user_id IS NOT NULL;",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_announcement_offers_unique_pending ON announcement_offers(announcement_id, performer_id) WHERE deleted_at IS NULL AND status = 'pending';",
 )
 
@@ -302,6 +378,11 @@ INDEX_DDLS: Iterable[tuple[str, str, Sequence[str]]] = (
         "reviews",
         "CREATE INDEX IF NOT EXISTS idx_reviews_from_user_created_at ON reviews(from_user_id, created_at DESC);",
         ("from_user_id", "created_at"),
+    ),
+    (
+        "reviews",
+        "CREATE INDEX IF NOT EXISTS idx_reviews_to_user_target_role_created_at ON reviews(to_user_id, target_role, created_at DESC);",
+        ("to_user_id", "target_role", "created_at"),
     ),
     (
         "user_devices",
@@ -349,6 +430,11 @@ INDEX_DDLS: Iterable[tuple[str, str, Sequence[str]]] = (
         ("offer_id",),
     ),
     (
+        "chat_threads",
+        "CREATE INDEX IF NOT EXISTS idx_chat_threads_assignment_id ON chat_threads(assignment_id);",
+        ("assignment_id",),
+    ),
+    (
         "chat_participants",
         "CREATE INDEX IF NOT EXISTS idx_chat_participants_user_id ON chat_participants(user_id);",
         ("user_id",),
@@ -394,6 +480,56 @@ INDEX_DDLS: Iterable[tuple[str, str, Sequence[str]]] = (
         "CREATE INDEX IF NOT EXISTS idx_notifications_user_created_at ON notifications(user_id, created_at DESC);",
         ("user_id", "created_at"),
     ),
+    (
+        "tasks",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_deleted_status ON tasks(deleted_at, status, moderation_status);",
+        ("deleted_at", "status", "moderation_status"),
+    ),
+    (
+        "tasks",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_budget_range ON tasks(budget_min, budget_max, quick_offer_price);",
+        ("budget_min", "budget_max", "quick_offer_price"),
+    ),
+    (
+        "task_offers",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_task_offers_chat_thread_id ON task_offers(chat_thread_id) WHERE chat_thread_id IS NOT NULL;",
+        ("chat_thread_id",),
+    ),
+    (
+        "task_assignments",
+        "CREATE INDEX IF NOT EXISTS idx_task_assignments_task_id ON task_assignments(task_id);",
+        ("task_id",),
+    ),
+    (
+        "task_assignments",
+        "CREATE INDEX IF NOT EXISTS idx_task_assignments_performer_status_updated ON task_assignments(performer_id, assignment_status, updated_at DESC);",
+        ("performer_id", "assignment_status", "updated_at"),
+    ),
+    (
+        "task_assignments",
+        "CREATE INDEX IF NOT EXISTS idx_task_assignments_customer_status_updated ON task_assignments(customer_id, assignment_status, updated_at DESC);",
+        ("customer_id", "assignment_status", "updated_at"),
+    ),
+    (
+        "task_assignments",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_task_assignments_offer_id ON task_assignments(offer_id);",
+        ("offer_id",),
+    ),
+    (
+        "task_assignments",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_task_assignments_chat_thread_id ON task_assignments(chat_thread_id) WHERE chat_thread_id IS NOT NULL;",
+        ("chat_thread_id",),
+    ),
+    (
+        "task_assignments",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_task_assignments_active_task ON task_assignments(task_id) WHERE assignment_status IN ('assigned', 'in_progress');",
+        ("task_id", "assignment_status"),
+    ),
+    (
+        "task_assignment_events",
+        "CREATE INDEX IF NOT EXISTS idx_task_assignment_events_assignment_created ON task_assignment_events(assignment_id, created_at DESC);",
+        ("assignment_id", "created_at"),
+    ),
 )
 
 
@@ -410,6 +546,12 @@ def ensure_core_tables() -> None:
 
 def ensure_auxiliary_tables() -> None:
     for table_name, ddl in AUX_TABLES.items():
+        if not table_exists(table_name):
+            execute(ddl)
+
+
+def ensure_task_domain_tables() -> None:
+    for table_name, ddl in TASK_DOMAIN_TABLES.items():
         if not table_exists(table_name):
             execute(ddl)
 
@@ -445,10 +587,601 @@ def ensure_chat_thread_kind_compat() -> None:
         execute("ALTER TYPE chat_thread_kind ADD VALUE IF NOT EXISTS 'offer';")
 
 
+def _category_id_for_slug(slug: str) -> str | None:
+    row = fetch_one(
+        """
+        SELECT id::text
+        FROM categories
+        WHERE slug = %s
+        LIMIT 1
+        """,
+        (slug,),
+    )
+    if row and row[0]:
+        return str(row[0])
+    return None
+
+
+def _task_exists(task_id: str) -> bool:
+    row = fetch_one("SELECT 1 FROM tasks WHERE id::text = %s", (task_id,))
+    return bool(row)
+
+
+def _user_exists(user_id: str) -> bool:
+    row = fetch_one("SELECT 1 FROM users WHERE id::text = %s", (user_id,))
+    return bool(row)
+
+
+def _ensure_task_route_points(task_id: str, data: dict[str, object]) -> None:
+    if fetch_one("SELECT 1 FROM task_route_points WHERE task_id::text = %s LIMIT 1", (task_id,)):
+        return
+
+    for point in route_points_from_payload(task_id, data):
+        raw_point = point.get("point")
+        if not isinstance(raw_point, tuple):
+            continue
+
+        execute(
+            """
+            INSERT INTO task_route_points (
+                id, task_id, point_order, title, address_text, point, point_kind, created_at
+            )
+            VALUES (
+                %s, %s, %s, %s, %s,
+                ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
+                %s, now()
+            )
+            ON CONFLICT DO NOTHING
+            """,
+            (
+                str(uuid.uuid4()),
+                task_id,
+                int(point["point_order"]),
+                point.get("title"),
+                point.get("address_text"),
+                raw_point[1],
+                raw_point[0],
+                point.get("point_kind"),
+            ),
+        )
+
+
+def backfill_legacy_tasks() -> None:
+    rows = fetch_all(
+        """
+        SELECT
+            id::text,
+            user_id,
+            category,
+            title,
+            status,
+            data,
+            created_at,
+            updated_at,
+            deleted_at,
+            CASE WHEN location_point IS NULL THEN NULL ELSE ST_Y(location_point::geometry) END AS location_lat,
+            CASE WHEN location_point IS NULL THEN NULL ELSE ST_X(location_point::geometry) END AS location_lon
+        FROM announcements
+        ORDER BY created_at ASC
+        """
+    )
+
+    for row in rows:
+        ann_id = str(row[0])
+        user_id = str(row[1] or "")
+        category = str(row[2] or "")
+        title = str(row[3] or "")
+        status = str(row[4] or "")
+        raw_data = row[5] if isinstance(row[5], dict) else {}
+        created_at = row[6]
+        updated_at = row[7] or row[6]
+        deleted_at = row[8]
+        location_lat = row[9]
+        location_lon = row[10]
+
+        if not is_uuid_like(ann_id) or not is_uuid_like(user_id):
+            continue
+        if not _user_exists(user_id):
+            continue
+        if _task_exists(ann_id):
+            _ensure_task_route_points(ann_id, ensure_task_payload(raw_data, title=title, announcement_status=status, deleted_at=deleted_at))
+            continue
+
+        has_accepted_offer = bool(
+            fetch_one(
+                """
+                SELECT 1
+                FROM announcement_offers
+                WHERE announcement_id = %s
+                  AND status = 'accepted'
+                  AND deleted_at IS NULL
+                LIMIT 1
+                """,
+                (ann_id,),
+            )
+        )
+        task_status, moderation_status = announcement_status_to_task_fields(
+            status,
+            deleted=deleted_at is not None,
+            has_accepted_offer=has_accepted_offer,
+        )
+        data = ensure_task_payload(raw_data, title=title, announcement_status=status, deleted_at=deleted_at)
+        budget_min, budget_max = derive_budget_bounds(data)
+        quick_offer_price = derive_quick_offer_price(data)
+        reward_amount = derive_reward_amount(data)
+        address_text = primary_source_address(data)
+        point = None
+        if location_lat is not None and location_lon is not None:
+            point = (float(location_lat), float(location_lon))
+        else:
+            point = primary_map_point(data)
+
+        category_id = _category_id_for_slug(builder_category_slug(category))
+        if not category_id:
+            continue
+
+        published_at = created_at if moderation_status == "published" and task_status in TASK_PUBLIC_STATUSES | {"agreed", "in_progress", "completed", "cancelled"} else None
+        closed_at = created_at if task_status in {"closed", "completed", "cancelled"} or deleted_at is not None else None
+        description = (
+            str(data.get("generated_description") or "")
+            or str(data.get("notes") or "")
+            or title
+        )
+
+        execute(
+            """
+            INSERT INTO tasks (
+                id,
+                customer_id,
+                title,
+                description,
+                category_id,
+                reward_amount,
+                currency,
+                price_type,
+                deadline_at,
+                location_point,
+                address_text,
+                customer_comment,
+                performer_preferences,
+                status,
+                moderation_status,
+                views_count,
+                favorites_count,
+                responses_count,
+                accepted_offer_id,
+                extra,
+                created_at,
+                updated_at,
+                published_at,
+                closed_at,
+                deleted_at,
+                budget_min,
+                budget_max,
+                quick_offer_price,
+                reoffer_policy
+            )
+            VALUES (
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                'RUB',
+                %s,
+                NULL,
+                CASE
+                    WHEN %s::double precision IS NULL OR %s::double precision IS NULL THEN NULL
+                    ELSE ST_SetSRID(
+                        ST_MakePoint(%s::double precision, %s::double precision),
+                        4326
+                    )::geography
+                END,
+                %s,
+                %s,
+                NULL,
+                %s,
+                %s,
+                0,
+                0,
+                COALESCE((%s)::integer, 0),
+                NULL,
+                %s::jsonb,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s
+            )
+            ON CONFLICT DO NOTHING
+            """,
+            (
+                ann_id,
+                user_id,
+                title,
+                description,
+                category_id,
+                reward_amount,
+                "negotiable" if budget_min is not None or budget_max is not None else ("free" if reward_amount == 0 else "fixed"),
+                point[1] if point else None,
+                point[0] if point else None,
+                point[1] if point else None,
+                point[0] if point else None,
+                address_text,
+                data.get("notes"),
+                task_status,
+                moderation_status,
+                int(data.get("offers_count") or 0),
+                json.dumps(data, ensure_ascii=False),
+                created_at,
+                updated_at,
+                published_at,
+                closed_at,
+                deleted_at,
+                budget_min,
+                budget_max,
+                quick_offer_price,
+                str(data.get("offer_policy", {}).get("reoffer_policy") or "blocked_after_reject"),
+            ),
+        )
+        _ensure_task_route_points(ann_id, data)
+
+
+def backfill_legacy_task_offers() -> None:
+    rows = fetch_all(
+        """
+        SELECT
+            ao.id::text,
+            ao.announcement_id,
+            ao.performer_id,
+            ao.message,
+            ao.proposed_price,
+            ao.status,
+            ao.created_at,
+            ao.chat_thread_id
+        FROM announcement_offers ao
+        WHERE ao.deleted_at IS NULL
+        ORDER BY ao.created_at ASC
+        """
+    )
+
+    for row in rows:
+        offer_id = str(row[0])
+        task_id = str(row[1] or "")
+        performer_id = str(row[2] or "")
+        message = row[3]
+        proposed_price = row[4]
+        legacy_status = str(row[5] or "pending")
+        created_at = row[6]
+        chat_thread_id = str(row[7]) if row[7] else None
+
+        if not (is_uuid_like(offer_id) and is_uuid_like(task_id) and is_uuid_like(performer_id)):
+            continue
+        if not _user_exists(performer_id):
+            continue
+        if not _task_exists(task_id):
+            continue
+        if fetch_one("SELECT 1 FROM task_offers WHERE id::text = %s", (offer_id,)):
+            continue
+
+        task_row = fetch_one("SELECT extra FROM tasks WHERE id::text = %s", (task_id,))
+        task_data = ensure_task_payload(task_row[0] if task_row and isinstance(task_row[0], dict) else {}, title="", announcement_status="active")
+        quick_offer_price = derive_quick_offer_price(task_data)
+
+        status = legacy_offer_status_to_canonical(legacy_status)
+        pricing_mode = "counter_price" if proposed_price is not None else "quick_min_price"
+        minimum_price_accepted = proposed_price is None
+        agreed_price = proposed_price if status == "accepted_by_customer" and proposed_price is not None else (quick_offer_price if status == "accepted_by_customer" else None)
+        can_reoffer = status == "sent"
+
+        execute(
+            """
+            INSERT INTO task_offers (
+                id,
+                task_id,
+                performer_id,
+                message,
+                proposed_price,
+                currency,
+                status,
+                created_at,
+                updated_at,
+                cancelled_at,
+                pricing_mode,
+                agreed_price,
+                minimum_price_accepted,
+                can_reoffer,
+                reoffer_block_reason,
+                chat_thread_id,
+                accepted_at,
+                rejected_at,
+                withdrawn_at
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, 'RUB', %s, %s, %s, NULL,
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s
+            )
+            ON CONFLICT DO NOTHING
+            """,
+            (
+                offer_id,
+                task_id,
+                performer_id,
+                message,
+                proposed_price,
+                status,
+                created_at,
+                created_at,
+                pricing_mode,
+                agreed_price,
+                minimum_price_accepted,
+                can_reoffer,
+                None if can_reoffer else "legacy_status_terminal",
+                chat_thread_id if chat_thread_id and is_uuid_like(chat_thread_id) else None,
+                created_at if status == "accepted_by_customer" else None,
+                created_at if status == "rejected_by_customer" else None,
+                created_at if status == "withdrawn_by_sender" else None,
+            ),
+        )
+
+    task_rows = fetch_all("SELECT id::text FROM tasks")
+    for task_row in task_rows:
+        task_id = str(task_row[0])
+        accepted = fetch_one(
+            """
+            SELECT id::text
+            FROM task_offers
+            WHERE task_id::text = %s
+              AND status = 'accepted_by_customer'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (task_id,),
+        )
+        responses = fetch_one(
+            """
+            SELECT COUNT(*)
+            FROM task_offers
+            WHERE task_id::text = %s
+              AND status IN ('sent', 'accepted_by_customer')
+            """,
+            (task_id,),
+        )
+        execute(
+            """
+            UPDATE tasks
+            SET accepted_offer_id = %s,
+                responses_count = %s,
+                status = CASE
+                    WHEN %s::uuid IS NOT NULL AND status IN ('published', 'in_responses') THEN 'agreed'
+                    WHEN %s::integer > 0 AND status = 'published' THEN 'in_responses'
+                    ELSE status
+                END,
+                updated_at = now()
+            WHERE id::text = %s
+            """,
+            (
+                accepted[0] if accepted else None,
+                int(responses[0] or 0) if responses else 0,
+                accepted[0] if accepted else None,
+                int(responses[0] or 0) if responses else 0,
+                task_id,
+            ),
+        )
+
+
+def backfill_legacy_task_assignments() -> None:
+    rows = fetch_all(
+        """
+        SELECT
+            t.id::text,
+            t.customer_id::text,
+            o.id::text,
+            o.performer_id::text,
+            o.chat_thread_id::text
+        FROM tasks t
+        JOIN task_offers o
+          ON o.id = t.accepted_offer_id
+        WHERE t.accepted_offer_id IS NOT NULL
+        """
+    )
+
+    for row in rows:
+        task_id = str(row[0])
+        customer_id = str(row[1])
+        offer_id = str(row[2])
+        performer_id = str(row[3])
+        chat_thread_id = str(row[4]) if row[4] else None
+        chat_thread_uuid = chat_thread_id if chat_thread_id and is_uuid_like(chat_thread_id) else None
+
+        existing = fetch_one(
+            """
+            SELECT id::text
+            FROM task_assignments
+            WHERE offer_id::text = %s
+            LIMIT 1
+            """,
+            (offer_id,),
+        )
+        if not existing and chat_thread_uuid:
+            existing = fetch_one(
+                """
+                SELECT id::text
+                FROM task_assignments
+                WHERE chat_thread_id = %s::uuid
+                LIMIT 1
+                """,
+                (chat_thread_uuid,),
+            )
+        if not existing:
+            existing = fetch_one(
+                """
+                SELECT id::text
+                FROM task_assignments
+                WHERE task_id::text = %s
+                  AND assignment_status IN ('assigned', 'in_progress')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (task_id,),
+            )
+
+        if existing:
+            assignment_id = str(existing[0])
+            execute(
+                """
+                UPDATE task_assignments
+                SET task_id = %s,
+                    offer_id = %s,
+                    customer_id = %s,
+                    performer_id = %s,
+                    assignment_status = 'assigned',
+                    execution_stage = 'accepted',
+                    route_visibility = 'performer_only',
+                    chat_thread_id = COALESCE(%s::uuid, chat_thread_id),
+                    updated_at = now()
+                WHERE id::text = %s
+                """,
+                (
+                    task_id,
+                    offer_id,
+                    customer_id,
+                    performer_id,
+                    chat_thread_uuid,
+                    assignment_id,
+                ),
+            )
+        else:
+            assignment_id = str(uuid.uuid4())
+            execute(
+                """
+                INSERT INTO task_assignments (
+                    id, task_id, offer_id, customer_id, performer_id,
+                    assignment_status, execution_stage, route_visibility,
+                    chat_thread_id, created_at, updated_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s,
+                    'assigned', 'accepted', 'performer_only',
+                    %s, now(), now()
+                )
+                """,
+                (
+                    assignment_id,
+                    task_id,
+                    offer_id,
+                    customer_id,
+                    performer_id,
+                    chat_thread_uuid,
+                ),
+            )
+
+        execute(
+            """
+            INSERT INTO task_assignment_events (
+                id, assignment_id, task_id, event_type, from_value, to_value, changed_by, payload
+            )
+            SELECT %s, %s, %s, 'assignment_status', NULL, 'assigned', %s, '{}'::jsonb
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM task_assignment_events
+                WHERE assignment_id = %s::uuid
+                  AND event_type = 'assignment_status'
+                  AND to_value = 'assigned'
+            )
+            """,
+            (str(uuid.uuid4()), assignment_id, task_id, customer_id, assignment_id),
+        )
+        execute(
+            """
+            INSERT INTO task_assignment_events (
+                id, assignment_id, task_id, event_type, from_value, to_value, changed_by, payload
+            )
+            SELECT %s, %s, %s, 'execution_stage', NULL, 'accepted', %s, '{}'::jsonb
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM task_assignment_events
+                WHERE assignment_id = %s::uuid
+                  AND event_type = 'execution_stage'
+                  AND to_value = 'accepted'
+            )
+            """,
+            (str(uuid.uuid4()), assignment_id, task_id, customer_id, assignment_id),
+        )
+
+    assignment_rows = fetch_all(
+        """
+        SELECT id::text, task_id::text, chat_thread_id::text, offer_id::text
+        FROM task_assignments
+        WHERE chat_thread_id IS NOT NULL
+        """
+    )
+    for row in assignment_rows:
+        assignment_id = str(row[0])
+        task_id = str(row[1])
+        chat_thread_id = str(row[2])
+        offer_id = str(row[3])
+        execute(
+            """
+            UPDATE chat_threads
+            SET task_id = %s,
+                offer_id = %s,
+                assignment_id = %s
+            WHERE id::text = %s
+            """,
+            (task_id, offer_id, assignment_id, chat_thread_id),
+        )
+        execute(
+            """
+            UPDATE task_offers
+            SET chat_thread_id = %s
+            WHERE id::text = %s
+            """,
+            (chat_thread_id, offer_id),
+        )
+
+
+def backfill_task_status_events() -> None:
+    task_rows = fetch_all(
+        """
+        SELECT id::text, customer_id::text, status::text
+        FROM tasks
+        """
+    )
+    for row in task_rows:
+        task_id = str(row[0])
+        changed_by = str(row[1])
+        status = str(row[2])
+        exists = fetch_one("SELECT 1 FROM task_status_events WHERE task_id::text = %s LIMIT 1", (task_id,))
+        if exists:
+            continue
+        execute(
+            """
+            INSERT INTO task_status_events (
+                id, task_id, from_status, to_status, changed_by, reason, created_at
+            )
+            VALUES (%s, %s, NULL, %s, %s, %s, now())
+            ON CONFLICT DO NOTHING
+            """,
+            (str(uuid.uuid4()), task_id, status, changed_by, "legacy_backfill"),
+        )
+
+
 def ensure_all_tables() -> None:
     ensure_core_tables()
     ensure_auxiliary_tables()
+    ensure_task_domain_tables()
     ensure_compat_columns()
     ensure_chat_thread_kind_compat()
     clear_schema_cache()
     ensure_indexes()
+    backfill_legacy_tasks()
+    backfill_legacy_task_offers()
+    backfill_legacy_task_assignments()
+    backfill_task_status_events()

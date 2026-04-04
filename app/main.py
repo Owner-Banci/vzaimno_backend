@@ -4,6 +4,7 @@ import json
 import os
 import uuid
 import itsdangerous
+import anyio
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from app.bootstrap import ensure_all_tables
@@ -19,11 +21,15 @@ from app.chat import (
     assert_thread_access,
     broadcast_chat_event,
     broadcast_chat_message,
+    broadcast_thread_preview_to_user,
+    connect_user_chat_socket,
     connect_chat_socket,
+    disconnect_user_chat_socket,
     disconnect_chat_socket,
     get_or_create_offer_thread,
     list_thread_messages,
     list_user_threads,
+    post_system_thread_message,
     post_thread_message,
 )
 from app.db import execute, fetch_all, fetch_one
@@ -44,6 +50,7 @@ from app.schemas import (
     CreateOfferIn,
     DeviceRegisterIn,
     DeviceUnregisterIn,
+    ExecutionStageUpdateIn,
     GeoPointOut,
     LoginIn,
     MeProfileOut,
@@ -66,6 +73,26 @@ from app.schemas import (
 )
 from app.security import create_access_token, decode_token, hash_password, verify_password
 from app.support import get_or_create_support_thread, list_support_messages, post_support_message
+from app.task_compat import (
+    announcement_status_to_task_fields,
+    builder_category_slug,
+    canonical_execution_status,
+    canonical_offer_status_to_legacy,
+    derive_budget_bounds,
+    derive_quick_offer_price,
+    derive_reward_amount,
+    ensure_task_payload,
+    is_uuid_like,
+    legacy_offer_status_to_canonical,
+    primary_destination_address,
+    primary_map_point,
+    primary_source_address,
+    route_points_from_payload,
+    route_visibility_for_execution,
+    task_offer_row_to_legacy_dict,
+    task_row_to_announcement_dict,
+    task_to_announcement_status,
+)
 
 app = FastAPI(title="Slayma Backend (MVP)")
 bearer = HTTPBearer(auto_error=True)
@@ -79,6 +106,48 @@ STATUS_NEEDS_FIX = "needs_fix"
 STATUS_REJECTED = "rejected"
 STATUS_ACTIVE = "active"
 STATUS_ARCHIVED = "archived"
+
+REVIEW_ROLE_ALL = "all"
+REVIEW_ROLE_CUSTOMER = "customer"
+REVIEW_ROLE_PERFORMER = "performer"
+VALID_REVIEW_ROLES = {REVIEW_ROLE_ALL, REVIEW_ROLE_CUSTOMER, REVIEW_ROLE_PERFORMER}
+
+
+class ReviewFeedItemOut(BaseModel):
+    id: str
+    from_user_display_name: str
+    stars: int = Field(..., ge=1, le=5)
+    text: Optional[str] = None
+    created_at: datetime
+    target_role: Optional[str] = None
+
+
+class ReviewFeedSummaryOut(BaseModel):
+    average: float = 0.0
+    count: int = 0
+
+
+class ReviewFeedOut(BaseModel):
+    items: list[ReviewFeedItemOut] = Field(default_factory=list)
+    selected_role: str = REVIEW_ROLE_ALL
+    summary: ReviewFeedSummaryOut = Field(default_factory=ReviewFeedSummaryOut)
+
+
+class ReviewEligibilityOut(BaseModel):
+    can_submit: bool = False
+    already_submitted: bool = False
+    announcement_id: str
+    announcement_title: Optional[str] = None
+    thread_id: Optional[str] = None
+    counterpart_user_id: Optional[str] = None
+    counterpart_display_name: Optional[str] = None
+    counterpart_role: Optional[str] = None
+    message: Optional[str] = None
+
+
+class SubmitReviewIn(BaseModel):
+    stars: int = Field(..., ge=1, le=5)
+    text: Optional[str] = Field(default=None, max_length=2000)
 
 # ----------------------------
 # Upload config
@@ -567,46 +636,252 @@ def update_my_profile(
     return _fetch_profile_section(user.id)
 
 
-@app.get("/users/me/reviews", response_model=UserReviewListOut)
+def _normalize_review_role(role: Optional[str]) -> str:
+    normalized = (role or "").strip().lower()
+    if normalized in VALID_REVIEW_ROLES:
+        return normalized
+    return REVIEW_ROLE_ALL
+
+
+def _review_feed_summary(user_id: str, role: str) -> ReviewFeedSummaryOut:
+    params: List[Any] = [user_id]
+    sql = """
+        SELECT COALESCE(AVG(r.stars), 0), COUNT(*)
+        FROM reviews r
+        WHERE r.to_user_id = %s
+    """
+    if role != REVIEW_ROLE_ALL:
+        sql += " AND COALESCE(r.target_role, '') = %s"
+        params.append(role)
+
+    row = fetch_one(sql, tuple(params))
+    return ReviewFeedSummaryOut(
+        average=round(float(row[0] or 0), 1) if row else 0.0,
+        count=int(row[1] or 0) if row else 0,
+    )
+
+
+def _review_context_for_user(task_id: str, user_id: str) -> Dict[str, Any]:
+    row = fetch_one(
+        """
+        SELECT
+            ta.task_id::text,
+            ta.assignment_status,
+            ta.execution_stage,
+            ta.chat_thread_id::text,
+            ta.customer_id::text,
+            ta.performer_id::text,
+            COALESCE(NULLIF(BTRIM(cup.display_name), ''), NULLIF(BTRIM(cu.phone), ''), NULLIF(BTRIM(cu.email), ''), 'Заказчик') AS customer_name,
+            COALESCE(NULLIF(BTRIM(pup.display_name), ''), NULLIF(BTRIM(pu.phone), ''), NULLIF(BTRIM(pu.email), ''), 'Исполнитель') AS performer_name,
+            a.title
+        FROM task_assignments ta
+        LEFT JOIN announcements a ON a.id::text = ta.task_id::text
+        LEFT JOIN user_profiles cup ON cup.user_id = ta.customer_id
+        LEFT JOIN users cu ON cu.id = ta.customer_id
+        LEFT JOIN user_profiles pup ON pup.user_id = ta.performer_id
+        LEFT JOIN users pu ON pu.id = ta.performer_id
+        WHERE ta.task_id::text = %s
+        ORDER BY
+            CASE ta.assignment_status
+                WHEN 'completed' THEN 0
+                WHEN 'in_progress' THEN 1
+                WHEN 'assigned' THEN 2
+                ELSE 3
+            END,
+            ta.updated_at DESC,
+            ta.created_at DESC
+        LIMIT 1
+        """,
+        (task_id,),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Контекст отзыва для задания не найден")
+
+    assignment_status = str(row[1] or "")
+    execution_stage = str(row[2] or "")
+    thread_id = str(row[3]) if row[3] else None
+    customer_id = str(row[4] or "")
+    performer_id = str(row[5] or "")
+    customer_name = str(row[6] or "Заказчик")
+    performer_name = str(row[7] or "Исполнитель")
+    announcement_title = _normalize_optional_text(row[8], collapse_spaces=True)
+
+    if user_id == customer_id:
+        counterpart_user_id = performer_id
+        counterpart_display_name = performer_name
+        counterpart_role = REVIEW_ROLE_PERFORMER
+        author_role = REVIEW_ROLE_CUSTOMER
+    elif user_id == performer_id:
+        counterpart_user_id = customer_id
+        counterpart_display_name = customer_name
+        counterpart_role = REVIEW_ROLE_CUSTOMER
+        author_role = REVIEW_ROLE_PERFORMER
+    else:
+        raise HTTPException(status_code=403, detail="Недостаточно прав для работы с отзывом")
+
+    already_submitted = bool(
+        fetch_one(
+            """
+            SELECT 1
+            FROM reviews
+            WHERE task_id = %s
+              AND from_user_id = %s
+            LIMIT 1
+            """,
+            (task_id, user_id),
+        )
+    )
+    is_completed = assignment_status == "completed" or execution_stage == "completed"
+    can_submit = is_completed and not already_submitted and bool(counterpart_user_id)
+
+    message = None
+    if already_submitted:
+        message = "Ваш отзыв уже сохранён."
+    elif not is_completed:
+        message = "Оставить отзыв можно после завершения задания."
+
+    return {
+        "announcement_id": task_id,
+        "announcement_title": announcement_title,
+        "thread_id": thread_id,
+        "counterpart_user_id": counterpart_user_id,
+        "counterpart_display_name": counterpart_display_name,
+        "counterpart_role": counterpart_role,
+        "author_role": author_role,
+        "already_submitted": already_submitted,
+        "can_submit": can_submit,
+        "message": message,
+    }
+
+
+@app.get("/users/me/reviews", response_model=ReviewFeedOut)
 def my_reviews(
     limit: int = 2,
     offset: int = 0,
+    role: str = REVIEW_ROLE_ALL,
     user: UserOut = Depends(get_current_user),
-) -> UserReviewListOut:
+) -> ReviewFeedOut:
+    selected_role = _normalize_review_role(role)
     if user.id == "dev":
-        return UserReviewListOut(items=[])
+        return ReviewFeedOut(items=[], selected_role=selected_role, summary=ReviewFeedSummaryOut())
 
     lim = max(1, min(int(limit), 100))
     off = max(0, int(offset))
+    summary = _review_feed_summary(user.id, selected_role)
+
+    params: List[Any] = [user.id]
+    filter_sql = ""
+    if selected_role != REVIEW_ROLE_ALL:
+        filter_sql = " AND COALESCE(r.target_role, '') = %s"
+        params.append(selected_role)
+    params.extend([lim, off])
 
     rows = fetch_all(
-        """
+        f"""
         SELECT
+            COALESCE(r.id::text, r.from_user_id::text || '|' || COALESCE(r.created_at::text, '') || '|' || COALESCE(r.text, '')),
             COALESCE(NULLIF(up.display_name, ''), u.email, 'Пользователь') AS from_user_display_name,
             r.stars,
             r.text,
-            r.created_at
+            r.created_at,
+            r.target_role
         FROM reviews r
         LEFT JOIN user_profiles up ON up.user_id = r.from_user_id
         LEFT JOIN users u ON u.id = r.from_user_id
         WHERE r.to_user_id = %s
+        {filter_sql}
         ORDER BY r.created_at DESC
         LIMIT %s OFFSET %s
         """,
-        (user.id, lim, off),
+        tuple(params),
     )
 
-    return UserReviewListOut(
+    return ReviewFeedOut(
         items=[
-            UserReviewOut(
-                from_user_display_name=row[0],
-                stars=int(row[1]),
-                text=row[2],
-                created_at=row[3],
+            ReviewFeedItemOut(
+                id=str(row[0]),
+                from_user_display_name=row[1],
+                stars=int(row[2]),
+                text=row[3],
+                created_at=row[4],
+                target_role=row[5],
             )
             for row in rows
-        ]
+        ],
+        selected_role=selected_role,
+        summary=summary,
     )
+
+
+@app.get("/announcements/{ann_id}/review-context", response_model=ReviewEligibilityOut)
+def announcement_review_context(
+    ann_id: str,
+    user: UserOut = Depends(get_current_user),
+) -> ReviewEligibilityOut:
+    if user.id == "dev":
+        return ReviewEligibilityOut(announcement_id=ann_id, message="В dev-режиме отзывы отключены.")
+
+    return ReviewEligibilityOut(**_review_context_for_user(ann_id, user.id))
+
+
+@app.post("/announcements/{ann_id}/review", response_model=OKOut)
+def submit_announcement_review(
+    ann_id: str,
+    payload: SubmitReviewIn,
+    user: UserOut = Depends(get_current_user),
+) -> OKOut:
+    if user.id == "dev":
+        return OKOut(ok=True)
+
+    context = _review_context_for_user(ann_id, user.id)
+    if context["already_submitted"]:
+        raise HTTPException(status_code=409, detail="Отзыв уже отправлен")
+    if not context["can_submit"]:
+        raise HTTPException(status_code=409, detail=context["message"] or "Оставить отзыв пока нельзя")
+
+    clean_text = _normalize_optional_text(payload.text)
+    review_id = str(uuid.uuid4())
+    inserted = fetch_one(
+        """
+        INSERT INTO reviews (id, task_id, from_user_id, to_user_id, stars, text, author_role, target_role, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
+        ON CONFLICT (task_id, from_user_id) DO NOTHING
+        RETURNING id
+        """,
+        (
+            review_id,
+            ann_id,
+            user.id,
+            context["counterpart_user_id"],
+            int(payload.stars),
+            clean_text,
+            context["author_role"],
+            context["counterpart_role"],
+        ),
+    )
+    if not inserted:
+        raise HTTPException(status_code=409, detail="Отзыв уже отправлен")
+
+    counterpart_user_id = str(context["counterpart_user_id"])
+    _ensure_profile_and_stats(counterpart_user_id)
+    overall_summary = _review_feed_summary(counterpart_user_id, REVIEW_ROLE_ALL)
+    execute(
+        """
+        UPDATE user_stats
+        SET rating_avg = %s,
+            rating_count = %s,
+            updated_at = now()
+        WHERE user_id = %s
+        """,
+        (overall_summary.average, overall_summary.count, counterpart_user_id),
+    )
+    create_notification(
+        user_id=counterpart_user_id,
+        notif_type="review_received",
+        body="Вам оставили отзыв по завершённому заданию.",
+        payload={"announcement_id": ann_id, "from_user_id": user.id},
+    )
+    return OKOut(ok=True)
 
 
 @app.post("/devices/register", response_model=OKOut)
@@ -711,27 +986,68 @@ def unregister_device(
 # ----------------------------
 # Helpers (announcements / moderation)
 # ----------------------------
-def _row_to_announcement(row) -> AnnouncementOut:
-    raw_data = row[5]
-    if raw_data is None:
-        data_obj: Dict[str, Any] = {}
-    elif isinstance(raw_data, str):
-        try:
-            data_obj = json.loads(raw_data)
-        except Exception:
-            data_obj = {}
-    else:
-        data_obj = raw_data
+TASK_ANNOUNCEMENT_SELECT = """
+    SELECT
+        t.id::text,
+        t.customer_id::text,
+        COALESCE(c.slug, COALESCE(t.extra->>'category', t.extra->>'main_group', 'help')) AS category_slug,
+        t.title,
+        t.extra,
+        t.created_at,
+        t.status::text,
+        t.moderation_status::text,
+        t.deleted_at,
+        t.responses_count,
+        t.address_text,
+        CASE WHEN t.location_point IS NULL THEN NULL ELSE ST_Y(t.location_point::geometry) END AS location_lat,
+        CASE WHEN t.location_point IS NULL THEN NULL ELSE ST_X(t.location_point::geometry) END AS location_lon,
+        ta.id::text AS assignment_id,
+        ta.assignment_status,
+        ta.execution_stage,
+        ta.performer_id::text AS assignment_performer_id,
+        ta.chat_thread_id::text AS assignment_chat_thread_id,
+        ta.route_visibility
+    FROM tasks t
+    LEFT JOIN categories c
+      ON c.id = t.category_id
+    LEFT JOIN task_assignments ta
+      ON ta.task_id = t.id
+     AND ta.assignment_status IN ('assigned', 'in_progress')
+"""
 
-    return AnnouncementOut(
-        id=row[0],
-        user_id=row[1],
-        category=row[2],
-        title=row[3],
-        status=row[4],
-        data=data_obj,
-        created_at=row[6],
+
+def _default_category_slug(extra: Dict[str, Any]) -> str:
+    return builder_category_slug(
+        _normalize_optional_text(extra.get("category"))
+        or _normalize_optional_text(extra.get("main_group"))
+        or "help"
     )
+
+
+def _task_row_to_announcement(row) -> AnnouncementOut:
+    extra = _normalize_json_object(row[4])
+    payload = {
+        "id": row[0],
+        "customer_id": row[1],
+        "category_slug": row[2] or _default_category_slug(extra),
+        "title": row[3],
+        "extra": extra,
+        "created_at": row[5],
+        "task_status": row[6],
+        "moderation_status": row[7],
+        "deleted_at": row[8],
+        "responses_count": row[9],
+        "address_text": row[10],
+        "location_lat": row[11],
+        "location_lon": row[12],
+        "assignment_id": row[13],
+        "assignment_status": row[14],
+        "execution_stage": row[15],
+        "assignment_performer_id": row[16],
+        "assignment_chat_thread_id": row[17],
+        "route_visibility": row[18],
+    }
+    return AnnouncementOut(**task_row_to_announcement_dict(payload))
 
 
 def _row_to_report(row) -> ReportOut:
@@ -791,6 +1107,23 @@ def _add_reason(mod: Dict[str, Any], field: str, code: str, details: str, can_ap
 
 def _set_suggestions(mod: Dict[str, Any], suggestions: List[str]) -> None:
     mod["suggestions"] = [s for s in suggestions if isinstance(s, str) and s.strip()]
+
+
+def _is_temporary_text_moderation_issue(reason: str) -> bool:
+    normalized = (reason or "").strip().lower()
+    if not normalized:
+        return False
+
+    technical_markers = (
+        "ollama error",
+        "timed out",
+        "connection refused",
+        "connection reset",
+        "remote end closed connection",
+        "non-json",
+        "не-json",
+    )
+    return any(marker in normalized for marker in technical_markers)
 
 
 def _status_priority(s: str) -> int:
@@ -939,89 +1272,43 @@ def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _fetch_announcement_or_404(ann_id: str) -> AnnouncementOut:
-    row = fetch_one(
-        """
-        SELECT id, user_id, category, title, status, data, created_at
-        FROM announcements
-        WHERE id = %s
-          AND deleted_at IS NULL
-        """,
-        (ann_id,),
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="Announcement not found")
-    return _row_to_announcement(row)
-
-
-def _count_pending_offers(ann_id: str) -> int:
-    row = fetch_one(
-        """
-        SELECT COUNT(*)
-        FROM announcement_offers
-        WHERE announcement_id = %s
-          AND status IN ('pending', 'accepted')
-          AND deleted_at IS NULL
-        """,
-        (ann_id,),
-    )
-    return int(row[0] or 0) if row else 0
-
-
-def _sync_announcement_offers_count(ann_id: str) -> int:
-    row = fetch_one(
-        """
-        SELECT data
-        FROM announcements
-        WHERE id = %s
-        """,
-        (ann_id,),
-    )
-    if not row:
-        return 0
-
-    raw_data = row[0]
-    if raw_data is None:
-        data_obj: Dict[str, Any] = {}
-    elif isinstance(raw_data, str):
-        try:
-            data_obj = json.loads(raw_data)
-        except Exception:
-            data_obj = {}
-    else:
-        data_obj = dict(raw_data)
-
-    offers_count = _count_pending_offers(ann_id)
-    data_obj["offers_count"] = offers_count
-
-    execute(
-        """
-        UPDATE announcements
-        SET data = %s::jsonb,
-            updated_at = now()
-        WHERE id = %s
-        """,
-        (json.dumps(data_obj, ensure_ascii=False), ann_id),
-    )
-    return offers_count
-
-
 def _offer_avatar_select_sql() -> str:
     if _profile_has_extra_column():
         return "up.extra->>'avatar_url' AS avatar_url"
     return "NULL AS avatar_url"
 
 
-def _offer_from_row(row) -> OfferOut:
-    return OfferOut(
-        id=row[0],
-        announcement_id=row[1],
-        performer_id=row[2],
-        message=_normalize_message(row[3]),
-        proposed_price=int(row[4]) if row[4] is not None else None,
-        status=row[5],
-        created_at=row[6],
+def _category_id_for_slug(slug: str) -> str:
+    row = fetch_one(
+        """
+        SELECT id::text
+        FROM categories
+        WHERE slug = %s
+        LIMIT 1
+        """,
+        (slug,),
     )
+    if row and row[0]:
+        return str(row[0])
+    raise HTTPException(status_code=500, detail=f"Category slug '{slug}' is not configured")
+
+
+def _offer_from_row(row) -> OfferOut:
+    return OfferOut(**task_offer_row_to_legacy_dict(
+        {
+            "id": row[0],
+            "task_id": row[1],
+            "performer_id": row[2],
+            "message": row[3],
+            "proposed_price": row[4],
+            "agreed_price": row[5],
+            "pricing_mode": row[6],
+            "minimum_price_accepted": row[7],
+            "can_reoffer": row[8],
+            "status": row[9],
+            "created_at": row[10],
+        }
+    ))
 
 
 def _offer_expanded_from_row(row) -> OfferOutExpanded:
@@ -1032,36 +1319,132 @@ def _offer_expanded_from_row(row) -> OfferOutExpanded:
         performer_id=offer.performer_id,
         message=offer.message,
         proposed_price=offer.proposed_price,
+        agreed_price=offer.agreed_price,
+        pricing_mode=offer.pricing_mode,
+        minimum_price_accepted=offer.minimum_price_accepted,
+        can_reoffer=offer.can_reoffer,
         status=offer.status,
         created_at=offer.created_at,
         performer_profile={
-            "user_id": row[7],
-            "display_name": row[8],
-            "city": _normalize_optional_text(row[9], collapse_spaces=True),
-            "contact": _normalize_optional_text(row[10], collapse_spaces=True),
-            "avatar_url": row[11],
+            "user_id": row[11],
+            "display_name": row[12],
+            "city": _normalize_optional_text(row[13], collapse_spaces=True),
+            "contact": _normalize_optional_text(row[14], collapse_spaces=True),
+            "avatar_url": row[15],
         },
         performer_stats={
-            "rating_avg": float(row[12] or 0),
-            "rating_count": int(row[13] or 0),
-            "completed_count": int(row[14] or 0),
-            "cancelled_count": int(row[15] or 0),
+            "rating_avg": float(row[16] or 0),
+            "rating_count": int(row[17] or 0),
+            "completed_count": int(row[18] or 0),
+            "cancelled_count": int(row[19] or 0),
         },
     )
+
+
+def _task_exists(task_id: str) -> bool:
+    return bool(fetch_one("SELECT 1 FROM tasks WHERE id::text = %s", (task_id,)))
+
+
+def _announcement_exists(task_id: str) -> bool:
+    return _task_exists(task_id)
+
+
+def _fetch_task_row_or_404(task_id: str):
+    row = fetch_one(
+        f"""
+        {TASK_ANNOUNCEMENT_SELECT}
+        WHERE t.id::text = %s
+        """,
+        (task_id,),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Announcement not found")
+    return row
+
+
+def _fetch_announcement_or_404(ann_id: str) -> AnnouncementOut:
+    return _task_row_to_announcement(_fetch_task_row_or_404(ann_id))
+
+
+def _count_pending_offers(task_id: str) -> int:
+    row = fetch_one(
+        """
+        SELECT COUNT(*)
+        FROM task_offers
+        WHERE task_id::text = %s
+          AND status IN ('sent', 'accepted_by_customer')
+        """,
+        (task_id,),
+    )
+    return int(row[0] or 0) if row else 0
+
+
+def _sync_announcement_offers_count(task_id: str) -> int:
+    offers_count = _count_pending_offers(task_id)
+    execute(
+        """
+        UPDATE tasks
+        SET responses_count = %s,
+            status = CASE
+                WHEN accepted_offer_id IS NOT NULL THEN status
+                WHEN %s > 0 AND status = 'published' THEN 'in_responses'
+                WHEN %s = 0 AND status = 'in_responses' THEN 'published'
+                ELSE status
+            END,
+            updated_at = now()
+        WHERE id::text = %s
+        """,
+        (offers_count, offers_count, offers_count, task_id),
+    )
+    return offers_count
+
+
+def _sync_task_route_points(task_id: str, data: Dict[str, Any]) -> None:
+    execute("DELETE FROM task_route_points WHERE task_id::text = %s", (task_id,))
+    for point in route_points_from_payload(task_id, data):
+        point_value = point.get("point")
+        if not isinstance(point_value, tuple):
+            continue
+        execute(
+            """
+            INSERT INTO task_route_points (
+                id, task_id, point_order, title, address_text, point, point_kind, created_at
+            )
+            VALUES (
+                %s, %s, %s, %s, %s,
+                ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
+                %s, now()
+            )
+            """,
+            (
+                str(uuid.uuid4()),
+                task_id,
+                int(point["point_order"]),
+                point.get("title"),
+                point.get("address_text"),
+                point_value[1],
+                point_value[0],
+                point.get("point_kind"),
+            ),
+        )
 
 
 def _fetch_expanded_offer(ann_id: str, offer_id: str) -> Optional[OfferOutExpanded]:
     row = fetch_one(
         f"""
         SELECT
-            ao.id,
-            ao.announcement_id,
-            ao.performer_id,
-            ao.message,
-            ao.proposed_price,
-            ao.status,
-            ao.created_at,
-            ao.performer_id::text,
+            tf.id::text,
+            tf.task_id::text,
+            tf.performer_id::text,
+            tf.message,
+            tf.proposed_price,
+            tf.agreed_price,
+            tf.pricing_mode,
+            tf.minimum_price_accepted,
+            tf.can_reoffer,
+            tf.status::text,
+            tf.created_at,
+            tf.performer_id::text,
             COALESCE(
                 NULLIF(BTRIM(up.display_name), ''),
                 NULLIF(BTRIM(u.phone), ''),
@@ -1078,16 +1461,15 @@ def _fetch_expanded_offer(ann_id: str, offer_id: str) -> Optional[OfferOutExpand
             COALESCE(us.rating_count, 0),
             COALESCE(us.completed_count, 0),
             COALESCE(us.cancelled_count, 0)
-        FROM announcement_offers ao
+        FROM task_offers tf
         JOIN users u
-          ON u.id::text = ao.performer_id::text
+          ON u.id::text = tf.performer_id::text
         LEFT JOIN user_profiles up
-          ON up.user_id::text = ao.performer_id::text
+          ON up.user_id::text = tf.performer_id::text
         LEFT JOIN user_stats us
-          ON us.user_id::text = ao.performer_id::text
-        WHERE ao.announcement_id = %s
-          AND ao.id = %s
-          AND ao.deleted_at IS NULL
+          ON us.user_id::text = tf.performer_id::text
+        WHERE tf.task_id::text = %s
+          AND tf.id::text = %s
         """,
         (ann_id, offer_id),
     )
@@ -1096,8 +1478,278 @@ def _fetch_expanded_offer(ann_id: str, offer_id: str) -> Optional[OfferOutExpand
     return _offer_expanded_from_row(row)
 
 
-# ----------------------------
-# Announcements (Create)
+def _task_columns_from_payload(
+    *,
+    user_id: str,
+    category: str,
+    title: str,
+    legacy_status: str,
+    data: Dict[str, Any],
+    deleted_at: Any = None,
+    has_accepted_offer: bool = False,
+) -> Dict[str, Any]:
+    normalized_data = ensure_task_payload(
+        data,
+        title=title,
+        announcement_status=legacy_status,
+        deleted_at=deleted_at,
+    )
+    task_status, moderation_status = announcement_status_to_task_fields(
+        legacy_status,
+        deleted=deleted_at is not None,
+        has_accepted_offer=has_accepted_offer,
+    )
+    budget_min, budget_max = derive_budget_bounds(normalized_data)
+    quick_offer_price = derive_quick_offer_price(normalized_data)
+    reward_amount = derive_reward_amount(normalized_data)
+    point = _announcement_point_for_storage(category, normalized_data) or primary_map_point(normalized_data)
+    address_text = _normalize_optional_text(normalized_data.get("address_text"), collapse_spaces=True) or primary_source_address(normalized_data)
+    published_at = datetime.now(timezone.utc) if moderation_status == "published" and task_status in {"published", "in_responses"} else None
+    closed_at = datetime.now(timezone.utc) if task_status in {"closed", "completed", "cancelled"} or deleted_at is not None else None
+    return {
+        "category_id": _category_id_for_slug(builder_category_slug(category)),
+        "data": normalized_data,
+        "task_status": task_status,
+        "moderation_status": moderation_status,
+        "reward_amount": reward_amount,
+        "budget_min": budget_min,
+        "budget_max": budget_max,
+        "quick_offer_price": quick_offer_price,
+        "point": point,
+        "address_text": address_text,
+        "published_at": published_at,
+        "closed_at": closed_at,
+        "reoffer_policy": _normalize_optional_text(normalized_data.get("offer_policy", {}).get("reoffer_policy")) or "blocked_after_reject",
+        "customer_comment": _normalize_optional_text(normalized_data.get("notes")),
+        "description": _normalize_optional_text(normalized_data.get("generated_description")) or _normalize_optional_text(normalized_data.get("notes")) or title,
+    }
+
+
+def _insert_task(task_id: str, user_id: str, category: str, title: str, legacy_status: str, data: Dict[str, Any]) -> None:
+    fields = _task_columns_from_payload(
+        user_id=user_id,
+        category=category,
+        title=title,
+        legacy_status=legacy_status,
+        data=data,
+    )
+    point = fields["point"]
+    execute(
+        """
+        INSERT INTO tasks (
+            id, customer_id, title, description, category_id, reward_amount, currency, price_type,
+            deadline_at, location_point, address_text, customer_comment, performer_preferences,
+            status, moderation_status, views_count, favorites_count, responses_count, accepted_offer_id,
+            extra, created_at, updated_at, published_at, closed_at, deleted_at,
+            budget_min, budget_max, quick_offer_price, reoffer_policy
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, 'RUB',
+            %s,
+            NULL,
+            CASE
+                WHEN %s::double precision IS NULL OR %s::double precision IS NULL THEN NULL
+                ELSE ST_SetSRID(
+                    ST_MakePoint(%s::double precision, %s::double precision),
+                    4326
+                )::geography
+            END,
+            %s, %s, NULL,
+            %s, %s,
+            0, 0, 0, NULL,
+            %s::jsonb, now(), now(), %s, %s, NULL,
+            %s, %s, %s, %s
+        )
+        """,
+        (
+            task_id,
+            user_id,
+            title,
+            fields["description"],
+            fields["category_id"],
+            fields["reward_amount"],
+            "negotiable" if fields["budget_min"] is not None or fields["budget_max"] is not None else ("free" if fields["reward_amount"] == 0 else "fixed"),
+            point[1] if point else None,
+            point[0] if point else None,
+            point[1] if point else None,
+            point[0] if point else None,
+            fields["address_text"],
+            fields["customer_comment"],
+            fields["task_status"],
+            fields["moderation_status"],
+            json.dumps(fields["data"], ensure_ascii=False),
+            fields["published_at"],
+            fields["closed_at"],
+            fields["budget_min"],
+            fields["budget_max"],
+            fields["quick_offer_price"],
+            fields["reoffer_policy"],
+        ),
+    )
+    _sync_task_route_points(task_id, fields["data"])
+    execute(
+        """
+        INSERT INTO task_status_events (id, task_id, from_status, to_status, changed_by, reason, created_at)
+        VALUES (%s, %s, NULL, %s, %s, %s, now())
+        """,
+        (str(uuid.uuid4()), task_id, fields["task_status"], user_id, "created_from_announcement_api"),
+    )
+
+
+def _update_task_content(
+    task_id: str,
+    *,
+    user_id: str,
+    category: str,
+    title: str,
+    legacy_status: str,
+    data: Dict[str, Any],
+    deleted_at: Any = None,
+) -> None:
+    current = _fetch_task_row_or_404(task_id)
+    fields = _task_columns_from_payload(
+        user_id=user_id,
+        category=category,
+        title=title,
+        legacy_status=legacy_status,
+        data=data,
+        deleted_at=deleted_at,
+        has_accepted_offer=bool(current[13]),
+    )
+    point = fields["point"]
+    execute(
+        """
+        UPDATE tasks
+        SET title = %s,
+            description = %s,
+            category_id = %s,
+            reward_amount = %s,
+            price_type = %s,
+            location_point = CASE
+                WHEN %s::double precision IS NULL OR %s::double precision IS NULL THEN NULL
+                ELSE ST_SetSRID(
+                    ST_MakePoint(%s::double precision, %s::double precision),
+                    4326
+                )::geography
+            END,
+            address_text = %s,
+            customer_comment = %s,
+            status = %s,
+            moderation_status = %s,
+            extra = %s::jsonb,
+            published_at = COALESCE(%s, published_at),
+            closed_at = %s,
+            deleted_at = %s,
+            budget_min = %s,
+            budget_max = %s,
+            quick_offer_price = %s,
+            reoffer_policy = %s,
+            updated_at = now()
+        WHERE id::text = %s
+        """,
+        (
+            title,
+            fields["description"],
+            fields["category_id"],
+            fields["reward_amount"],
+            "negotiable" if fields["budget_min"] is not None or fields["budget_max"] is not None else ("free" if fields["reward_amount"] == 0 else "fixed"),
+            point[1] if point else None,
+            point[0] if point else None,
+            point[1] if point else None,
+            point[0] if point else None,
+            fields["address_text"],
+            fields["customer_comment"],
+            fields["task_status"],
+            fields["moderation_status"],
+            json.dumps(fields["data"], ensure_ascii=False),
+            fields["published_at"],
+            fields["closed_at"],
+            deleted_at,
+            fields["budget_min"],
+            fields["budget_max"],
+            fields["quick_offer_price"],
+            fields["reoffer_policy"],
+            task_id,
+        ),
+    )
+    _sync_task_route_points(task_id, fields["data"])
+
+
+def _active_assignment_for_task(task_id: str):
+    return fetch_one(
+        """
+        SELECT id::text, offer_id::text, performer_id::text, assignment_status, execution_stage, chat_thread_id::text
+        FROM task_assignments
+        WHERE task_id::text = %s
+          AND assignment_status IN ('assigned', 'in_progress')
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (task_id,),
+    )
+
+
+def _create_or_update_assignment(task_id: str, offer_id: str, customer_id: str, performer_id: str) -> str:
+    existing = _active_assignment_for_task(task_id)
+    if existing and str(existing[1]) == offer_id:
+        return str(existing[0])
+    if existing and str(existing[1]) != offer_id:
+        raise HTTPException(status_code=409, detail="По объявлению уже выбран исполнитель")
+
+    assignment_id = str(uuid.uuid4())
+    execute(
+        """
+        INSERT INTO task_assignments (
+            id, task_id, offer_id, customer_id, performer_id,
+            assignment_status, execution_stage, route_visibility,
+            created_at, updated_at
+        )
+        VALUES (
+            %s, %s, %s, %s, %s,
+            'assigned', 'accepted', 'performer_only',
+            now(), now()
+        )
+        """,
+        (assignment_id, task_id, offer_id, customer_id, performer_id),
+    )
+    execute(
+        """
+        INSERT INTO task_assignment_events (
+            id, assignment_id, task_id, event_type, from_value, to_value, changed_by, payload
+        )
+        VALUES (%s, %s, %s, 'assignment_status', NULL, 'assigned', %s, '{}'::jsonb)
+        """,
+        (str(uuid.uuid4()), assignment_id, task_id, customer_id),
+    )
+    execute(
+        """
+        INSERT INTO task_assignment_events (
+            id, assignment_id, task_id, event_type, from_value, to_value, changed_by, payload
+        )
+        VALUES (%s, %s, %s, 'execution_stage', NULL, 'accepted', %s, '{}'::jsonb)
+        """,
+        (str(uuid.uuid4()), assignment_id, task_id, customer_id),
+    )
+    execute(
+        """
+        UPDATE tasks
+        SET accepted_offer_id = %s,
+            status = 'agreed',
+            updated_at = now()
+        WHERE id::text = %s
+        """,
+        (offer_id, task_id),
+    )
+    execute(
+        """
+        INSERT INTO task_status_events (id, task_id, from_status, to_status, changed_by, reason, created_at)
+        VALUES (%s, %s, 'in_responses', 'agreed', %s, %s, now())
+        """,
+        (str(uuid.uuid4()), task_id, customer_id, "offer_accepted"),
+    )
+    return assignment_id
+
+
 # ----------------------------
 @app.post("/announcements", response_model=AnnouncementOut, status_code=201)
 def create_announcement(
@@ -1187,6 +1839,7 @@ def create_announcement(
     status = STATUS_PENDING
     suggestions: List[str] = []
     has_media = _has_media_attachments(data)
+    text_moderation_temporarily_unavailable = label == "UNKNOWN" and _is_temporary_text_moderation_issue(reason)
 
     mod["text"] = {
         "label": label,
@@ -1205,15 +1858,23 @@ def create_announcement(
             "Уберите неоднозначные или запрещённые формулировки.",
         ]
     elif label != "LEGAL":
-        status = STATUS_NEEDS_FIX
-        _set_decision(mod, status, "Нужно исправить: текст выглядит спорным. Уточните формулировку.")
-        _add_reason(mod, "title", "TEXT_UNKNOWN", reason or "Спорный текст", True)
-        if isinstance(notes, str) and notes.strip():
-            _add_reason(mod, "notes", "TEXT_UNKNOWN", reason or "Спорный текст", True)
-        suggestions = [
-            "Сделайте описание более нейтральным и конкретным.",
-            "Уберите фразы, которые можно трактовать неоднозначно.",
-        ]
+        if text_moderation_temporarily_unavailable:
+            if has_media:
+                status = STATUS_PENDING
+                _set_decision(mod, status, "На проверке: сначала проверим фото, затем объявление появится на карте.")
+            else:
+                status = STATUS_ACTIVE
+                _set_decision(mod, status, "Одобрено: объявление без фото активно и отображается на карте.")
+        else:
+            status = STATUS_NEEDS_FIX
+            _set_decision(mod, status, "Нужно исправить: текст выглядит спорным. Уточните формулировку.")
+            _add_reason(mod, "title", "TEXT_UNKNOWN", reason or "Спорный текст", True)
+            if isinstance(notes, str) and notes.strip():
+                _add_reason(mod, "notes", "TEXT_UNKNOWN", reason or "Спорный текст", True)
+            suggestions = [
+                "Сделайте описание более нейтральным и конкретным.",
+                "Уберите фразы, которые можно трактовать неоднозначно.",
+            ]
     else:
         if has_media:
             status = STATUS_PENDING
@@ -1236,52 +1897,15 @@ def create_announcement(
 
     _set_mod(data, mod)
 
-    location_point = _announcement_point_for_storage(payload.category, data)
-    location_lon = location_point[1] if location_point else None
-    location_lat = location_point[0] if location_point else None
-
-    execute(
-        """
-        INSERT INTO announcements (id, user_id, category, title, status, data, location_point)
-        VALUES (
-            %s,
-            %s,
-            %s,
-            %s,
-            %s,
-            %s::jsonb,
-            CASE
-                WHEN %s IS NULL OR %s IS NULL THEN NULL
-                ELSE ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography
-            END
-        )
-        """,
-        (
-            ann_id,
-            user.id,
-            payload.category,
-            title,
-            status,
-            json.dumps(data, ensure_ascii=False),
-            location_lon,
-            location_lat,
-            location_lon,
-            location_lat,
-        ),
+    _insert_task(
+        task_id=ann_id,
+        user_id=user.id,
+        category=payload.category,
+        title=title,
+        legacy_status=status,
+        data=data,
     )
-
-    row = fetch_one(
-        """
-        SELECT id, user_id, category, title, status, data, created_at
-        FROM announcements
-        WHERE id = %s
-        """,
-        (ann_id,),
-    )
-    if not row:
-        raise HTTPException(status_code=500, detail="Failed to create announcement")
-
-    return _row_to_announcement(row)
+    return _fetch_announcement_or_404(ann_id)
 
 
 # ----------------------------
@@ -1293,18 +1917,7 @@ def upload_announcement_media(
     files: List[UploadFile] = File(...),
     user: UserOut = Depends(get_current_user),
 ) -> AnnouncementOut:
-    row = fetch_one(
-        """
-        SELECT id, user_id, category, title, status, data, created_at
-        FROM announcements
-        WHERE id=%s AND deleted_at IS NULL
-        """,
-        (ann_id,),
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="Announcement not found")
-
-    ann = _row_to_announcement(row)
+    ann = _fetch_announcement_or_404(ann_id)
     if ann.user_id != user.id:
         raise HTTPException(status_code=403, detail="Not your announcement")
 
@@ -1381,17 +1994,15 @@ def upload_announcement_media(
         }
 
     _set_mod(data_obj, mod)
-
-    execute(
-        "UPDATE announcements SET status=%s, data=%s::jsonb, updated_at=now() WHERE id=%s",
-        (new_status, json.dumps(data_obj, ensure_ascii=False), ann_id),
+    _update_task_content(
+        ann_id,
+        user_id=user.id,
+        category=ann.category,
+        title=ann.title,
+        legacy_status=new_status,
+        data=data_obj,
     )
-
-    updated = fetch_one(
-        "SELECT id, user_id, category, title, status, data, created_at FROM announcements WHERE id=%s",
-        (ann_id,),
-    )
-    return _row_to_announcement(updated)
+    return _fetch_announcement_or_404(ann_id)
 
 
 # ----------------------------
@@ -1403,18 +2014,7 @@ def appeal_announcement(
     payload: AppealIn,
     user: UserOut = Depends(get_current_user),
 ) -> AnnouncementOut:
-    row = fetch_one(
-        """
-        SELECT id, user_id, category, title, status, data, created_at
-        FROM announcements
-        WHERE id = %s AND deleted_at IS NULL
-        """,
-        (ann_id,),
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="Announcement not found")
-
-    ann = _row_to_announcement(row)
+    ann = _fetch_announcement_or_404(ann_id)
     if ann.user_id != user.id:
         raise HTTPException(status_code=403, detail="Not your announcement")
 
@@ -1429,24 +2029,16 @@ def appeal_announcement(
 
     _set_decision(mod, STATUS_PENDING, "Апелляция принята и отправлена на повторную проверку.")
     _set_mod(data_obj, mod)
-
-    execute(
-        """
-        UPDATE announcements
-        SET status = %s,
-            data = %s::jsonb,
-            updated_at = now()
-        WHERE id = %s
-        """,
-        (STATUS_PENDING, json.dumps(data_obj, ensure_ascii=False), ann_id),
+    _update_task_content(
+        ann_id,
+        user_id=user.id,
+        category=ann.category,
+        title=ann.title,
+        legacy_status=STATUS_PENDING,
+        data=data_obj,
     )
     ensure_appeal_report(user.id, ann_id, payload.reason)
-
-    updated = fetch_one(
-        "SELECT id, user_id, category, title, status, data, created_at FROM announcements WHERE id = %s",
-        (ann_id,),
-    )
-    return _row_to_announcement(updated)
+    return _fetch_announcement_or_404(ann_id)
 
 
 @app.patch("/announcements/{ann_id}/archive", response_model=AnnouncementOut)
@@ -1454,28 +2046,18 @@ def archive_announcement(
     ann_id: str,
     user: UserOut = Depends(get_current_user),
 ) -> AnnouncementOut:
-    row = fetch_one(
-        """
-        SELECT id, user_id, category, title, status, data, created_at
-        FROM announcements
-        WHERE id=%s AND deleted_at IS NULL
-        """,
-        (ann_id,),
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="Announcement not found")
-
-    ann = _row_to_announcement(row)
+    ann = _fetch_announcement_or_404(ann_id)
     if ann.user_id != user.id:
         raise HTTPException(status_code=403, detail="Not your announcement")
-
-    execute("UPDATE announcements SET status=%s, updated_at=now() WHERE id=%s", (STATUS_ARCHIVED, ann_id))
-
-    updated = fetch_one(
-        "SELECT id, user_id, category, title, status, data, created_at FROM announcements WHERE id=%s",
-        (ann_id,),
+    _update_task_content(
+        ann_id,
+        user_id=user.id,
+        category=ann.category,
+        title=ann.title,
+        legacy_status=STATUS_ARCHIVED,
+        data=dict(ann.data or {}),
     )
-    return _row_to_announcement(updated)
+    return _fetch_announcement_or_404(ann_id)
 
 
 @app.delete("/announcements/{ann_id}")
@@ -1483,17 +2065,52 @@ def delete_announcement(
     ann_id: str,
     user: UserOut = Depends(get_current_user),
 ) -> Dict[str, bool]:
-    row = fetch_one(
-        "SELECT id, user_id FROM announcements WHERE id=%s AND deleted_at IS NULL",
+    if not _task_exists(ann_id):
+        return {"ok": True}
+    ann = _fetch_announcement_or_404(ann_id)
+    if ann.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Not your announcement")
+    now = datetime.now(timezone.utc)
+    execute(
+        """
+        UPDATE task_assignments
+        SET assignment_status = 'cancelled',
+            execution_stage = 'cancelled',
+            route_visibility = 'hidden',
+            cancelled_at = now(),
+            updated_at = now()
+        WHERE task_id::text = %s
+          AND assignment_status IN ('assigned', 'in_progress')
+        """,
         (ann_id,),
     )
-    if not row:
-        return {"ok": True}
-
-    if row[1] != user.id:
-        raise HTTPException(status_code=403, detail="Not your announcement")
-
-    execute("UPDATE announcements SET deleted_at=now(), updated_at=now() WHERE id=%s", (ann_id,))
+    execute(
+        """
+        UPDATE chat_threads
+        SET archived_at = now()
+        WHERE task_id::text = %s
+        """,
+        (ann_id,),
+    )
+    execute(
+        """
+        UPDATE chat_participants
+        SET left_at = now()
+        WHERE thread_id IN (
+            SELECT id FROM chat_threads WHERE task_id::text = %s
+        )
+        """,
+        (ann_id,),
+    )
+    _update_task_content(
+        ann_id,
+        user_id=user.id,
+        category=ann.category,
+        title=ann.title,
+        legacy_status="deleted",
+        data=dict(ann.data or {}),
+        deleted_at=now,
+    )
     return {"ok": True}
 
 
@@ -1514,59 +2131,71 @@ def create_offer(
     if ann.status != STATUS_ACTIVE:
         raise HTTPException(status_code=400, detail="Отклики доступны только для активных объявлений")
 
-    accepted_offer = fetch_one(
-        """
-        SELECT id
-        FROM announcement_offers
-        WHERE announcement_id = %s
-          AND status = 'accepted'
-          AND deleted_at IS NULL
-        LIMIT 1
-        """,
-        (ann_id,),
-    )
-    if accepted_offer:
+    if _active_assignment_for_task(ann_id):
         raise HTTPException(status_code=409, detail="По объявлению уже выбран исполнитель")
 
     message = _normalize_message(payload.message)
+    pricing_mode = (payload.pricing_mode or "").strip().lower() or ("quick_min_price" if payload.proposed_price is None else "counter_price")
+    quick_offer_price = derive_quick_offer_price(dict(ann.data or {}))
+    minimum_price_accepted = bool(payload.minimum_price_accepted) or pricing_mode == "quick_min_price"
     proposed_price = payload.proposed_price
+    agreed_price = payload.agreed_price
+
+    if pricing_mode == "quick_min_price":
+        minimum_price_accepted = True
+        proposed_price = None
+        agreed_price = quick_offer_price
+    elif agreed_price is None and proposed_price is not None:
+        agreed_price = proposed_price
 
     existing = fetch_one(
         """
-        SELECT id
-        FROM announcement_offers
-        WHERE announcement_id = %s
-          AND performer_id = %s
-          AND status = 'pending'
-          AND deleted_at IS NULL
-        ORDER BY created_at DESC
+        SELECT id::text, status::text, can_reoffer
+        FROM task_offers
+        WHERE task_id::text = %s
+          AND performer_id::text = %s
         LIMIT 1
         """,
         (ann_id, user.id),
     )
 
     if existing:
-        offer_id = existing[0]
+        offer_id = str(existing[0])
+        existing_status = str(existing[1] or "")
+        can_reoffer = bool(existing[2])
+        if existing_status == "accepted_by_customer":
+            raise HTTPException(status_code=409, detail="Ваш отклик уже принят")
+        if not can_reoffer and existing_status in {"rejected_by_customer", "withdrawn_by_sender"}:
+            raise HTTPException(status_code=409, detail="Повторный отклик по этому заданию запрещён")
         execute(
             """
-            UPDATE announcement_offers
+            UPDATE task_offers
             SET message = %s,
                 proposed_price = %s,
-                deleted_at = NULL
-            WHERE id = %s
+                agreed_price = %s,
+                pricing_mode = %s,
+                minimum_price_accepted = %s,
+                can_reoffer = TRUE,
+                reoffer_block_reason = NULL,
+                status = 'sent',
+                rejected_at = NULL,
+                withdrawn_at = NULL,
+                updated_at = now()
+            WHERE id::text = %s
             """,
-            (message, proposed_price, offer_id),
+            (message, proposed_price, agreed_price, pricing_mode, minimum_price_accepted, offer_id),
         )
     else:
         offer_id = str(uuid.uuid4())
         execute(
             """
-            INSERT INTO announcement_offers (
-                id, announcement_id, performer_id, message, proposed_price, status, created_at, deleted_at
+            INSERT INTO task_offers (
+                id, task_id, performer_id, message, proposed_price, currency, status, created_at, updated_at,
+                pricing_mode, agreed_price, minimum_price_accepted, can_reoffer, reoffer_block_reason
             )
-            VALUES (%s, %s, %s, %s, %s, 'pending', now(), NULL)
+            VALUES (%s, %s, %s, %s, %s, 'RUB', 'sent', now(), now(), %s, %s, %s, TRUE, NULL)
             """,
-            (offer_id, ann_id, user.id, message, proposed_price),
+            (offer_id, ann_id, user.id, message, proposed_price, pricing_mode, agreed_price, minimum_price_accepted),
         )
 
     _sync_announcement_offers_count(ann_id)
@@ -1579,9 +2208,20 @@ def create_offer(
 
     row = fetch_one(
         """
-        SELECT id, announcement_id, performer_id, message, proposed_price, status, created_at
-        FROM announcement_offers
-        WHERE id = %s
+        SELECT
+            id::text,
+            task_id::text,
+            performer_id::text,
+            message,
+            proposed_price,
+            agreed_price,
+            pricing_mode,
+            minimum_price_accepted,
+            can_reoffer,
+            status::text,
+            created_at
+        FROM task_offers
+        WHERE id::text = %s
         """,
         (offer_id,),
     )
@@ -1603,14 +2243,18 @@ def list_announcement_offers(
     rows = fetch_all(
         f"""
         SELECT
-            ao.id,
-            ao.announcement_id,
-            ao.performer_id,
-            ao.message,
-            ao.proposed_price,
-            ao.status,
-            ao.created_at,
-            ao.performer_id::text,
+            tf.id::text,
+            tf.task_id::text,
+            tf.performer_id::text,
+            tf.message,
+            tf.proposed_price,
+            tf.agreed_price,
+            tf.pricing_mode,
+            tf.minimum_price_accepted,
+            tf.can_reoffer,
+            tf.status::text,
+            tf.created_at,
+            tf.performer_id::text,
             COALESCE(
                 NULLIF(BTRIM(up.display_name), ''),
                 NULLIF(BTRIM(u.phone), ''),
@@ -1627,18 +2271,17 @@ def list_announcement_offers(
             COALESCE(us.rating_count, 0),
             COALESCE(us.completed_count, 0),
             COALESCE(us.cancelled_count, 0)
-        FROM announcement_offers ao
+        FROM task_offers tf
         JOIN users u
-          ON u.id::text = ao.performer_id::text
+          ON u.id::text = tf.performer_id::text
         LEFT JOIN user_profiles up
-          ON up.user_id::text = ao.performer_id::text
+          ON up.user_id::text = tf.performer_id::text
         LEFT JOIN user_stats us
-          ON us.user_id::text = ao.performer_id::text
-        WHERE ao.announcement_id = %s
-          AND ao.status IN ('pending', 'accepted')
-          AND ao.deleted_at IS NULL
-        ORDER BY CASE WHEN ao.status = 'accepted' THEN 0 ELSE 1 END,
-                 ao.created_at DESC
+          ON us.user_id::text = tf.performer_id::text
+        WHERE tf.task_id::text = %s
+          AND tf.status IN ('sent', 'accepted_by_customer', 'rejected_by_customer')
+        ORDER BY CASE WHEN tf.status = 'accepted_by_customer' THEN 0 ELSE 1 END,
+                 tf.created_at DESC
         """,
         (ann_id,),
     )
@@ -1658,11 +2301,10 @@ def accept_announcement_offer(
 
     row = fetch_one(
         """
-        SELECT performer_id, status
-        FROM announcement_offers
-        WHERE id = %s
-          AND announcement_id = %s
-          AND deleted_at IS NULL
+        SELECT performer_id::text, status::text
+        FROM task_offers
+        WHERE id::text = %s
+          AND task_id::text = %s
         """,
         (offer_id, ann_id),
     )
@@ -1670,30 +2312,55 @@ def accept_announcement_offer(
         raise HTTPException(status_code=404, detail="Offer not found")
 
     performer_id, status = row
-    if status == "rejected":
+    if status == "rejected_by_customer":
         raise HTTPException(status_code=409, detail="Отклик уже отклонён")
 
     did_accept_now = False
-    thread_id = get_or_create_offer_thread(
-        offer_id=offer_id,
-        owner_id=ann.user_id,
-        performer_id=performer_id,
-    )
+    assignment_id = None
 
-    if status != "accepted":
-        if status != "pending":
+    if status != "accepted_by_customer":
+        if status != "sent":
             raise HTTPException(status_code=409, detail="Отклик нельзя принять в текущем статусе")
 
         execute(
             """
-            UPDATE announcement_offers
-            SET status = 'accepted'
-            WHERE id = %s
+            UPDATE task_offers
+            SET status = 'accepted_by_customer',
+                can_reoffer = FALSE,
+                accepted_at = now(),
+                agreed_price = COALESCE(agreed_price, proposed_price, %s)
+            WHERE id::text = %s
             """,
-            (offer_id,),
+            (derive_quick_offer_price(dict(ann.data or {})), offer_id),
+        )
+        execute(
+            """
+            UPDATE task_offers
+            SET status = 'rejected_by_customer',
+                can_reoffer = FALSE,
+                reoffer_block_reason = 'task_already_assigned',
+                rejected_at = now(),
+                updated_at = now()
+            WHERE task_id::text = %s
+              AND id::text <> %s
+              AND status = 'sent'
+            """,
+            (ann_id, offer_id),
         )
         _sync_announcement_offers_count(ann_id)
+        assignment_id = _create_or_update_assignment(ann_id, offer_id, ann.user_id, performer_id)
         did_accept_now = True
+    else:
+        existing_assignment = _active_assignment_for_task(ann_id)
+        assignment_id = str(existing_assignment[0]) if existing_assignment else None
+
+    thread_id = get_or_create_offer_thread(
+        task_id=ann_id,
+        offer_id=offer_id,
+        assignment_id=assignment_id,
+        owner_id=ann.user_id,
+        performer_id=performer_id,
+    )
 
     if did_accept_now:
         create_notification(
@@ -1722,11 +2389,10 @@ def reject_announcement_offer(
 
     row = fetch_one(
         """
-        SELECT performer_id, status
-        FROM announcement_offers
-        WHERE id = %s
-          AND announcement_id = %s
-          AND deleted_at IS NULL
+        SELECT performer_id::text, status::text
+        FROM task_offers
+        WHERE id::text = %s
+          AND task_id::text = %s
         """,
         (offer_id, ann_id),
     )
@@ -1734,15 +2400,19 @@ def reject_announcement_offer(
         raise HTTPException(status_code=404, detail="Offer not found")
 
     performer_id, status = row
-    if status == "accepted":
+    if status == "accepted_by_customer":
         raise HTTPException(status_code=409, detail="Нельзя отклонить уже принятый отклик")
 
-    if status != "rejected":
+    if status != "rejected_by_customer":
         execute(
             """
-            UPDATE announcement_offers
-            SET status = 'rejected'
-            WHERE id = %s
+            UPDATE task_offers
+            SET status = 'rejected_by_customer',
+                can_reoffer = FALSE,
+                reoffer_block_reason = 'blocked_after_reject',
+                rejected_at = now(),
+                updated_at = now()
+            WHERE id::text = %s
             """,
             (offer_id,),
         )
@@ -1755,6 +2425,188 @@ def reject_announcement_offer(
         )
 
     return OKOut(ok=True)
+
+
+def _canonical_execution_stage(stage: str) -> str:
+    normalized = (stage or "").strip().lower()
+    mapping = {
+        "accepted": "accepted",
+        "heading": "en_route",
+        "en_route": "en_route",
+        "onsite": "on_site",
+        "on_site": "on_site",
+        "doing": "in_progress",
+        "in_progress": "in_progress",
+        "finishing": "handoff",
+        "handoff": "handoff",
+        "completed": "completed",
+        "cancelled": "cancelled",
+        "canceled": "cancelled",
+    }
+    return mapping.get(normalized, normalized)
+
+
+@app.post("/announcements/{ann_id}/execution-stage", response_model=AnnouncementOut)
+def update_announcement_execution_stage(
+    ann_id: str,
+    payload: ExecutionStageUpdateIn,
+    user: UserOut = Depends(get_current_user),
+) -> AnnouncementOut:
+    ann = _fetch_announcement_or_404(ann_id)
+    assignment = _active_assignment_for_task(ann_id)
+    if not assignment:
+        raise HTTPException(status_code=409, detail="Для задания пока нет активного исполнителя")
+
+    assignment_id, accepted_offer_id, performer_id, assignment_status, current_stage, chat_thread_id = assignment
+    if user.id != performer_id and user.id != ann.user_id:
+        raise HTTPException(status_code=403, detail="Недостаточно прав для смены этапа")
+
+    new_stage = _canonical_execution_stage(payload.stage)
+    allowed_stages = {"accepted", "en_route", "on_site", "in_progress", "handoff", "completed", "cancelled"}
+    if new_stage not in allowed_stages:
+        raise HTTPException(status_code=422, detail="Неизвестный execution-stage")
+
+    stage_order = {
+        "accepted": 0,
+        "en_route": 1,
+        "on_site": 2,
+        "in_progress": 3,
+        "handoff": 4,
+        "completed": 5,
+        "cancelled": 99,
+    }
+    current_stage = canonical_execution_status(
+        execution_stage=current_stage,
+        assignment_status=assignment_status,
+        current_value="accepted",
+    )
+    if new_stage != "cancelled" and stage_order[new_stage] < stage_order[current_stage]:
+        raise HTTPException(status_code=409, detail="Нельзя откатить execution-stage назад")
+    if new_stage != "cancelled" and stage_order[new_stage] > stage_order[current_stage] + 1:
+        raise HTTPException(status_code=409, detail="Нужно отмечать этапы последовательно")
+
+    next_assignment_status = "assigned"
+    next_task_status = "agreed"
+    if new_stage in {"en_route", "on_site", "in_progress", "handoff"}:
+        next_assignment_status = "in_progress"
+        next_task_status = "in_progress"
+    elif new_stage == "completed":
+        next_assignment_status = "completed"
+        next_task_status = "completed"
+    elif new_stage == "cancelled":
+        next_assignment_status = "cancelled"
+        next_task_status = "cancelled"
+
+    accepted_confirmed = new_stage != "cancelled"
+    data_obj: Dict[str, Any] = dict(ann.data or {})
+    task_obj = _ensure_obj(data_obj.get("task"))
+    task_execution = _ensure_obj(task_obj.get("execution"))
+    task_assignment = _ensure_obj(task_obj.get("assignment"))
+    legacy_execution = _ensure_obj(data_obj.get("execution"))
+
+    task_execution["status"] = new_stage
+    task_execution["accepted_confirmed"] = accepted_confirmed
+    task_assignment["execution_status"] = new_stage
+    task_assignment["accepted_confirmed"] = accepted_confirmed
+    task_obj["execution"] = task_execution
+    task_obj["assignment"] = task_assignment
+    data_obj["task"] = task_obj
+
+    legacy_execution["status"] = new_stage
+    legacy_execution["accepted_confirmed"] = accepted_confirmed
+    data_obj["execution"] = legacy_execution
+    data_obj["execution_status"] = new_stage
+    data_obj["execution_status_confirmed"] = accepted_confirmed
+
+    next_route_visibility = route_visibility_for_execution(new_stage)
+    execute(
+        """
+        UPDATE task_assignments
+        SET assignment_status = %s,
+            execution_stage = %s,
+            route_visibility = %s,
+            started_at = CASE
+                WHEN started_at IS NULL AND %s = 'in_progress' THEN now()
+                ELSE started_at
+            END,
+            completed_at = CASE WHEN %s = 'completed' THEN now() ELSE completed_at END,
+            cancelled_at = CASE WHEN %s = 'cancelled' THEN now() ELSE cancelled_at END,
+            updated_at = now()
+        WHERE id::text = %s
+        """,
+        (
+            next_assignment_status,
+            new_stage,
+            next_route_visibility,
+            next_assignment_status,
+            next_assignment_status,
+            next_assignment_status,
+            assignment_id,
+        ),
+    )
+    execute(
+        """
+        INSERT INTO task_assignment_events (id, assignment_id, task_id, event_type, from_value, to_value, changed_by, payload)
+        VALUES (%s, %s, %s, 'execution_stage', %s, %s, %s, '{}'::jsonb)
+        """,
+        (str(uuid.uuid4()), assignment_id, ann_id, current_stage, new_stage, user.id),
+    )
+    if assignment_status != next_assignment_status:
+        execute(
+            """
+            INSERT INTO task_assignment_events (id, assignment_id, task_id, event_type, from_value, to_value, changed_by, payload)
+            VALUES (%s, %s, %s, 'assignment_status', %s, %s, %s, '{}'::jsonb)
+            """,
+            (str(uuid.uuid4()), assignment_id, ann_id, assignment_status, next_assignment_status, user.id),
+        )
+
+    current_task = fetch_one("SELECT status::text FROM tasks WHERE id::text = %s", (ann_id,))
+    previous_task_status = str(current_task[0]) if current_task and current_task[0] else "agreed"
+    execute(
+        """
+        UPDATE tasks
+        SET status = %s,
+            extra = %s::jsonb,
+            closed_at = CASE WHEN %s IN ('completed', 'cancelled') THEN now() ELSE NULL END,
+            updated_at = now()
+        WHERE id::text = %s
+        """,
+        (next_task_status, json.dumps(data_obj, ensure_ascii=False), next_task_status, ann_id),
+    )
+    if previous_task_status != next_task_status:
+        execute(
+            """
+            INSERT INTO task_status_events (id, task_id, from_status, to_status, changed_by, reason, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, now())
+            """,
+            (str(uuid.uuid4()), ann_id, previous_task_status, next_task_status, user.id, "execution_stage_updated"),
+        )
+
+    legacy_announcement_status = STATUS_ACTIVE
+    if new_stage == "completed":
+        legacy_announcement_status = "completed"
+    elif new_stage == "cancelled":
+        legacy_announcement_status = "cancelled"
+    execute(
+        """
+        UPDATE announcements
+        SET status = %s,
+            updated_at = now()
+        WHERE id::text = %s
+          AND deleted_at IS NULL
+        """,
+        (legacy_announcement_status, ann_id),
+    )
+
+    if chat_thread_id:
+        if new_stage == "completed":
+            post_system_thread_message(
+                chat_thread_id,
+                "Заказ выполнен. Если возникли проблемы, позже здесь можно будет открыть спор. Если всё прошло хорошо, оставьте отзыв друг о друге."
+            )
+        anyio.from_thread.run(broadcast_thread_preview_to_user, chat_thread_id, ann.user_id)
+        anyio.from_thread.run(broadcast_thread_preview_to_user, chat_thread_id, performer_id)
+    return _fetch_announcement_or_404(ann_id)
 
 
 # ----------------------------
@@ -1943,42 +2795,87 @@ def send_support_thread_message(
 @app.get("/announcements/me", response_model=List[AnnouncementOut])
 def my_announcements(user: UserOut = Depends(get_current_user)) -> List[AnnouncementOut]:
     rows = fetch_all(
-        """
-        SELECT id, user_id, category, title, status, data, created_at
-        FROM announcements
-        WHERE user_id = %s AND deleted_at IS NULL
-        ORDER BY created_at DESC
+        f"""
+        {TASK_ANNOUNCEMENT_SELECT}
+        WHERE t.customer_id::text = %s
+          AND t.deleted_at IS NULL
+        ORDER BY t.created_at DESC
         """,
         (user.id,),
     )
-    return [_row_to_announcement(r) for r in rows]
+    return [_task_row_to_announcement(r) for r in rows]
 
 
 @app.get("/announcements/public", response_model=List[AnnouncementOut])
 def public_announcements(limit: int = 200) -> List[AnnouncementOut]:
     lim = max(1, min(int(limit), 500))
     rows = fetch_all(
-        """
-        SELECT id, user_id, category, title, status, data, created_at
-        FROM announcements
-        WHERE deleted_at IS NULL
-          AND status = %s
+        f"""
+        {TASK_ANNOUNCEMENT_SELECT}
+        WHERE t.deleted_at IS NULL
+          AND t.moderation_status = 'published'
+          AND t.status IN ('published', 'in_responses')
+          AND t.customer_id::text <> 'dev'
           AND NOT EXISTS (
               SELECT 1
-              FROM announcement_offers ao
-              WHERE ao.announcement_id::text = announcements.id::text
-                AND ao.status = 'accepted'
-                AND ao.deleted_at IS NULL
+              FROM task_assignments ta
+              WHERE ta.task_id = t.id
+                AND ta.assignment_status IN ('assigned', 'in_progress')
           )
-          AND announcements.user_id::text <> 'dev'
-          AND EXISTS (
-              SELECT 1
-              FROM users u
-              WHERE u.id::text = announcements.user_id::text
-          )
-        ORDER BY created_at DESC
+        ORDER BY t.created_at DESC
         LIMIT %s
         """,
-        (STATUS_ACTIVE, lim),
+        (lim,),
     )
-    return [_row_to_announcement(r) for r in rows]
+    return [_task_row_to_announcement(r) for r in rows]
+
+
+def _user_can_fetch_announcement(ann_id: str, user_id: str, owner_id: str) -> bool:
+    if owner_id == user_id:
+        return True
+
+    assignment = fetch_one(
+        """
+        SELECT 1
+        FROM task_assignments
+        WHERE task_id::text = %s
+          AND performer_id::text = %s
+          AND assignment_status IN ('assigned', 'in_progress', 'completed')
+        LIMIT 1
+        """,
+        (ann_id, user_id),
+    )
+    if assignment:
+        return True
+
+    public_row = fetch_one(
+        """
+        SELECT 1
+        FROM tasks t
+        WHERE t.id::text = %s
+          AND t.deleted_at IS NULL
+          AND t.moderation_status = 'published'
+          AND t.status IN ('published', 'in_responses')
+          AND t.customer_id::text <> 'dev'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM task_assignments ta
+              WHERE ta.task_id = t.id
+                AND ta.assignment_status IN ('assigned', 'in_progress')
+          )
+        LIMIT 1
+        """,
+        (ann_id,),
+    )
+    return public_row is not None
+
+
+@app.get("/announcements/{ann_id}", response_model=AnnouncementOut)
+def get_announcement(
+    ann_id: str,
+    user: UserOut = Depends(get_current_user),
+) -> AnnouncementOut:
+    ann = _fetch_announcement_or_404(ann_id)
+    if not _user_can_fetch_announcement(ann_id, user.id, ann.user_id):
+        raise HTTPException(status_code=404, detail="Announcement not found")
+    return ann

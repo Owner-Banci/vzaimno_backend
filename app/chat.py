@@ -8,10 +8,12 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException, WebSocket
+from fastapi.encoders import jsonable_encoder
 
 from app.db import execute, fetch_all, fetch_one
 from app.ops import create_notification
 from app.schema_compat import table_has_column
+from app.task_compat import normalize_optional_text
 
 
 class ChatWebSocketHub:
@@ -42,10 +44,15 @@ class ChatWebSocketHub:
         if not thread_sockets:
             return
 
+        try:
+            serialized_payload = jsonable_encoder(payload)
+        except Exception:
+            return
+
         stale: List[WebSocket] = []
         for websocket in thread_sockets:
             try:
-                await websocket.send_json(payload)
+                await websocket.send_json(serialized_payload)
             except Exception:
                 stale.append(websocket)
 
@@ -58,6 +65,8 @@ class ChatWebSocketHub:
 
 
 _chat_ws_hub = ChatWebSocketHub()
+_chat_user_ws_hub = ChatWebSocketHub()
+SYSTEM_CHAT_SENDER_ID = "system"
 
 
 async def connect_chat_socket(thread_id: str, websocket: WebSocket) -> None:
@@ -79,6 +88,18 @@ async def broadcast_chat_message(thread_id: str, message: Dict[str, Any]) -> Non
     )
 
 
+async def connect_user_chat_socket(user_id: str, websocket: WebSocket) -> None:
+    await _chat_user_ws_hub.connect(user_id, websocket)
+
+
+async def disconnect_user_chat_socket(user_id: str, websocket: WebSocket) -> None:
+    await _chat_user_ws_hub.disconnect(user_id, websocket)
+
+
+async def broadcast_user_chat_event(user_id: str, payload: Dict[str, Any]) -> None:
+    await _chat_user_ws_hub.broadcast(user_id, payload)
+
+
 def publish_chat_message_sync(thread_id: str, message: Dict[str, Any]) -> None:
     try:
         anyio.from_thread.run(broadcast_chat_message, thread_id, message)
@@ -87,17 +108,70 @@ def publish_chat_message_sync(thread_id: str, message: Dict[str, Any]) -> None:
         return
 
 
+def publish_thread_preview_sync(thread_id: str, user_id: str | None = None) -> None:
+    try:
+        if user_id:
+            anyio.from_thread.run(broadcast_thread_preview_to_user, thread_id, user_id)
+        else:
+            anyio.from_thread.run(broadcast_thread_preview_update, thread_id)
+    except Exception:
+        return
+
+
 def _normalize_text(text: str) -> str:
     return " ".join((text or "").strip().split())
 
 
+@lru_cache(maxsize=1)
+def _chat_message_sender_storage() -> tuple[str, bool]:
+    row = fetch_one(
+        """
+        SELECT data_type, is_nullable
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'chat_messages'
+          AND column_name = 'sender_id'
+        """
+    )
+    if not row:
+        return ("text", False)
+    return (str(row[0] or "").lower(), str(row[1] or "").upper() == "YES")
+
+
+def _system_sender_db_value(thread_id: str) -> str | None:
+    data_type, is_nullable = _chat_message_sender_storage()
+    if data_type in {"text", "character varying", "character"}:
+        return SYSTEM_CHAT_SENDER_ID
+    if is_nullable:
+        return None
+
+    participant = fetch_one(
+        """
+        SELECT user_id::text
+        FROM chat_participants
+        WHERE thread_id = %s
+          AND left_at IS NULL
+        ORDER BY user_id
+        LIMIT 1
+        """,
+        (thread_id,),
+    )
+    if participant and participant[0]:
+        return str(participant[0])
+
+    raise HTTPException(status_code=500, detail="System sender could not be resolved")
+
+
 def _message_row_to_dict(row) -> Dict[str, Any]:
+    message_type = str(row[5]) if len(row) > 5 and row[5] is not None else "text"
+    sender_value = SYSTEM_CHAT_SENDER_ID if message_type == "system" or row[2] is None else str(row[2])
     return {
         "id": str(row[0]),
         "thread_id": str(row[1]),
-        "sender_id": str(row[2]) if row[2] is not None else None,
+        "sender_id": sender_value,
         "text": row[3],
         "created_at": row[4],
+        "type": message_type,
     }
 
 
@@ -222,87 +296,85 @@ def assert_thread_access(thread_id: str, user_id: str) -> None:
         raise HTTPException(status_code=403, detail="Thread access denied")
 
 
-def get_or_create_offer_thread(offer_id: str, owner_id: str, performer_id: str) -> str:
-    if table_has_column("announcement_offers", "chat_thread_id"):
-        mapped = fetch_one(
-            """
-            SELECT chat_thread_id
-            FROM announcement_offers
-            WHERE id = %s
-              AND chat_thread_id IS NOT NULL
-            """,
-            (offer_id,),
-        )
-        if mapped and mapped[0]:
-            thread_id = str(mapped[0])
-            ensure_chat_participant(thread_id, owner_id, "owner")
-            ensure_chat_participant(thread_id, performer_id, "performer")
-            return thread_id
-
+def get_or_create_offer_thread(
+    *,
+    task_id: str,
+    offer_id: str,
+    assignment_id: str | None,
+    owner_id: str,
+    performer_id: str,
+) -> str:
     existing = fetch_one(
         """
-        SELECT id
+        SELECT id::text
         FROM chat_threads
-        WHERE offer_id::text = %s
+        WHERE (%s::uuid IS NOT NULL AND assignment_id = %s::uuid)
+           OR offer_id::text = %s
+           OR (task_id::text = %s AND kind = %s)
         ORDER BY created_at DESC
         LIMIT 1
         """,
-        (offer_id,),
+        (assignment_id, assignment_id, offer_id, task_id, _offer_thread_kind_value()),
     )
     if existing:
-        thread_id = existing[0]
+        thread_id = str(existing[0])
         ensure_chat_participant(thread_id, owner_id, "owner")
         ensure_chat_participant(thread_id, performer_id, "performer")
-        if table_has_column("announcement_offers", "chat_thread_id"):
-            execute(
-                """
-                UPDATE announcement_offers
-                SET chat_thread_id = %s
-                WHERE id = %s
-                """,
-                (thread_id, offer_id),
-            )
+        execute(
+            """
+            UPDATE chat_threads
+            SET task_id = %s,
+                offer_id = %s,
+                assignment_id = %s
+            WHERE id::text = %s
+            """,
+            (task_id, offer_id, assignment_id, thread_id),
+        )
+        if table_has_column("task_offers", "chat_thread_id"):
+            execute("UPDATE task_offers SET chat_thread_id = %s WHERE id::text = %s", (thread_id, offer_id))
+        if assignment_id:
+            execute("UPDATE task_assignments SET chat_thread_id = %s WHERE id::text = %s", (thread_id, assignment_id))
+        publish_thread_preview_sync(thread_id)
         return thread_id
 
     thread_id = str(uuid.uuid4())
-    kind = _offer_thread_kind_value()
-    if _can_store_announcement_offer_id_in_chat_thread():
-        execute(
-            """
-            INSERT INTO chat_threads (id, kind, task_id, offer_id, last_message_at)
-            VALUES (%s, %s, NULL, %s, NULL)
-            """,
-            (thread_id, kind, offer_id),
-        )
-    else:
-        execute(
-            """
-            INSERT INTO chat_threads (id, kind, task_id, offer_id, last_message_at)
-            VALUES (%s, %s, NULL, NULL, NULL)
-            """,
-            (thread_id, kind),
-        )
-
+    execute(
+        """
+        INSERT INTO chat_threads (id, kind, task_id, offer_id, last_message_at, assignment_id)
+        VALUES (%s, %s, %s, %s, NULL, %s)
+        """,
+        (thread_id, _offer_thread_kind_value(), task_id, offer_id, assignment_id),
+    )
     ensure_chat_participant(thread_id, owner_id, "owner")
     ensure_chat_participant(thread_id, performer_id, "performer")
-    if table_has_column("announcement_offers", "chat_thread_id"):
+    if table_has_column("task_offers", "chat_thread_id"):
+        execute("UPDATE task_offers SET chat_thread_id = %s WHERE id::text = %s", (thread_id, offer_id))
+    if assignment_id:
         execute(
             """
-            UPDATE announcement_offers
-            SET chat_thread_id = %s
-            WHERE id = %s
+            UPDATE task_assignments
+            SET chat_thread_id = %s,
+                updated_at = now()
+            WHERE id::text = %s
             """,
-            (thread_id, offer_id),
+            (thread_id, assignment_id),
         )
+    publish_thread_preview_sync(thread_id)
     return thread_id
 
 
-def list_user_threads(user_id: str) -> List[Dict[str, Any]]:
+def _thread_preview_rows(user_id: str, thread_id: str | None = None) -> List[Dict[str, Any]]:
+    params: List[Any] = [user_id, user_id, user_id]
+    extra_filter = ""
+    if thread_id is not None:
+        extra_filter = " AND ct.id::text = %s"
+        params.append(thread_id)
+
     rows = fetch_all(
         f"""
         SELECT
-            ct.id,
-            ct.kind,
+            ct.id::text,
+            ct.kind::text,
             other.user_id::text,
             COALESCE(
                 NULLIF(BTRIM(up.display_name), ''),
@@ -311,16 +383,18 @@ def list_user_threads(user_id: str) -> List[Dict[str, Any]]:
                 'Собеседник'
             ) AS partner_display_name,
             {_avatar_select_sql("up")},
-            COALESCE(lm.text, 'Чат открыт'),
-            COALESCE(ct.last_message_at, lm.created_at, ct.created_at),
-            0 AS unread_count,
-            ann.id::text,
-            ann.title
+            COALESCE(lm.text, 'Чат открыт') AS last_message_text,
+            COALESCE(ct.last_message_at, lm.created_at, ct.created_at) AS last_message_at,
+            COALESCE(unread.unread_count, 0) AS unread_count,
+            t.id::text AS task_id,
+            t.title AS task_title
         FROM chat_threads ct
         JOIN chat_participants me
           ON me.thread_id = ct.id
          AND me.user_id = %s
          AND me.left_at IS NULL
+        LEFT JOIN chat_messages read_msg
+          ON read_msg.id = me.last_read_message_id
         LEFT JOIN chat_participants other
           ON other.thread_id = ct.id
          AND other.user_id <> %s
@@ -329,13 +403,12 @@ def list_user_threads(user_id: str) -> List[Dict[str, Any]]:
           ON u.id = other.user_id
         LEFT JOIN user_profiles up
           ON up.user_id = other.user_id
-        LEFT JOIN announcement_offers ao
-          ON (
-                {_announcement_offer_chat_thread_id_sql()}
-                ao.id::text = ct.offer_id::text
-             )
-        LEFT JOIN announcements ann
-          ON ann.id = ao.announcement_id
+        LEFT JOIN task_assignments ta
+          ON ta.id = ct.assignment_id
+        LEFT JOIN task_offers tf
+          ON tf.id = COALESCE(ct.offer_id, ta.offer_id)
+        LEFT JOIN tasks t
+          ON t.id = COALESCE(ct.task_id, ta.task_id, tf.task_id)
         LEFT JOIN LATERAL (
             SELECT text, created_at
             FROM chat_messages
@@ -344,10 +417,31 @@ def list_user_threads(user_id: str) -> List[Dict[str, Any]]:
             ORDER BY created_at DESC
             LIMIT 1
         ) lm ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS unread_count
+            FROM chat_messages m
+            WHERE m.thread_id = ct.id
+              AND m.deleted_at IS NULL
+              AND (
+                    COALESCE(m.type, 'text') = 'system'
+                    OR m.sender_id::text <> %s
+              )
+              AND (
+                    me.last_read_message_id IS NULL
+                    OR m.created_at > COALESCE(read_msg.created_at, 'epoch'::timestamptz)
+                    OR (
+                        m.created_at = COALESCE(read_msg.created_at, 'epoch'::timestamptz)
+                        AND m.id::text > COALESCE(me.last_read_message_id::text, '')
+                    )
+                  )
+        ) unread ON TRUE
         WHERE ct.kind <> 'support'
+          AND ct.archived_at IS NULL
+          AND (t.id IS NULL OR t.deleted_at IS NULL)
+          {extra_filter}
         ORDER BY COALESCE(ct.last_message_at, lm.created_at, ct.created_at) DESC, ct.created_at DESC
         """,
-        (user_id, user_id),
+        tuple(params),
     )
 
     return [
@@ -367,6 +461,35 @@ def list_user_threads(user_id: str) -> List[Dict[str, Any]]:
     ]
 
 
+async def broadcast_thread_preview_update(thread_id: str) -> None:
+    participants = fetch_all(
+        """
+        SELECT user_id::text
+        FROM chat_participants
+        WHERE thread_id::text = %s
+          AND left_at IS NULL
+        """,
+        (thread_id,),
+    )
+    for row in participants:
+        user_id = str(row[0])
+        preview = _thread_preview_rows(user_id=user_id, thread_id=thread_id)
+        if not preview:
+            continue
+        await broadcast_user_chat_event(user_id=user_id, payload={"type": "thread_upsert", "payload": preview[0]})
+
+
+async def broadcast_thread_preview_to_user(thread_id: str, user_id: str) -> None:
+    preview = _thread_preview_rows(user_id=user_id, thread_id=thread_id)
+    if not preview:
+        return
+    await broadcast_user_chat_event(user_id=user_id, payload={"type": "thread_upsert", "payload": preview[0]})
+
+
+def list_user_threads(user_id: str) -> List[Dict[str, Any]]:
+    return _thread_preview_rows(user_id=user_id)
+
+
 def list_thread_messages(
     thread_id: str,
     user_id: str,
@@ -378,7 +501,7 @@ def list_thread_messages(
     lim = max(1, min(int(limit), 100))
     params: List[Any] = [thread_id]
     sql = """
-        SELECT id, thread_id, sender_id, text, created_at
+        SELECT id, thread_id, sender_id, text, created_at, type
         FROM chat_messages
         WHERE thread_id = %s
           AND deleted_at IS NULL
@@ -403,6 +526,7 @@ def list_thread_messages(
             """,
             (ordered[-1][0], thread_id, user_id),
         )
+        publish_thread_preview_sync(thread_id, user_id=user_id)
 
     return [_message_row_to_dict(row) for row in ordered]
 
@@ -460,7 +584,7 @@ def post_thread_message(thread_id: str, sender_id: str, text: str) -> Dict[str, 
 
     row = fetch_one(
         """
-        SELECT id, thread_id, sender_id, text, created_at
+        SELECT id, thread_id, sender_id, text, created_at, type
         FROM chat_messages
         WHERE id = %s
         """,
@@ -469,4 +593,63 @@ def post_thread_message(thread_id: str, sender_id: str, text: str) -> Dict[str, 
     if not row:
         raise HTTPException(status_code=500, detail="Message was not saved")
 
-    return _message_row_to_dict(row)
+    message = _message_row_to_dict(row)
+    publish_thread_preview_sync(thread_id)
+    return message
+
+
+def post_system_thread_message(thread_id: str, text: str) -> Dict[str, Any]:
+    clean_text = _normalize_text(text)
+    if not clean_text:
+        raise HTTPException(status_code=400, detail="Message text is required")
+
+    message_id = str(uuid.uuid4())
+    sender_db_value = _system_sender_db_value(thread_id)
+    execute(
+        """
+        INSERT INTO chat_messages (id, thread_id, sender_id, type, text)
+        VALUES (%s, %s, %s, 'system', %s)
+        """,
+        (message_id, thread_id, sender_db_value, clean_text),
+    )
+    execute(
+        """
+        UPDATE chat_threads
+        SET last_message_at = now()
+        WHERE id = %s
+        """,
+        (thread_id,),
+    )
+
+    recipients = fetch_all(
+        """
+        SELECT user_id
+        FROM chat_participants
+        WHERE thread_id = %s
+          AND left_at IS NULL
+        """,
+        (thread_id,),
+    )
+    for row in recipients:
+        create_notification(
+            user_id=row[0],
+            notif_type="chat_system",
+            body=clean_text,
+            payload={"thread_id": thread_id, "message_id": message_id, "sender_id": SYSTEM_CHAT_SENDER_ID},
+        )
+
+    row = fetch_one(
+        """
+        SELECT id, thread_id, sender_id, text, created_at, type
+        FROM chat_messages
+        WHERE id = %s
+        """,
+        (message_id,),
+    )
+    if not row:
+        raise HTTPException(status_code=500, detail="System message was not saved")
+
+    message = _message_row_to_dict(row)
+    publish_chat_message_sync(thread_id, message)
+    publish_thread_preview_sync(thread_id)
+    return message

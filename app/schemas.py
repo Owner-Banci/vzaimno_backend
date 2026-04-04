@@ -120,6 +120,9 @@ class AnnouncementOut(BaseModel):
 class CreateOfferIn(BaseModel):
     message: Optional[str] = Field(default=None, max_length=1000)
     proposed_price: Optional[int] = Field(default=None, ge=0)
+    pricing_mode: Optional[str] = Field(default=None, max_length=64)
+    agreed_price: Optional[int] = Field(default=None, ge=0)
+    minimum_price_accepted: Optional[bool] = None
 
 
 class OfferPerformerProfileOut(BaseModel):
@@ -143,6 +146,10 @@ class OfferOut(BaseModel):
     performer_id: str
     message: Optional[str] = None
     proposed_price: Optional[int] = None
+    agreed_price: Optional[int] = None
+    pricing_mode: Optional[str] = None
+    minimum_price_accepted: bool = False
+    can_reoffer: bool = True
     status: str
     created_at: datetime
 
@@ -206,6 +213,10 @@ class SupportMessageIn(BaseModel):
 
 class ChatMessageIn(BaseModel):
     text: str = Field(..., min_length=1, max_length=5000)
+
+
+class ExecutionStageUpdateIn(BaseModel):
+    stage: str = Field(..., min_length=1, max_length=64)
 
 
 class ChatMessageOut(BaseModel):
