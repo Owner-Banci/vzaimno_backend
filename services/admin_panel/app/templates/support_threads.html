@@ -3,12 +3,13 @@
 <section class="panel">
   <div class="section-head">
     <div>
-      <p class="eyebrow">Чаты с пользователями</p>
+      <p class="eyebrow">Support threads</p>
       <h2>Поддержка</h2>
+      <p class="muted">Список построен поверх существующих `chat_threads.kind = 'support'`, без отдельной параллельной системы сообщений.</p>
     </div>
   </div>
   <form class="toolbar" method="get">
-    <input type="search" name="search" placeholder="Поиск по email пользователя" value="{{ search }}">
+    <input type="search" name="search" placeholder="Email, display name, user ID или thread ID" value="{{ search }}">
     <button type="submit">Найти</button>
   </form>
 
@@ -16,23 +17,44 @@
     <thead>
       <tr>
         <th>Пользователь</th>
-        <th>Тред</th>
+        <th>Thread</th>
+        <th>Назначен</th>
+        <th>Unread</th>
         <th>Последнее сообщение</th>
-        <th>Последняя активность</th>
+        <th>Активность</th>
         <th></th>
       </tr>
     </thead>
     <tbody>
       {% for thread in threads %}
       <tr>
-        <td>{{ thread.user_email or thread.user_id }}</td>
-        <td>{{ thread.id }}</td>
-        <td>{{ thread.last_message_text or "—" }}</td>
+        <td>
+          <strong>{{ thread.user_display_label }}</strong>
+          <div class="table-meta">{{ thread.user_email or "—" }}</div>
+          <div class="table-meta mono">{{ thread.user_id }}</div>
+        </td>
+        <td class="mono">{{ thread.id }}</td>
+        <td>
+          {% if thread.assigned_admin_account_id %}
+          <strong>{{ thread.assigned_admin_display_label }}</strong>
+          <div class="table-meta mono">{{ thread.assigned_admin_account_id }}</div>
+          {% else %}
+          —
+          {% endif %}
+        </td>
+        <td>
+          {% if thread.unread_count %}
+          <span class="badge">{{ thread.unread_count }}</span>
+          {% else %}
+          —
+          {% endif %}
+        </td>
+        <td>{{ thread.last_message_text or "Сообщений пока нет" }}</td>
         <td>{{ format_dt(thread.last_message_at or thread.created_at) }}</td>
-        <td><a class="action-link" href="/admin/support/{{ thread.id }}">Открыть</a></td>
+        <td><a class="action-link" href="/admin/support/{{ thread.id }}">Открыть чат</a></td>
       </tr>
       {% else %}
-      <tr><td colspan="5">Диалогов поддержки пока нет.</td></tr>
+      <tr><td colspan="7">Диалогов поддержки пока нет.</td></tr>
       {% endfor %}
     </tbody>
   </table>

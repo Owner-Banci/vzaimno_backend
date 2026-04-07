@@ -19,6 +19,7 @@ class LoginIn(BaseModel):
 class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    principal_type: str = "user"
 
 
 class UserOut(BaseModel):
@@ -113,6 +114,8 @@ class AnnouncementOut(BaseModel):
     category: str
     title: str
     status: str
+    description: Optional[str] = None
+    address_text: Optional[str] = None
     data: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
 
@@ -190,6 +193,13 @@ class ReportOut(BaseModel):
     resolved_at: Optional[datetime] = None
 
 
+class ReportReasonOptionOut(BaseModel):
+    code: str
+    title: str
+    description: str
+    allowed_target_types: list[str] = Field(default_factory=list)
+
+
 class SupportThreadOut(BaseModel):
     thread_id: str
 
@@ -205,6 +215,7 @@ class ChatThreadOut(BaseModel):
     unread_count: int = 0
     announcement_id: Optional[str] = None
     announcement_title: Optional[str] = None
+    is_pinned: bool = False
 
 
 class SupportMessageIn(BaseModel):
@@ -222,15 +233,26 @@ class ExecutionStageUpdateIn(BaseModel):
 class ChatMessageOut(BaseModel):
     id: str
     thread_id: str
-    sender_id: str
+    sender_id: Optional[str] = None
+    sender_type: str = "user"
+    sender_user_account_id: Optional[str] = None
+    sender_admin_account_id: Optional[str] = None
+    sender_display_name: Optional[str] = None
+    sender_label: Optional[str] = None
     text: str
     created_at: datetime
+    type: str = "text"
 
 
 class SupportMessageOut(BaseModel):
     id: str
     thread_id: str
-    sender_id: str
+    sender_id: Optional[str] = None
+    sender_type: str = "user"
+    sender_user_account_id: Optional[str] = None
+    sender_admin_account_id: Optional[str] = None
+    sender_display_name: Optional[str] = None
+    sender_label: Optional[str] = None
     type: str
     text: str
     is_blocked: bool = False

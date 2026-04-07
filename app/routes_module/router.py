@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import APIRouter, Depends
 
-from app.db import fetch_one
+from app.auth_context import get_current_user
 from app.schemas import UserOut
-from app.security import decode_token
 
 from .schemas import RouteBuildIn, RouteContextOut, RouteDetailsOut
 from .service import (
@@ -19,31 +17,6 @@ from .service import (
 )
 
 router = APIRouter(tags=["routes"])
-bearer = HTTPBearer(auto_error=True)
-
-
-def _user_from_token(token: str) -> UserOut:
-    if token == "DEV_TOKEN":
-        return UserOut(id="dev", email="dev@localdomain.com", role="user")
-
-    try:
-        payload = decode_token(token)
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token payload")
-
-    row = fetch_one("SELECT id::text, email, role FROM users WHERE id = %s", (user_id,))
-    if not row:
-        raise HTTPException(status_code=401, detail="User not found")
-
-    return UserOut(id=row[0], email=row[1], role=row[2])
-
-
-def get_current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> UserOut:
-    return _user_from_token(creds.credentials)
 
 
 @router.get("/announcements/{ann_id}/route", response_model=RouteDetailsOut)

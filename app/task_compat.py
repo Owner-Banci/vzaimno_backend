@@ -428,6 +428,7 @@ def ensure_task_payload(
     route.setdefault("start_at", normalize_optional_text(data.get("start_at")))
     route.setdefault("has_end_time", bool(data.get("has_end_time")))
     route.setdefault("end_at", normalize_optional_text(data.get("end_at")))
+    route.setdefault("timezone", normalize_optional_text(data.get("timezone")) or normalize_optional_text(data.get("schedule_timezone")))
     route.setdefault(
         "source",
         {
@@ -453,7 +454,9 @@ def ensure_task_payload(
     search.setdefault("generated_title", normalize_optional_text(data.get("generated_title")) or normalize_optional_text(title))
     search.setdefault(
         "generated_description",
-        normalize_optional_text(data.get("generated_description")) or normalize_optional_text(data.get("notes")),
+        normalize_optional_text(data.get("generated_description"))
+        or normalize_optional_text(data.get("description"))
+        or normalize_optional_text(data.get("notes")),
     )
     search.setdefault("generated_tags", normalize_json_list(data.get("generated_tags")))
     search.setdefault("hints", normalize_json_list(data.get("ai_hints")))
@@ -496,12 +499,21 @@ def ensure_task_payload(
     data["offer_policy"] = offer_policy
     data["execution"] = execution
     data["search"] = search
+    if search.get("generated_description"):
+        data.setdefault("generated_description", search["generated_description"])
+        data.setdefault("description", search["generated_description"])
     if budget_min is not None:
         data["budget_min"] = budget_min
     if budget_max is not None:
         data["budget_max"] = budget_max
     if quick_offer_price is not None:
         data["quick_offer_price"] = quick_offer_price
+    if route.get("start_at"):
+        data.setdefault("start_at", route["start_at"])
+    if route.get("end_at"):
+        data.setdefault("end_at", route["end_at"])
+    if route.get("timezone"):
+        data.setdefault("timezone", route["timezone"])
     if route.get("source", {}).get("address"):
         data.setdefault("source_address", route["source"]["address"])
     if route.get("destination", {}).get("address"):
@@ -541,12 +553,32 @@ def task_row_to_announcement_dict(row: Dict[str, Any]) -> Dict[str, Any]:
     if row.get("location_lat") is not None and row.get("location_lon") is not None:
         data.setdefault("point", {"lat": float(row["location_lat"]), "lon": float(row["location_lon"])})
 
+    description = (
+        normalize_optional_text(row.get("description"))
+        or normalize_optional_text(data.get("description"))
+        or normalize_optional_text(data.get("generated_description"))
+        or normalize_optional_text(normalize_json_object(data.get("search")).get("generated_description"))
+        or normalize_optional_text(data.get("notes"))
+        or normalize_optional_text(row.get("title"))
+    )
+    address_text = normalize_optional_text(row.get("address_text"), collapse_spaces=True) or primary_source_address(data)
+    if description:
+        data.setdefault("generated_description", description)
+        data.setdefault("description", description)
+        search = normalize_json_object(data.get("search"))
+        search.setdefault("generated_description", description)
+        data["search"] = search
+    if address_text:
+        data["address_text"] = address_text
+
     return {
         "id": str(row.get("id")),
         "user_id": str(row.get("customer_id")),
         "category": row.get("category_slug") or builder_category_slug(data.get("category")),
         "title": row.get("title") or "",
         "status": announcement_status,
+        "description": description,
+        "address_text": address_text,
         "data": data,
         "created_at": row.get("created_at"),
     }

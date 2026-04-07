@@ -25,16 +25,16 @@
       <div>
         <p class="eyebrow">Вход</p>
         <h1>{{ admin.title }}</h1>
-        <p class="muted">Используйте email и пароль сотрудника с ролью администратора, модератора или поддержки.</p>
+        <p class="muted">Используйте отдельный логин и пароль admin account. Обычный пользовательский аккаунт сюда не подходит.</p>
       </div>
 
       {% if error %}
-      <div class="error-banner">Неверный email или пароль.</div>
+      <div class="error-banner">Неверный admin login или пароль.</div>
       {% endif %}
 
       <label class="field">
-        <span class="field-label">Email</span>
-        <input name="username" type="text" placeholder="name@example.com" autocomplete="username">
+        <span class="field-label">Admin Login</span>
+        <input name="username" type="text" placeholder="support-team" autocomplete="username">
       </label>
 
       <label class="field">
@@ -43,7 +43,7 @@
       </label>
 
       <button type="submit">Войти</button>
-      <p class="auth-note">Если вход не проходит, проверьте роль пользователя в таблице <code>users.role</code>.</p>
+      <p class="auth-note">Admin access управляется через отдельные записи в таблице <code>admin_accounts</code>.</p>
     </form>
   </div>
 </body>

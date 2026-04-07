@@ -18,17 +18,51 @@ UI_LABELS = {
         "moderator": "Модератор",
         "admin": "Администратор",
     },
+    "admin_access_statuses": {
+        "absent": "Нет admin account",
+        "active": "Активен",
+        "disabled": "Отключен",
+    },
     "announcement_statuses": {
         "pending_review": "На проверке",
         "needs_fix": "Нужно исправить",
         "rejected": "Отклонено",
-        "active": "Активно",
-        "archived": "В архиве",
+        "active": "Опубликовано",
+        "archived": "Архив",
+        "deleted": "Удалено",
         "draft": "Черновик",
+    },
+    "task_statuses": {
+        "draft": "Черновик",
+        "review": "На проверке",
+        "published": "Опубликовано",
+        "in_responses": "Есть отклики",
+        "assigned": "Назначено",
+        "agreed": "Исполнитель выбран",
+        "in_progress": "В работе",
+        "completed": "Завершено",
+        "closed": "Закрыто",
+        "cancelled": "Отменено",
+    },
+    "moderation_statuses": {
+        "pending": "На проверке",
+        "published": "Опубликовано",
+        "needs_fix": "Нужно исправить",
+        "rejected": "Отклонено",
+        "blocked": "Заблокировано",
     },
     "restriction_types": {
         "warning": "Предупреждение",
-        "ban": "Блокировка",
+        "mute_chat": "Запрет на чат",
+        "restrict_posting": "Запрет на публикации",
+        "publish_ban": "Запрет на публикации",
+        "restrict_offers": "Запрет на отклики",
+        "response_ban": "Запрет на отклики",
+        "temporary_ban": "Временный бан",
+        "temp_ban": "Временный бан",
+        "permanent_ban": "Постоянный бан",
+        "perm_ban": "Постоянный бан",
+        "custom": "Кастомное ограничение",
         "shadowban": "Теневая блокировка",
     },
     "restriction_statuses": {
@@ -40,6 +74,15 @@ UI_LABELS = {
         "resolved": "Закрыта",
     },
     "report_resolutions": {
+        "no_action": "Без санкции",
+        "warning": "Предупреждение",
+        "mute_chat": "Запрет на чат",
+        "restrict_posting": "Запрет на публикации",
+        "restrict_offers": "Запрет на отклики",
+        "temporary_ban": "Временный бан",
+        "permanent_ban": "Постоянный бан",
+        "custom_restriction": "Кастомное ограничение",
+        "report_rejected": "Жалоба отклонена",
         "valid": "Обоснована",
         "invalid": "Не обоснована",
     },
@@ -49,12 +92,15 @@ UI_LABELS = {
         "user": "Пользователь",
         "task": "Задание",
         "report": "Жалоба",
+        "support_thread": "Тикет поддержки",
+        "admin_account": "Admin account",
     },
     "sender_roles": {
         "user": "Пользователь",
         "support": "Поддержка",
         "moderator": "Модератор",
         "admin": "Администратор",
+        "system": "Система",
     },
     "actions": {
         "approve": "Одобрить",
@@ -64,8 +110,21 @@ UI_LABELS = {
         "delete": "Удалить",
         "report_resolve": "Решение по жалобе",
         "restriction_set": "Назначено ограничение",
+        "restriction_extend": "Продлено ограничение",
         "restriction_revoke": "Ограничение снято",
-        "user_role_change": "Смена роли",
+        "support_thread_created": "Создан support thread",
+        "support_thread_assigned": "Назначен staff на тикет",
+        "support_message_sent": "Отправлено сообщение поддержки",
+        "admin_access_granted": "Выдан admin access",
+        "admin_access_disabled": "Admin access отключен",
+        "admin_access_enabled": "Admin access включен",
+        "admin_credentials_reset": "Сброшены admin credentials",
+        "admin_login": "Вход администратора",
+    },
+    "restriction_sources": {
+        "manual": "Вручную",
+        "report": "По жалобе",
+        "moderation": "По модерации",
     },
 }
 
@@ -116,7 +175,10 @@ def _parse_optional_dt(value: str) -> Optional[datetime]:
     raw = (value or "").strip()
     if not raw:
         return None
-    parsed = datetime.fromisoformat(raw)
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Некорректная дата и время") from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
@@ -146,13 +208,79 @@ class UsersView(BaseView):
 
     @expose("/users/{user_id}/role", methods=["POST"], identity="users-update-role")
     async def update_role(self, request: Request):
+        raise HTTPException(
+            status_code=410,
+            detail="Direct role mutation was removed. Manage admin access through a separate admin account.",
+        )
+
+    @expose("/users/{user_id}/admin-access", methods=["POST"], identity="users-admin-access-create")
+    async def create_admin_access(self, request: Request):
         actor = require_admin_user(request)
         user_id = request.path_params["user_id"]
         form = await request.form()
+        login_identifier = str(form.get("login_identifier", "")).strip()
+        display_name = str(form.get("display_name", "")).strip()
         role = str(form.get("role", "")).strip()
+        password = str(form.get("password", "")).strip()
+        email = str(form.get("email", "")).strip() or None
         with SessionLocal() as session:
             try:
-                crud.update_user_role(session, user_id, role, actor.id, actor.role)
+                crud.create_admin_access_for_user(
+                    session=session,
+                    user_id=user_id,
+                    login_identifier=login_identifier,
+                    display_name=display_name,
+                    role=role,
+                    password=password,
+                    email=email,
+                    actor_admin_account_id=actor.id,
+                )
+            except PermissionError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _redirect(f"/admin/users/{user_id}")
+
+    @expose("/admin-accounts/{admin_account_id}/disable", methods=["POST"], identity="users-admin-access-disable")
+    async def disable_admin_access(self, request: Request):
+        actor = require_admin_user(request)
+        admin_account_id = request.path_params["admin_account_id"]
+        form = await request.form()
+        user_id = str(form.get("user_id", "")).strip()
+        with SessionLocal() as session:
+            try:
+                crud.disable_admin_account(session, admin_account_id, actor.id)
+            except PermissionError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _redirect(f"/admin/users/{user_id}")
+
+    @expose("/admin-accounts/{admin_account_id}/enable", methods=["POST"], identity="users-admin-access-enable")
+    async def enable_admin_access(self, request: Request):
+        actor = require_admin_user(request)
+        admin_account_id = request.path_params["admin_account_id"]
+        form = await request.form()
+        user_id = str(form.get("user_id", "")).strip()
+        with SessionLocal() as session:
+            try:
+                crud.enable_admin_account(session, admin_account_id, actor.id)
+            except PermissionError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _redirect(f"/admin/users/{user_id}")
+
+    @expose("/admin-accounts/{admin_account_id}/reset-credentials", methods=["POST"], identity="users-admin-access-reset")
+    async def reset_admin_access_credentials(self, request: Request):
+        actor = require_admin_user(request)
+        admin_account_id = request.path_params["admin_account_id"]
+        form = await request.form()
+        user_id = str(form.get("user_id", "")).strip()
+        password = str(form.get("password", "")).strip()
+        with SessionLocal() as session:
+            try:
+                crud.reset_admin_account_credentials(session, admin_account_id, password, actor.id)
             except PermissionError as exc:
                 raise HTTPException(status_code=403, detail=str(exc)) from exc
             except ValueError as exc:
@@ -266,9 +394,19 @@ class ReportsView(BaseView):
         form = await request.form()
         resolution = str(form.get("resolution", "")).strip()
         moderator_comment = str(form.get("moderator_comment", "")).strip() or None
+        ends_at = _parse_optional_dt(str(form.get("ends_at", "")).strip())
+        custom_restriction_label = str(form.get("custom_restriction_label", "")).strip() or None
         with SessionLocal() as session:
             try:
-                crud.resolve_report(session, report_id, actor.id, resolution, moderator_comment)
+                crud.resolve_report(
+                    session,
+                    report_id,
+                    actor.id,
+                    resolution,
+                    moderator_comment,
+                    ends_at=ends_at,
+                    custom_restriction_label=custom_restriction_label,
+                )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         return _redirect(f"/admin/reports/{report_id}")
@@ -281,21 +419,33 @@ class SupportThreadsView(BaseView):
 
     @expose("/support", methods=["GET"], identity="support")
     async def a_index(self, request: Request):
+        actor = require_staff_user(request)
         search = (request.query_params.get("search") or "").strip()
         with SessionLocal() as session:
-            threads = crud.list_support_threads(session, search or None)
+            threads = crud.list_support_threads(session, actor.id, search or None)
         return await _render(self, request, "support_threads.html", threads=threads, search=search)
 
     @expose("/support/{thread_id}", methods=["GET"], identity="support-thread")
     async def thread_view(self, request: Request):
+        actor = require_staff_user(request)
         thread_id = request.path_params["thread_id"]
         with SessionLocal() as session:
             try:
-                thread = crud.get_support_thread(session, thread_id)
-                messages = crud.get_support_messages(session, thread_id)
+                thread = crud.get_support_thread(session, thread_id, actor.id)
+                messages = crud.get_support_messages(session, thread_id, actor.id)
+                available_admin_accounts = crud.list_active_admin_accounts(session)
             except ValueError as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return await _render(self, request, "support_thread.html", thread=thread, messages=messages)
+        reply_blocked = bool(actor.linked_user_account_id and actor.linked_user_account_id == thread["user_id"])
+        return await _render(
+            self,
+            request,
+            "support_thread.html",
+            thread=thread,
+            messages=messages,
+            available_admin_accounts=available_admin_accounts,
+            reply_blocked=reply_blocked,
+        )
 
     @expose("/support/{thread_id}/reply", methods=["POST"], identity="support-reply")
     async def reply(self, request: Request):
@@ -306,6 +456,21 @@ class SupportThreadsView(BaseView):
         with SessionLocal() as session:
             try:
                 crud.post_support_message(session, thread_id, actor.id, text_value)
+            except PermissionError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _redirect(f"/admin/support/{thread_id}")
+
+    @expose("/support/{thread_id}/assign", methods=["POST"], identity="support-assign")
+    async def assign(self, request: Request):
+        actor = require_staff_user(request)
+        thread_id = request.path_params["thread_id"]
+        form = await request.form()
+        assigned_admin_account_id = str(form.get("assigned_admin_account_id", "")).strip()
+        with SessionLocal() as session:
+            try:
+                crud.assign_support_thread(session, thread_id, assigned_admin_account_id, actor.id)
             except PermissionError as exc:
                 raise HTTPException(status_code=403, detail=str(exc)) from exc
             except ValueError as exc:
@@ -340,10 +505,39 @@ class RestrictionsView(BaseView):
         user_id = str(form.get("user_id", "")).strip()
         restriction_type = str(form.get("type", "")).strip()
         comment = str(form.get("comment", "")).strip() or None
+        source_type = str(form.get("source_type", "manual")).strip() or "manual"
+        source_id = str(form.get("source_id", "")).strip() or None
+        custom_label = str(form.get("custom_label", "")).strip() or None
         ends_at = _parse_optional_dt(str(form.get("ends_at", "")).strip())
         with SessionLocal() as session:
             try:
-                crud.create_restriction(session, user_id, restriction_type, actor.id, ends_at, comment)
+                crud.create_restriction(
+                    session=session,
+                    user_id=user_id,
+                    restriction_type=restriction_type,
+                    moderator_id=actor.id,
+                    ends_at=ends_at,
+                    comment=comment,
+                    source_type=source_type,
+                    source_id=source_id,
+                    meta={"custom_label": custom_label} if custom_label else None,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _redirect("/admin/restrictions")
+
+    @expose("/restrictions/{restriction_id}/extend", methods=["POST"], identity="restrictions-extend")
+    async def extend(self, request: Request):
+        actor = require_staff_user(request)
+        restriction_id = request.path_params["restriction_id"]
+        form = await request.form()
+        ends_at = _parse_optional_dt(str(form.get("ends_at", "")).strip())
+        comment = str(form.get("comment", "")).strip() or None
+        if ends_at is None:
+            raise HTTPException(status_code=400, detail="Нужно указать новую дату окончания")
+        with SessionLocal() as session:
+            try:
+                crud.extend_restriction(session, restriction_id, actor.id, ends_at, comment)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         return _redirect("/admin/restrictions")

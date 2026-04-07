@@ -3,12 +3,13 @@
 <section class="panel">
   <div class="section-head">
     <div>
-      <p class="eyebrow">Очередь обращений</p>
+      <p class="eyebrow">Object-based moderation input</p>
       <h2>Жалобы</h2>
+      <p class="muted">Жалобы остаются объектными: message, user, task и legacy announcement обрабатываются через единый reports flow.</p>
     </div>
   </div>
   <form class="toolbar" method="get">
-    <input type="search" name="search" placeholder="Email автора жалобы или объект" value="{{ search }}">
+    <input type="search" name="search" placeholder="Автор жалобы, target ID, причина" value="{{ search }}">
     <select name="status">
       <option value="">Все статусы</option>
       {% for value in ["open", "resolved"] %}
@@ -25,6 +26,7 @@
         <th>Кто отправил</th>
         <th>Объект</th>
         <th>Причина</th>
+        <th>Резолюция</th>
         <th>Создано</th>
         <th></th>
       </tr>
@@ -33,14 +35,25 @@
       {% for report in reports %}
       <tr>
         <td><span class="badge">{{ labels.report_statuses.get(report.status, report.status) }}</span></td>
-        <td>{{ report.reporter_email or report.reporter_id }}</td>
-        <td>{{ labels.target_types.get(report.target_type, report.target_type) }} / {{ report.target_id }}</td>
-        <td>{{ report.reason_code }}</td>
+        <td>
+          <strong>{{ report.reporter_display_label }}</strong>
+          <div class="table-meta mono">{{ report.reporter_id }}</div>
+        </td>
+        <td>
+          <strong>{{ labels.target_types.get(report.target_type, report.target_type) }}</strong>
+          <div class="table-meta">{{ report.target_summary or "Контекст будет восстановлен на detail" }}</div>
+          <div class="table-meta mono">{{ report.target_id }}</div>
+        </td>
+        <td>
+          <strong>{{ report.reason_code }}</strong>
+          <div class="table-meta">{{ report.reason_text or "—" }}</div>
+        </td>
+        <td>{{ labels.report_resolutions.get(report.resolution, report.resolution or "—") }}</td>
         <td>{{ format_dt(report.created_at) }}</td>
         <td><a class="action-link" href="/admin/reports/{{ report.id }}">Открыть</a></td>
       </tr>
       {% else %}
-      <tr><td colspan="6">Жалоб нет.</td></tr>
+      <tr><td colspan="7">Жалоб пока нет.</td></tr>
       {% endfor %}
     </tbody>
   </table>

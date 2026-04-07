@@ -1,28 +1,149 @@
 {% extends "base.html" %}
 {% block content %}
+{% set context = report.target_context or {} %}
 <section class="panel">
-  <p class="eyebrow">Карточка жалобы</p>
-  <h2>Жалоба {{ report.id }}</h2>
-  <p><strong>Статус:</strong> {{ labels.report_statuses.get(report.status, report.status) }}</p>
-  <p><strong>Кто отправил:</strong> {{ report.reporter_email or report.reporter_id }}</p>
-  <p><strong>Объект:</strong> {{ labels.target_types.get(report.target_type, report.target_type) }} / {{ report.target_id }}</p>
-  <p><strong>Код причины:</strong> {{ report.reason_code }}</p>
-  <p><strong>Описание:</strong> {{ report.reason_text or "—" }}</p>
-  <p><strong>Решение:</strong> {{ labels.report_resolutions.get(report.resolution, report.resolution or "—") }}</p>
-  <p><strong>Кем обработано:</strong> {{ report.resolved_by_email or report.resolved_by or "—" }}</p>
-  <p><strong>Комментарий модератора:</strong> {{ report.moderator_comment or "—" }}</p>
+  <div class="section-head">
+    <div>
+      <p class="eyebrow">Карточка жалобы</p>
+      <h2>Жалоба {{ report.id }}</h2>
+    </div>
+    <a class="action-link" href="/admin/reports">К списку</a>
+  </div>
+
+  <div class="info-grid">
+    <div class="info-card">
+      <span class="info-label">Статус</span>
+      <strong>{{ labels.report_statuses.get(report.status, report.status) }}</strong>
+      <div class="table-meta">Резолюция: {{ labels.report_resolutions.get(report.resolution, report.resolution or "—") }}</div>
+      <div class="table-meta">Создано: {{ format_dt(report.created_at) }}</div>
+      <div class="table-meta">Обработано: {{ format_dt(report.resolved_at) }}</div>
+    </div>
+    <div class="info-card">
+      <span class="info-label">Кто отправил</span>
+      <strong>{{ report.reporter_display_label }}</strong>
+      <div class="table-meta mono">{{ report.reporter_id }}</div>
+    </div>
+    <div class="info-card">
+      <span class="info-label">Объект</span>
+      <strong>{{ labels.target_types.get(report.target_type, report.target_type) }}</strong>
+      <div class="table-meta">{{ report.target_summary or "—" }}</div>
+      <div class="table-meta mono">{{ report.target_id }}</div>
+    </div>
+    <div class="info-card">
+      <span class="info-label">Причина</span>
+      <strong>{{ report.reason_code }}</strong>
+      <div class="table-meta">{{ report.reason_text or "Без комментария" }}</div>
+      <div class="table-meta">Модератор: {{ report.resolved_by_email or report.resolved_by or "—" }}</div>
+    </div>
+  </div>
+
+  {% if report.moderator_comment %}
+  <div class="callout">
+    <strong>Комментарий модератора</strong>
+    <p>{{ report.moderator_comment }}</p>
+  </div>
+  {% endif %}
 </section>
+
+<section class="grid two">
+  <article class="panel">
+    <h3>Контекст target</h3>
+    {% if context.kind == "task" and context.task %}
+    <div class="kv-list">
+      <div><strong>Задание:</strong> {{ context.task.title }}</div>
+      <div><strong>Статус:</strong> {{ labels.announcement_statuses.get(context.task.status, context.task.status) }}</div>
+      <div><strong>Автор:</strong> {{ context.task.user_display_name }}</div>
+      <div><strong>Описание:</strong> {{ context.task.description }}</div>
+      <div><strong>Адрес:</strong> {{ context.task.address_text or "—" }}</div>
+    </div>
+    <a class="action-link" href="/admin/announcements/{{ context.task.id }}">Открыть карточку</a>
+    {% elif context.kind == "user" and context.user %}
+    <div class="kv-list">
+      <div><strong>Пользователь:</strong> {{ context.user.display_label }}</div>
+      <div><strong>Email:</strong> {{ context.user.email or "—" }}</div>
+      <div><strong>Роль:</strong> {{ labels.roles.get(context.user.role, context.user.role or "—") }}</div>
+      <div><strong>ID:</strong> <span class="mono">{{ context.user.id }}</span></div>
+    </div>
+    <a class="action-link" href="/admin/users/{{ context.user.id }}">Открыть пользователя</a>
+    {% elif context.kind == "message" and context.message %}
+    <div class="kv-list">
+      <div><strong>Thread:</strong> <span class="mono">{{ context.message.thread_id }}</span></div>
+      <div><strong>Отправитель:</strong> {{ context.message.sender_display_label }}</div>
+      <div><strong>Sender type:</strong> {{ context.message.sender_badge }}</div>
+      <div><strong>Тип треда:</strong> {{ context.message.thread_kind }}</div>
+      <div><strong>Сообщение:</strong> {{ context.message.text }}</div>
+    </div>
+    {% if context.task %}
+    <a class="action-link" href="/admin/announcements/{{ context.task.id }}">Связанная карточка</a>
+    {% endif %}
+    {% elif context.missing %}
+    <p>Связанный объект уже недоступен, но сама жалоба и её резолюция сохранены.</p>
+    {% else %}
+    <p>Дополнительный контекст не найден.</p>
+    {% endif %}
+  </article>
+
+  <article class="panel">
+    <h3>Дополнительные данные</h3>
+    <div class="kv-list">
+      <div><strong>Target type:</strong> {{ report.target_type }}</div>
+      <div><strong>Target id:</strong> <span class="mono">{{ report.target_id }}</span></div>
+      <div><strong>Reporter id:</strong> <span class="mono">{{ report.reporter_id }}</span></div>
+    </div>
+    <details class="details-block">
+      <summary>Показать meta</summary>
+      <pre>{{ report.meta | tojson(indent=2) }}</pre>
+    </details>
+  </article>
+</section>
+
+{% if context.kind == "message" and context.thread_messages %}
+<section class="panel">
+  <h3>Контекст переписки</h3>
+  <div class="chat">
+    {% for message in context.thread_messages %}
+    <article class="message {% if message.sender_type == 'admin' or message.id == context.message.id %}support{% else %}user{% endif %}">
+      <header>
+        <strong>{{ message.sender_display_label }}</strong>
+        <span>{{ message.sender_badge }}</span>
+        <time>{{ format_dt(message.created_at) }}</time>
+      </header>
+      <p>{{ message.text }}</p>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
 
 {% if report.status != "resolved" %}
 <section class="panel">
-  <h3>Принять решение</h3>
+  <h3>Решение по жалобе</h3>
   <form method="post" action="/admin/reports/{{ report.id }}/resolve" class="stack">
-    <label>Комментарий модератора</label>
-    <textarea name="moderator_comment" rows="4"></textarea>
-    <div class="actions">
-      <button type="submit" name="resolution" value="valid">Обоснована</button>
-      <button type="submit" name="resolution" value="invalid">Не обоснована</button>
+    <label>Решение
+      <select name="resolution" required>
+        <option value="no_action">Без санкции</option>
+        <option value="warning">Предупреждение</option>
+        <option value="mute_chat">Запретить чат</option>
+        <option value="restrict_posting">Запретить публикации</option>
+        <option value="restrict_offers">Запретить отклики</option>
+        <option value="temporary_ban">Временный бан</option>
+        <option value="permanent_ban">Постоянный бан</option>
+        <option value="custom_restriction">Кастомное ограничение</option>
+        <option value="report_rejected">Жалоба отклонена</option>
+      </select>
+    </label>
+    <div class="grid two">
+      <label>Действует до
+        <input type="datetime-local" name="ends_at">
+      </label>
+      <label>Название кастомного ограничения
+        <input type="text" name="custom_restriction_label" placeholder="Например, запрет на офф-платформенные контакты">
+      </label>
     </div>
+    <label>Комментарий модератора
+      <textarea name="moderator_comment" rows="4" placeholder="Что увидел модератор и какое решение принято"></textarea>
+    </label>
+    <button type="submit">Применить решение</button>
   </form>
 </section>
 {% endif %}

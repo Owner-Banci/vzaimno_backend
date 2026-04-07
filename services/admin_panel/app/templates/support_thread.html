@@ -1,36 +1,81 @@
 {% extends "base.html" %}
 {% block content %}
 <section class="panel">
-  <p class="eyebrow">Диалог поддержки</p>
-  <h2>Обращение {{ thread.id }}</h2>
-  <p><strong>Пользователь:</strong> {{ thread.user_email or thread.user_id }}</p>
-  <p><strong>Создано:</strong> {{ format_dt(thread.created_at) }}</p>
-  <p><strong>Последнее сообщение:</strong> {{ format_dt(thread.last_message_at) }}</p>
+  <div class="section-head">
+    <div>
+      <p class="eyebrow">Диалог поддержки</p>
+      <h2>{{ thread.user_display_label }}</h2>
+      <p class="muted">Support thread хранит явный sender identity: user и admin сообщения разделены на уровне данных, а не только в UI.</p>
+    </div>
+    <a class="action-link" href="/admin/support">К списку</a>
+  </div>
+  <div class="kv-list">
+    <div><strong>Thread:</strong> <span class="mono">{{ thread.id }}</span></div>
+    <div><strong>Email:</strong> {{ thread.user_email or "—" }}</div>
+    <div><strong>User ID:</strong> <span class="mono">{{ thread.user_id }}</span></div>
+    <div><strong>Назначен:</strong> {{ thread.assigned_admin_display_label or "—" }}</div>
+    <div><strong>Создано:</strong> {{ format_dt(thread.created_at) }}</div>
+    <div><strong>Последняя активность:</strong> {{ format_dt(thread.last_message_at or thread.created_at) }}</div>
+  </div>
+</section>
+
+<section class="grid two">
+  <article class="panel">
+    <h3>Назначение staff</h3>
+    <form method="post" action="/admin/support/{{ thread.id }}/assign" class="stack">
+      <label>Ответственный admin account
+        <select name="assigned_admin_account_id" required>
+          {% for account in available_admin_accounts %}
+          <option value="{{ account.id }}" {% if account.id == thread.assigned_admin_account_id %}selected{% endif %}>
+            {{ account.display_label }} · {{ labels.roles.get(account.role, account.role) }}
+          </option>
+          {% endfor %}
+        </select>
+      </label>
+      <button type="submit">Назначить staff</button>
+    </form>
+  </article>
+
+  <article class="panel">
+    <h3>Ответ пользователю</h3>
+    {% if reply_blocked %}
+    <div class="callout">
+      <strong>Ответ заблокирован</strong>
+      <p>Ваш admin account связан с этим же user account. Чтобы не смешивать identity contexts, ответ в собственный тикет запрещён. Назначьте другой admin account и продолжайте работу от него.</p>
+    </div>
+    {% endif %}
+
+    <form method="post" action="/admin/support/{{ thread.id }}/reply" class="stack">
+      <textarea name="text" rows="4" required {% if reply_blocked %}disabled{% endif %} placeholder="Напишите ответ от имени команды поддержки"></textarea>
+      <button type="submit" {% if reply_blocked %}disabled{% endif %}>Отправить</button>
+    </form>
+  </article>
 </section>
 
 <section class="panel">
-  <h3>Переписка</h3>
+  <h3>История сообщений</h3>
   <div class="chat">
     {% for message in messages %}
-    <article class="message {% if message.sender_role == 'support' %}support{% else %}user{% endif %}">
+    <article class="message {% if message.sender_type == 'admin' %}support{% else %}user{% endif %}">
       <header>
-        <strong>{{ message.sender_email or message.sender_id }}</strong>
-        <span>{{ labels.sender_roles.get(message.sender_role, message.sender_role) }}</span>
+        <strong>{{ message.sender_display_name or message.sender_id }}</strong>
+        <span>{{ message.sender_label or labels.sender_roles.get(message.sender_type, message.sender_type) }}</span>
         <time>{{ format_dt(message.created_at) }}</time>
       </header>
       <p>{{ message.text }}</p>
+      <div class="table-meta">
+        sender_type={{ message.sender_type }}
+        {% if message.sender_user_account_id %}
+        · user={{ message.sender_user_account_id }}
+        {% endif %}
+        {% if message.sender_admin_account_id %}
+        · admin={{ message.sender_admin_account_id }}
+        {% endif %}
+      </div>
     </article>
     {% else %}
     <p>Сообщений пока нет.</p>
     {% endfor %}
   </div>
-</section>
-
-<section class="panel">
-  <h3>Ответить</h3>
-  <form method="post" action="/admin/support/{{ thread.id }}/reply" class="stack">
-    <textarea name="text" rows="4" required placeholder="Напишите ответ пользователю"></textarea>
-    <button type="submit">Отправить</button>
-  </form>
 </section>
 {% endblock %}

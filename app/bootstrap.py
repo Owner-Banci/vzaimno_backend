@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from typing import Dict, Iterable, Sequence
 
 from app.db import execute, fetch_all, fetch_one
+from app.security import hash_password
 from app.schema_compat import clear_schema_cache, table_has_columns
 from app.task_compat import (
     TASK_PUBLIC_STATUSES,
@@ -25,7 +27,7 @@ from app.task_compat import (
 CORE_TABLES: Dict[str, str] = {
     "users": """
         CREATE TABLE IF NOT EXISTS users (
-          id TEXT PRIMARY KEY,
+          id UUID PRIMARY KEY,
           email TEXT NOT NULL UNIQUE,
           phone TEXT NULL,
           password_hash TEXT NOT NULL,
@@ -115,30 +117,30 @@ AUX_TABLES: Dict[str, str] = {
     """,
     "chat_threads": """
         CREATE TABLE IF NOT EXISTS chat_threads (
-          id TEXT PRIMARY KEY,
+          id UUID PRIMARY KEY,
           kind TEXT NOT NULL,
-          task_id TEXT NULL,
-          offer_id TEXT NULL,
+          task_id UUID NULL,
+          offer_id UUID NULL,
           created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           last_message_at TIMESTAMPTZ NULL
         );
     """,
     "chat_participants": """
         CREATE TABLE IF NOT EXISTS chat_participants (
-          thread_id TEXT NOT NULL,
-          user_id TEXT NOT NULL,
+          thread_id UUID NOT NULL,
+          user_id UUID NOT NULL,
           role TEXT NOT NULL,
           joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           left_at TIMESTAMPTZ NULL,
-          last_read_message_id TEXT NULL,
+          last_read_message_id UUID NULL,
           PRIMARY KEY (thread_id, user_id)
         );
     """,
     "chat_messages": """
         CREATE TABLE IF NOT EXISTS chat_messages (
-          id TEXT PRIMARY KEY,
-          thread_id TEXT NOT NULL,
-          sender_id TEXT NOT NULL,
+          id UUID PRIMARY KEY,
+          thread_id UUID NOT NULL,
+          sender_id UUID NULL,
           type TEXT NOT NULL,
           text TEXT NOT NULL,
           is_blocked BOOLEAN NOT NULL DEFAULT FALSE,
@@ -150,8 +152,8 @@ AUX_TABLES: Dict[str, str] = {
     """,
     "message_reads": """
         CREATE TABLE IF NOT EXISTS message_reads (
-          message_id TEXT NOT NULL,
-          user_id TEXT NOT NULL,
+          message_id UUID NOT NULL,
+          user_id UUID NOT NULL,
           read_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           PRIMARY KEY (message_id, user_id)
         );
@@ -208,6 +210,75 @@ AUX_TABLES: Dict[str, str] = {
           read_at TIMESTAMPTZ NULL
         );
     """,
+    "admin_accounts": """
+        CREATE TABLE IF NOT EXISTS admin_accounts (
+          id UUID PRIMARY KEY,
+          login_identifier TEXT NOT NULL UNIQUE,
+          email TEXT NULL,
+          password_hash TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'support',
+          status TEXT NOT NULL DEFAULT 'active',
+          display_name TEXT NULL,
+          linked_user_account_id UUID NULL REFERENCES users(id) ON DELETE SET NULL,
+          created_by_admin_id UUID NULL REFERENCES admin_accounts(id) ON DELETE SET NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          last_login_at TIMESTAMPTZ NULL,
+          mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+          mfa_secret TEXT NULL,
+          disabled_at TIMESTAMPTZ NULL,
+          password_reset_required BOOLEAN NOT NULL DEFAULT FALSE
+        );
+    """,
+    "admin_sessions": """
+        CREATE TABLE IF NOT EXISTS admin_sessions (
+          id UUID PRIMARY KEY,
+          admin_account_id UUID NOT NULL REFERENCES admin_accounts(id) ON DELETE CASCADE,
+          token_id UUID NOT NULL UNIQUE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          expires_at TIMESTAMPTZ NOT NULL,
+          revoked_at TIMESTAMPTZ NULL,
+          user_agent TEXT NULL,
+          ip_address TEXT NULL
+        );
+    """,
+    "support_threads": """
+        CREATE TABLE IF NOT EXISTS support_threads (
+          id UUID PRIMARY KEY REFERENCES chat_threads(id) ON DELETE CASCADE,
+          user_account_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          assigned_admin_account_id UUID NULL REFERENCES admin_accounts(id) ON DELETE SET NULL,
+          status TEXT NOT NULL DEFAULT 'open',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          closed_at TIMESTAMPTZ NULL
+        );
+    """,
+    "support_thread_admin_reads": """
+        CREATE TABLE IF NOT EXISTS support_thread_admin_reads (
+          thread_id UUID NOT NULL REFERENCES support_threads(id) ON DELETE CASCADE,
+          admin_account_id UUID NOT NULL REFERENCES admin_accounts(id) ON DELETE CASCADE,
+          last_read_message_id UUID NULL REFERENCES chat_messages(id) ON DELETE SET NULL,
+          joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (thread_id, admin_account_id)
+        );
+    """,
+    "audit_logs": """
+        CREATE TABLE IF NOT EXISTS audit_logs (
+          id UUID PRIMARY KEY,
+          actor_type TEXT NOT NULL,
+          actor_user_account_id UUID NULL REFERENCES users(id) ON DELETE SET NULL,
+          actor_admin_account_id UUID NULL REFERENCES admin_accounts(id) ON DELETE SET NULL,
+          action TEXT NOT NULL,
+          target_type TEXT NOT NULL,
+          target_id TEXT NOT NULL,
+          result TEXT NOT NULL DEFAULT 'success',
+          details JSONB NOT NULL DEFAULT '{}'::jsonb,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+    """,
 }
 
 
@@ -254,6 +325,18 @@ TASK_DOMAIN_TABLES: Dict[str, str] = {
 COMPAT_DDLS: Iterable[str] = (
     "CREATE EXTENSION IF NOT EXISTS postgis;",
     "ALTER TYPE offer_status ADD VALUE IF NOT EXISTS 'withdrawn_by_sender';",
+    "ALTER TYPE report_target_type ADD VALUE IF NOT EXISTS 'announcement';",
+    "ALTER TYPE report_resolution ADD VALUE IF NOT EXISTS 'no_action';",
+    "ALTER TYPE report_resolution ADD VALUE IF NOT EXISTS 'warning';",
+    "ALTER TYPE report_resolution ADD VALUE IF NOT EXISTS 'mute_chat';",
+    "ALTER TYPE report_resolution ADD VALUE IF NOT EXISTS 'restrict_posting';",
+    "ALTER TYPE report_resolution ADD VALUE IF NOT EXISTS 'restrict_offers';",
+    "ALTER TYPE report_resolution ADD VALUE IF NOT EXISTS 'temporary_ban';",
+    "ALTER TYPE report_resolution ADD VALUE IF NOT EXISTS 'permanent_ban';",
+    "ALTER TYPE report_resolution ADD VALUE IF NOT EXISTS 'custom_restriction';",
+    "ALTER TYPE report_resolution ADD VALUE IF NOT EXISTS 'report_rejected';",
+    "ALTER TYPE restriction_type ADD VALUE IF NOT EXISTS 'mute_chat';",
+    "ALTER TYPE restriction_type ADD VALUE IF NOT EXISTS 'custom';",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT NULL;",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL;",
     "ALTER TABLE announcements ADD COLUMN IF NOT EXISTS location_point geography(Point,4326);",
@@ -315,6 +398,196 @@ COMPAT_DDLS: Iterable[str] = (
     "ALTER TABLE task_offers ADD COLUMN IF NOT EXISTS withdrawn_at TIMESTAMPTZ NULL;",
     "ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS assignment_id UUID NULL;",
     "ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ NULL;",
+    "ALTER TABLE admin_accounts ADD COLUMN IF NOT EXISTS email TEXT NULL;",
+    "ALTER TABLE admin_accounts ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'support';",
+    "ALTER TABLE admin_accounts ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';",
+    "ALTER TABLE admin_accounts ADD COLUMN IF NOT EXISTS display_name TEXT NULL;",
+    "ALTER TABLE admin_accounts ADD COLUMN IF NOT EXISTS linked_user_account_id UUID NULL;",
+    "ALTER TABLE admin_accounts ADD COLUMN IF NOT EXISTS created_by_admin_id UUID NULL;",
+    "ALTER TABLE admin_accounts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE admin_accounts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE admin_accounts ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ NULL;",
+    "ALTER TABLE admin_accounts ADD COLUMN IF NOT EXISTS mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE;",
+    "ALTER TABLE admin_accounts ADD COLUMN IF NOT EXISTS mfa_secret TEXT NULL;",
+    "ALTER TABLE admin_accounts ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ NULL;",
+    "ALTER TABLE admin_accounts ADD COLUMN IF NOT EXISTS password_reset_required BOOLEAN NOT NULL DEFAULT FALSE;",
+    "ALTER TABLE admin_sessions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE admin_sessions ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE admin_sessions ADD COLUMN IF NOT EXISTS user_agent TEXT NULL;",
+    "ALTER TABLE admin_sessions ADD COLUMN IF NOT EXISTS ip_address TEXT NULL;",
+    "ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS assigned_admin_account_id UUID NULL;",
+    "ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open';",
+    "ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ NULL;",
+    "ALTER TABLE support_thread_admin_reads ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS sender_type TEXT NULL;",
+    "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS sender_user_account_id UUID NULL;",
+    "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS sender_admin_account_id UUID NULL;",
+    "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS sender_display_name TEXT NULL;",
+    "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS sender_label TEXT NULL;",
+    "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;",
+    "ALTER TABLE chat_messages ALTER COLUMN sender_id DROP NOT NULL;",
+    "ALTER TABLE reports ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}'::jsonb;",
+    "ALTER TABLE reports ADD COLUMN IF NOT EXISTS resolved_by_admin_account_id UUID NULL;",
+    "ALTER TABLE user_restrictions ADD COLUMN IF NOT EXISTS reason_text TEXT NULL;",
+    "ALTER TABLE user_restrictions ADD COLUMN IF NOT EXISTS source_type TEXT NULL;",
+    "ALTER TABLE user_restrictions ADD COLUMN IF NOT EXISTS source_id UUID NULL;",
+    "ALTER TABLE user_restrictions ADD COLUMN IF NOT EXISTS revoked_by UUID NULL;",
+    "ALTER TABLE user_restrictions ADD COLUMN IF NOT EXISTS issued_by_admin_account_id UUID NULL;",
+    "ALTER TABLE user_restrictions ADD COLUMN IF NOT EXISTS revoked_by_admin_account_id UUID NULL;",
+    "ALTER TABLE user_restrictions ADD COLUMN IF NOT EXISTS revocation_reason TEXT NULL;",
+    "ALTER TABLE user_restrictions ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}'::jsonb;",
+    "ALTER TABLE user_restrictions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE user_restrictions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    """
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'chk_admin_accounts_role'
+      ) THEN
+        ALTER TABLE admin_accounts
+        ADD CONSTRAINT chk_admin_accounts_role
+        CHECK (role IN ('support', 'moderator', 'admin'));
+      END IF;
+    END $$;
+    """,
+    """
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'chk_admin_accounts_status'
+      ) THEN
+        ALTER TABLE admin_accounts
+        ADD CONSTRAINT chk_admin_accounts_status
+        CHECK (status IN ('active', 'disabled'));
+      END IF;
+    END $$;
+    """,
+    """
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'fk_reports_resolved_by_admin_account'
+      ) THEN
+        ALTER TABLE reports
+        ADD CONSTRAINT fk_reports_resolved_by_admin_account
+        FOREIGN KEY (resolved_by_admin_account_id) REFERENCES admin_accounts(id) ON DELETE SET NULL;
+      END IF;
+    END $$;
+    """,
+    """
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'fk_user_restrictions_issued_by_admin_account'
+      ) THEN
+        ALTER TABLE user_restrictions
+        ADD CONSTRAINT fk_user_restrictions_issued_by_admin_account
+        FOREIGN KEY (issued_by_admin_account_id) REFERENCES admin_accounts(id) ON DELETE SET NULL;
+      END IF;
+    END $$;
+    """,
+    """
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'fk_user_restrictions_revoked_by_admin_account'
+      ) THEN
+        ALTER TABLE user_restrictions
+        ADD CONSTRAINT fk_user_restrictions_revoked_by_admin_account
+        FOREIGN KEY (revoked_by_admin_account_id) REFERENCES admin_accounts(id) ON DELETE SET NULL;
+      END IF;
+    END $$;
+    """,
+    """
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'fk_chat_messages_sender_user_account'
+      ) THEN
+        ALTER TABLE chat_messages
+        ADD CONSTRAINT fk_chat_messages_sender_user_account
+        FOREIGN KEY (sender_user_account_id) REFERENCES users(id) ON DELETE SET NULL;
+      END IF;
+    END $$;
+    """,
+    """
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'fk_chat_messages_sender_admin_account'
+      ) THEN
+        ALTER TABLE chat_messages
+        ADD CONSTRAINT fk_chat_messages_sender_admin_account
+        FOREIGN KEY (sender_admin_account_id) REFERENCES admin_accounts(id) ON DELETE SET NULL;
+      END IF;
+    END $$;
+    """,
+    """
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'chk_chat_messages_sender_identity'
+      ) THEN
+        ALTER TABLE chat_messages
+        ADD CONSTRAINT chk_chat_messages_sender_identity
+        CHECK (
+          (sender_type = 'user' AND sender_user_account_id IS NOT NULL AND sender_admin_account_id IS NULL)
+          OR (sender_type = 'admin' AND sender_user_account_id IS NULL AND sender_admin_account_id IS NOT NULL)
+          OR (sender_type = 'system' AND sender_user_account_id IS NULL AND sender_admin_account_id IS NULL)
+        ) NOT VALID;
+      END IF;
+    END $$;
+    """,
+    """
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'chk_support_threads_status'
+      ) THEN
+        ALTER TABLE support_threads
+        ADD CONSTRAINT chk_support_threads_status
+        CHECK (status IN ('open', 'pending', 'closed'));
+      END IF;
+    END $$;
+    """,
+    """
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'chk_audit_logs_actor_identity'
+      ) THEN
+        ALTER TABLE audit_logs
+        ADD CONSTRAINT chk_audit_logs_actor_identity
+        CHECK (
+          (actor_type = 'user' AND actor_user_account_id IS NOT NULL AND actor_admin_account_id IS NULL)
+          OR (actor_type = 'admin' AND actor_user_account_id IS NULL AND actor_admin_account_id IS NOT NULL)
+          OR (actor_type = 'system' AND actor_user_account_id IS NULL AND actor_admin_account_id IS NULL)
+        );
+      END IF;
+    END $$;
+    """,
     """
     UPDATE announcements
     SET location_point = ST_SetSRID(
@@ -352,6 +625,9 @@ COMPAT_DDLS: Iterable[str] = (
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique ON users(phone) WHERE phone IS NOT NULL;",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_id_unique ON reviews(id) WHERE id IS NOT NULL;",
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_reviews_task_from_user ON reviews(task_id, from_user_id) WHERE task_id IS NOT NULL AND from_user_id IS NOT NULL;",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_admin_accounts_login_identifier ON admin_accounts ((lower(login_identifier)));",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_admin_accounts_email ON admin_accounts ((lower(email))) WHERE email IS NOT NULL;",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_admin_accounts_linked_user_account_id ON admin_accounts(linked_user_account_id) WHERE linked_user_account_id IS NOT NULL;",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_announcement_offers_unique_pending ON announcement_offers(announcement_id, performer_id) WHERE deleted_at IS NULL AND status = 'pending';",
 )
 
@@ -476,9 +752,54 @@ INDEX_DDLS: Iterable[tuple[str, str, Sequence[str]]] = (
         ("user_id", "revoked_at"),
     ),
     (
+        "user_restrictions",
+        "CREATE INDEX IF NOT EXISTS idx_user_restrictions_source ON user_restrictions(source_type, source_id);",
+        ("source_type", "source_id"),
+    ),
+    (
         "notifications",
         "CREATE INDEX IF NOT EXISTS idx_notifications_user_created_at ON notifications(user_id, created_at DESC);",
         ("user_id", "created_at"),
+    ),
+    (
+        "admin_accounts",
+        "CREATE INDEX IF NOT EXISTS idx_admin_accounts_status_role ON admin_accounts(status, role);",
+        ("status", "role"),
+    ),
+    (
+        "admin_sessions",
+        "CREATE INDEX IF NOT EXISTS idx_admin_sessions_admin_revoked_at ON admin_sessions(admin_account_id, revoked_at, expires_at);",
+        ("admin_account_id", "revoked_at", "expires_at"),
+    ),
+    (
+        "support_threads",
+        "CREATE INDEX IF NOT EXISTS idx_support_threads_user_status_updated ON support_threads(user_account_id, status, updated_at DESC);",
+        ("user_account_id", "status", "updated_at"),
+    ),
+    (
+        "support_threads",
+        "CREATE INDEX IF NOT EXISTS idx_support_threads_assigned_admin_updated ON support_threads(assigned_admin_account_id, updated_at DESC);",
+        ("assigned_admin_account_id", "updated_at"),
+    ),
+    (
+        "support_thread_admin_reads",
+        "CREATE INDEX IF NOT EXISTS idx_support_thread_admin_reads_admin_updated ON support_thread_admin_reads(admin_account_id, updated_at DESC);",
+        ("admin_account_id", "updated_at"),
+    ),
+    (
+        "chat_messages",
+        "CREATE INDEX IF NOT EXISTS idx_chat_messages_sender_identity ON chat_messages(sender_type, sender_user_account_id, sender_admin_account_id, created_at DESC);",
+        ("sender_type", "sender_user_account_id", "sender_admin_account_id", "created_at"),
+    ),
+    (
+        "audit_logs",
+        "CREATE INDEX IF NOT EXISTS idx_audit_logs_actor_created_at ON audit_logs(actor_type, actor_admin_account_id, actor_user_account_id, created_at DESC);",
+        ("actor_type", "actor_admin_account_id", "actor_user_account_id", "created_at"),
+    ),
+    (
+        "audit_logs",
+        "CREATE INDEX IF NOT EXISTS idx_audit_logs_target_created_at ON audit_logs(target_type, target_id, created_at DESC);",
+        ("target_type", "target_id", "created_at"),
     ),
     (
         "tasks",
@@ -1173,14 +1494,536 @@ def backfill_task_status_events() -> None:
         )
 
 
+def _admin_role_from_legacy_user_role(role: str | None) -> str:
+    normalized = str(role or "").strip().lower()
+    if normalized == "admin":
+        return "admin"
+    if normalized == "moderator":
+        return "moderator"
+    return "support"
+
+
+def _admin_sender_label(role: str | None) -> str:
+    normalized = str(role or "").strip().lower()
+    if normalized == "admin":
+        return "Администратор"
+    if normalized == "moderator":
+        return "Модератор"
+    return "Поддержка"
+
+
+def _normalize_admin_login_identifier(email: str | None, user_id: str) -> str:
+    normalized = (email or "").strip().lower()
+    return normalized or f"admin-{user_id}"
+
+
+def backfill_admin_accounts_from_legacy_users() -> None:
+    if not table_exists("admin_accounts"):
+        return
+
+    rows = fetch_all(
+        """
+        SELECT
+            u.id::text,
+            u.email,
+            u.password_hash,
+            u.role::text,
+            u.created_at,
+            COALESCE(NULLIF(BTRIM(up.display_name), ''), NULLIF(BTRIM(u.email), ''), 'Команда Vzaimno')
+        FROM users u
+        LEFT JOIN user_profiles up
+          ON up.user_id = u.id
+        WHERE u.role::text IN ('admin', 'moderator')
+        ORDER BY u.created_at ASC, u.id ASC
+        """
+    )
+
+    for row in rows:
+        user_id = str(row[0])
+        email = str(row[1] or "").strip().lower() or None
+        password_hash = str(row[2] or "").strip()
+        legacy_role = str(row[3] or "admin").strip().lower()
+        created_at = row[4]
+        display_name = str(row[5] or "").strip() or (email or f"admin-{user_id}")
+        login_identifier = _normalize_admin_login_identifier(email, user_id)
+        existing = fetch_one(
+            """
+            SELECT id::text
+            FROM admin_accounts
+            WHERE linked_user_account_id::text = %s
+               OR lower(login_identifier) = lower(%s)
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (user_id, login_identifier),
+        )
+        if existing:
+            execute(
+                """
+                UPDATE admin_accounts
+                SET linked_user_account_id = COALESCE(linked_user_account_id, %s::uuid),
+                    email = COALESCE(email, %s),
+                    display_name = COALESCE(NULLIF(display_name, ''), %s),
+                    role = COALESCE(NULLIF(role, ''), %s),
+                    updated_at = now()
+                WHERE id::text = %s
+                """,
+                (user_id, email, display_name, _admin_role_from_legacy_user_role(legacy_role), str(existing[0])),
+            )
+            continue
+
+        execute(
+            """
+            INSERT INTO admin_accounts (
+                id,
+                login_identifier,
+                email,
+                password_hash,
+                role,
+                status,
+                display_name,
+                linked_user_account_id,
+                created_at,
+                updated_at,
+                password_reset_required
+            )
+            VALUES (%s::uuid, %s, %s, %s, %s, 'active', %s, %s::uuid, %s, %s, FALSE)
+            """,
+            (
+                str(uuid.uuid4()),
+                login_identifier,
+                email,
+                password_hash or hash_password(str(uuid.uuid4())),
+                _admin_role_from_legacy_user_role(legacy_role),
+                display_name,
+                user_id,
+                created_at,
+                created_at,
+            ),
+        )
+
+    execute("UPDATE users SET role = 'user' WHERE role::text IN ('admin', 'moderator')")
+
+
+def ensure_bootstrap_admin_account() -> None:
+    if not table_exists("admin_accounts"):
+        return
+    existing = fetch_one("SELECT 1 FROM admin_accounts LIMIT 1")
+    if existing:
+        return
+
+    login_identifier = (os.getenv("ADMIN_BOOTSTRAP_LOGIN") or "").strip().lower()
+    password = os.getenv("ADMIN_BOOTSTRAP_PASSWORD") or ""
+    if not login_identifier or not password:
+        return
+
+    display_name = (os.getenv("ADMIN_BOOTSTRAP_DISPLAY_NAME") or "Super Admin").strip() or "Super Admin"
+    execute(
+        """
+        INSERT INTO admin_accounts (
+            id,
+            login_identifier,
+            email,
+            password_hash,
+            role,
+            status,
+            display_name,
+            created_at,
+            updated_at,
+            password_reset_required
+        )
+        VALUES (%s::uuid, %s, %s, %s, 'admin', 'active', %s, now(), now(), FALSE)
+        ON CONFLICT DO NOTHING
+        """,
+        (
+            str(uuid.uuid4()),
+            login_identifier,
+            login_identifier if "@" in login_identifier else None,
+            hash_password(password),
+            display_name,
+        ),
+    )
+
+
+def backfill_support_threads() -> None:
+    if not table_exists("support_threads"):
+        return
+
+    rows = fetch_all(
+        """
+        SELECT ct.id::text,
+               ct.created_at,
+               COALESCE(ct.last_message_at, ct.created_at) AS updated_at
+        FROM chat_threads ct
+        WHERE ct.kind::text = 'support'
+        ORDER BY ct.created_at ASC
+        """
+    )
+
+    for row in rows:
+        thread_id = str(row[0])
+        created_at = row[1]
+        updated_at = row[2]
+        if fetch_one("SELECT 1 FROM support_threads WHERE id::text = %s", (thread_id,)):
+            continue
+
+        participant = fetch_one(
+            """
+            SELECT cp.user_id::text
+            FROM chat_participants cp
+            LEFT JOIN admin_accounts aa
+              ON aa.linked_user_account_id = cp.user_id
+            WHERE cp.thread_id::text = %s
+            ORDER BY
+                CASE WHEN aa.id IS NULL THEN 0 ELSE 1 END,
+                cp.joined_at ASC,
+                cp.user_id ASC
+            LIMIT 1
+            """,
+            (thread_id,),
+        )
+        if not participant or not participant[0]:
+            continue
+
+        user_account_id = str(participant[0])
+        assigned = fetch_one(
+            """
+            SELECT aa.id::text
+            FROM chat_messages m
+            JOIN admin_accounts aa
+              ON aa.linked_user_account_id = m.sender_id
+            WHERE m.thread_id::text = %s
+              AND m.sender_id::text <> %s
+            ORDER BY m.created_at DESC
+            LIMIT 1
+            """,
+            (thread_id, user_account_id),
+        )
+        if not assigned:
+            assigned = fetch_one(
+                """
+                SELECT aa.id::text
+                FROM chat_participants cp
+                JOIN admin_accounts aa
+                  ON aa.linked_user_account_id = cp.user_id
+                WHERE cp.thread_id::text = %s
+                  AND cp.user_id::text <> %s
+                ORDER BY cp.joined_at ASC, cp.user_id ASC
+                LIMIT 1
+                """,
+                (thread_id, user_account_id),
+            )
+
+        execute(
+            """
+            INSERT INTO support_threads (
+                id,
+                user_account_id,
+                assigned_admin_account_id,
+                status,
+                created_at,
+                updated_at
+            )
+            VALUES (%s::uuid, %s::uuid, %s::uuid, 'open', %s, %s)
+            ON CONFLICT (id) DO NOTHING
+            """,
+            (thread_id, user_account_id, str(assigned[0]) if assigned and assigned[0] else None, created_at, updated_at),
+        )
+
+
+def backfill_chat_message_sender_identity() -> None:
+    if not table_exists("chat_messages"):
+        return
+
+    rows = fetch_all(
+        """
+        SELECT
+            m.id::text,
+            COALESCE(m.type::text, 'text') AS message_type,
+            m.sender_id::text,
+            st.user_account_id::text AS support_user_account_id,
+            aa.id::text AS admin_account_id,
+            aa.role,
+            COALESCE(NULLIF(BTRIM(aa.display_name), ''), NULLIF(BTRIM(up.display_name), ''), NULLIF(BTRIM(u.email), ''), NULLIF(BTRIM(aa.login_identifier), ''), 'Команда Vzaimno') AS admin_display_name,
+            COALESCE(NULLIF(BTRIM(up.display_name), ''), NULLIF(BTRIM(u.email), ''), 'Пользователь') AS user_display_name
+        FROM chat_messages m
+        LEFT JOIN support_threads st
+          ON st.id = m.thread_id
+        LEFT JOIN users u
+          ON u.id = m.sender_id
+        LEFT JOIN user_profiles up
+          ON up.user_id = m.sender_id
+        LEFT JOIN admin_accounts aa
+          ON aa.linked_user_account_id = m.sender_id
+        ORDER BY m.created_at ASC, m.id ASC
+        """
+    )
+
+    for row in rows:
+        message_id = str(row[0])
+        message_type = str(row[1] or "text")
+        sender_id = str(row[2]) if row[2] is not None else None
+        support_user_account_id = str(row[3]) if row[3] is not None else None
+        admin_account_id = str(row[4]) if row[4] is not None else None
+        admin_role = str(row[5] or "")
+        admin_display_name = str(row[6] or "").strip() or "Команда Vzaimno"
+        user_display_name = str(row[7] or "").strip() or "Пользователь"
+
+        if message_type == "system" or sender_id is None:
+            sender_type = "system"
+            sender_user_account_id = None
+            sender_admin_account_id = None
+            sender_display_name = "Система"
+            sender_label = "Система"
+        elif admin_account_id and support_user_account_id and sender_id != support_user_account_id:
+            sender_type = "admin"
+            sender_user_account_id = None
+            sender_admin_account_id = admin_account_id
+            sender_display_name = admin_display_name
+            sender_label = _admin_sender_label(admin_role)
+        else:
+            sender_type = "user"
+            sender_user_account_id = sender_id
+            sender_admin_account_id = None
+            sender_display_name = user_display_name
+            sender_label = "Пользователь"
+
+        execute(
+            """
+            UPDATE chat_messages
+            SET sender_type = %s,
+                sender_user_account_id = %s::uuid,
+                sender_admin_account_id = %s::uuid,
+                sender_display_name = %s,
+                sender_label = %s
+            WHERE id::text = %s
+            """,
+            (
+                sender_type,
+                sender_user_account_id,
+                sender_admin_account_id,
+                sender_display_name,
+                sender_label,
+                message_id,
+            ),
+        )
+
+
+def backfill_support_thread_admin_reads() -> None:
+    if not table_exists("support_thread_admin_reads"):
+        return
+
+    rows = fetch_all(
+        """
+        SELECT
+            st.id::text,
+            aa.id::text,
+            cp.last_read_message_id::text,
+            COALESCE(cp.joined_at, st.created_at) AS joined_at,
+            COALESCE(ct.last_message_at, st.updated_at, st.created_at) AS updated_at
+        FROM support_threads st
+        JOIN chat_threads ct
+          ON ct.id = st.id
+        JOIN chat_participants cp
+          ON cp.thread_id = st.id
+        JOIN admin_accounts aa
+          ON aa.linked_user_account_id = cp.user_id
+        WHERE cp.user_id <> st.user_account_id
+        """
+    )
+
+    for row in rows:
+        execute(
+            """
+            INSERT INTO support_thread_admin_reads (
+                thread_id,
+                admin_account_id,
+                last_read_message_id,
+                joined_at,
+                updated_at
+            )
+            VALUES (%s::uuid, %s::uuid, %s::uuid, %s, %s)
+            ON CONFLICT (thread_id, admin_account_id)
+            DO UPDATE SET last_read_message_id = COALESCE(EXCLUDED.last_read_message_id, support_thread_admin_reads.last_read_message_id),
+                          updated_at = EXCLUDED.updated_at
+            """,
+            (str(row[0]), str(row[1]), str(row[2]) if row[2] is not None else None, row[3], row[4]),
+        )
+
+
+def backfill_admin_actor_columns() -> None:
+    if table_exists("reports"):
+        execute(
+            """
+            UPDATE reports r
+            SET resolved_by_admin_account_id = aa.id
+            FROM admin_accounts aa
+            WHERE r.resolved_by_admin_account_id IS NULL
+              AND r.resolved_by IS NOT NULL
+              AND aa.linked_user_account_id = r.resolved_by
+            """
+        )
+
+    if table_exists("user_restrictions"):
+        execute(
+            """
+            UPDATE user_restrictions ur
+            SET issued_by_admin_account_id = aa.id
+            FROM admin_accounts aa
+            WHERE ur.issued_by_admin_account_id IS NULL
+              AND ur.issued_by IS NOT NULL
+              AND aa.linked_user_account_id = ur.issued_by
+            """
+        )
+        execute(
+            """
+            UPDATE user_restrictions ur
+            SET revoked_by_admin_account_id = aa.id
+            FROM admin_accounts aa
+            WHERE ur.revoked_by_admin_account_id IS NULL
+              AND ur.revoked_by IS NOT NULL
+              AND aa.linked_user_account_id = ur.revoked_by
+            """
+        )
+
+
+def backfill_audit_logs() -> None:
+    if not table_exists("audit_logs"):
+        return
+
+    moderation_rows = fetch_all(
+        """
+        SELECT id::text,
+               moderator_id::text,
+               action_type,
+               target_type,
+               target_id::text,
+               reason,
+               payload,
+               created_at
+        FROM moderation_actions
+        ORDER BY created_at ASC, id ASC
+        """
+    ) if table_exists("moderation_actions") else []
+
+    for row in moderation_rows:
+        source_id = str(row[0])
+        if fetch_one("SELECT 1 FROM audit_logs WHERE details->>'source_moderation_action_id' = %s LIMIT 1", (source_id,)):
+            continue
+        moderator_user_id = str(row[1]) if row[1] is not None else None
+        linked_admin = fetch_one(
+            "SELECT id::text FROM admin_accounts WHERE linked_user_account_id::text = %s LIMIT 1",
+            (moderator_user_id,),
+        ) if moderator_user_id else None
+        actor_type = "admin" if linked_admin and linked_admin[0] else "user"
+        actor_user_account_id = None if actor_type == "admin" else moderator_user_id
+        actor_admin_account_id = str(linked_admin[0]) if actor_type == "admin" else None
+        details = dict(row[6] or {}) if isinstance(row[6], dict) else {}
+        details["source_moderation_action_id"] = source_id
+        if row[5]:
+            details["reason"] = row[5]
+        execute(
+            """
+            INSERT INTO audit_logs (
+                id,
+                actor_type,
+                actor_user_account_id,
+                actor_admin_account_id,
+                action,
+                target_type,
+                target_id,
+                result,
+                details,
+                created_at
+            )
+            VALUES (%s::uuid, %s, %s::uuid, %s::uuid, %s, %s, %s, 'success', %s::jsonb, %s)
+            """,
+            (
+                str(uuid.uuid4()),
+                actor_type,
+                actor_user_account_id,
+                actor_admin_account_id,
+                str(row[2]),
+                str(row[3]),
+                str(row[4]),
+                json.dumps(details, ensure_ascii=False),
+                row[7],
+            ),
+        )
+
+    support_rows = fetch_all(
+        """
+        SELECT id::text,
+               thread_id::text,
+               sender_admin_account_id::text,
+               text,
+               created_at
+        FROM chat_messages
+        WHERE sender_type = 'admin'
+          AND sender_admin_account_id IS NOT NULL
+        ORDER BY created_at ASC, id ASC
+        """
+    ) if table_exists("chat_messages") else []
+
+    for row in support_rows:
+        message_id = str(row[0])
+        if fetch_one("SELECT 1 FROM audit_logs WHERE details->>'source_message_id' = %s LIMIT 1", (message_id,)):
+            continue
+        execute(
+            """
+            INSERT INTO audit_logs (
+                id,
+                actor_type,
+                actor_user_account_id,
+                actor_admin_account_id,
+                action,
+                target_type,
+                target_id,
+                result,
+                details,
+                created_at
+            )
+            VALUES (%s::uuid, 'admin', NULL, %s::uuid, 'support_message_sent', 'support_thread', %s, 'success', %s::jsonb, %s)
+            """,
+            (
+                str(uuid.uuid4()),
+                str(row[2]),
+                str(row[1]),
+                json.dumps(
+                    {
+                        "source_message_id": message_id,
+                        "message_preview": str(row[3] or "")[:250],
+                    },
+                    ensure_ascii=False,
+                ),
+                row[4],
+            ),
+        )
+
+
+def validate_identity_constraints() -> None:
+    if table_exists("chat_messages"):
+        execute("ALTER TABLE chat_messages VALIDATE CONSTRAINT chk_chat_messages_sender_identity")
+    if table_exists("audit_logs"):
+        execute("ALTER TABLE audit_logs VALIDATE CONSTRAINT chk_audit_logs_actor_identity")
+
+
 def ensure_all_tables() -> None:
     ensure_core_tables()
     ensure_auxiliary_tables()
     ensure_task_domain_tables()
     ensure_compat_columns()
     ensure_chat_thread_kind_compat()
+    backfill_admin_accounts_from_legacy_users()
+    ensure_bootstrap_admin_account()
+    backfill_support_threads()
+    backfill_chat_message_sender_identity()
+    backfill_support_thread_admin_reads()
+    backfill_admin_actor_columns()
     clear_schema_cache()
     ensure_indexes()
+    backfill_audit_logs()
+    validate_identity_constraints()
     backfill_legacy_tasks()
     backfill_legacy_task_offers()
     backfill_legacy_task_assignments()

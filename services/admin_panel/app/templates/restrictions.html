@@ -2,29 +2,56 @@
 {% block content %}
 <section class="grid two">
   <article class="panel">
-    <p class="eyebrow">Модераторские меры</p>
-    <h2>Назначить ограничение</h2>
+    <p class="eyebrow">Manual action</p>
+    <h2>Выдать ограничение</h2>
     <form method="post" action="/admin/restrictions/create" class="stack">
-      <label>ID пользователя</label>
-      <input type="text" name="user_id" required placeholder="UUID или текстовый ID">
-      <label>Тип</label>
-      <select name="type">
-        <option value="warning">Предупреждение</option>
-        <option value="ban">Блокировка</option>
-        <option value="shadowban">Теневая блокировка</option>
-      </select>
-      <label>До какого времени</label>
-      <input type="datetime-local" name="ends_at">
-      <label>Комментарий</label>
-      <textarea name="comment" rows="3"></textarea>
+      <label>ID пользователя
+        <input type="text" name="user_id" required placeholder="UUID пользователя">
+      </label>
+      <div class="grid two">
+        <label>Тип ограничения
+          <select name="type">
+            <option value="warning">Предупреждение</option>
+            <option value="mute_chat">Запрет на чат</option>
+            <option value="restrict_posting">Запрет на публикации</option>
+            <option value="restrict_offers">Запрет на отклики</option>
+            <option value="temporary_ban">Временный бан</option>
+            <option value="permanent_ban">Постоянный бан</option>
+            <option value="custom">Кастомное ограничение</option>
+            <option value="shadowban">Теневая блокировка</option>
+          </select>
+        </label>
+        <label>Источник
+          <select name="source_type">
+            <option value="manual">Вручную</option>
+            <option value="report">По жалобе</option>
+            <option value="moderation">По модерации</option>
+          </select>
+        </label>
+      </div>
+      <div class="grid two">
+        <label>До какого времени
+          <input type="datetime-local" name="ends_at">
+        </label>
+        <label>Source ID
+          <input type="text" name="source_id" placeholder="report/task UUID, если есть">
+        </label>
+      </div>
+      <label>Название кастомного ограничения
+        <input type="text" name="custom_label" placeholder="Например, запрет на off-platform coercion">
+      </label>
+      <label>Причина
+        <textarea name="comment" rows="4" placeholder="Что произошло и почему выдаётся санкция"></textarea>
+      </label>
       <button type="submit">Назначить ограничение</button>
     </form>
   </article>
 
   <article class="panel">
+    <p class="eyebrow">History-aware entity</p>
     <h2>Список ограничений</h2>
     <form class="toolbar" method="get">
-      <input type="search" name="search" placeholder="Поиск по email пользователя" value="{{ search }}">
+      <input type="search" name="search" placeholder="Email, display name, user ID или source ID" value="{{ search }}">
       <select name="status">
         <option value="">Все статусы</option>
         {% for value in ["active", "revoked"] %}
@@ -33,6 +60,7 @@
       </select>
       <button type="submit">Показать</button>
     </form>
+    <p class="muted">Ограничения не сводятся к `user.is_banned`: у каждой санкции есть срок, источник и история снятия.</p>
   </article>
 </section>
 
@@ -41,28 +69,71 @@
     <thead>
       <tr>
         <th>Пользователь</th>
-        <th>Тип</th>
+        <th>Ограничение</th>
         <th>Статус</th>
-        <th>Кем назначено</th>
-        <th>Начало</th>
-        <th>Окончание</th>
+        <th>Источник</th>
+        <th>Кем выдано</th>
+        <th>Период</th>
+        <th>Причина</th>
         <th></th>
       </tr>
     </thead>
     <tbody>
       {% for restriction in restrictions %}
       <tr>
-        <td>{{ restriction.user_email or restriction.user_id }}</td>
-        <td>{{ labels.restriction_types.get(restriction.type, restriction.type or "—") }}</td>
-        <td>{{ labels.restriction_statuses.get(restriction.status, restriction.status) }}</td>
-        <td>{{ restriction.issued_by_email or restriction.issued_by }}</td>
-        <td>{{ format_dt(restriction.starts_at) }}</td>
-        <td>{{ format_dt(restriction.ends_at) }}</td>
+        <td>
+          <strong>{{ restriction.user_display_label }}</strong>
+          <div class="table-meta mono">{{ restriction.user_id }}</div>
+        </td>
+        <td>
+          <strong>{{ labels.restriction_types.get(restriction.type, restriction.type or "—") }}</strong>
+          {% if restriction.custom_label %}
+          <div class="table-meta">{{ restriction.custom_label }}</div>
+          {% endif %}
+        </td>
+        <td>
+          <div>{{ labels.restriction_statuses.get(restriction.status, restriction.status) }}</div>
+          {% if restriction.revoked_at %}
+          <div class="table-meta">Снято: {{ format_dt(restriction.revoked_at) }}</div>
+          {% endif %}
+        </td>
+        <td>
+          <div>{{ labels.restriction_sources.get(restriction.source_type, restriction.source_type or "—") }}</div>
+          {% if restriction.source_id %}
+          <div class="table-meta mono">{{ restriction.source_id }}</div>
+          {% endif %}
+          {% if restriction.source_type == "report" and restriction.source_id %}
+          <a class="inline-link" href="/admin/reports/{{ restriction.source_id }}">Открыть источник</a>
+          {% elif restriction.source_type == "moderation" and restriction.source_id %}
+          <a class="inline-link" href="/admin/announcements/{{ restriction.source_id }}">Открыть источник</a>
+          {% endif %}
+        </td>
+        <td>
+          <div>{{ restriction.issued_by_display_label }}</div>
+          {% if restriction.revoked_by %}
+          <div class="table-meta">Снял: {{ restriction.revoked_by_display_label }}</div>
+          {% endif %}
+        </td>
+        <td>
+          <div>{{ format_dt(restriction.starts_at) }}</div>
+          <div class="table-meta">До: {{ format_dt(restriction.ends_at) }}</div>
+        </td>
+        <td>
+          <div>{{ restriction.reason_text or "—" }}</div>
+          {% if restriction.revocation_reason %}
+          <div class="table-meta">Причина снятия: {{ restriction.revocation_reason }}</div>
+          {% endif %}
+        </td>
         <td>
           {% if restriction.status == "active" %}
-          <form method="post" action="/admin/restrictions/{{ restriction.id }}/revoke">
-            <input type="hidden" name="comment" value="Снято из админ-панели">
-            <button type="submit">Снять</button>
+          <form method="post" action="/admin/restrictions/{{ restriction.id }}/extend" class="inline-form">
+            <input type="datetime-local" name="ends_at" required>
+            <input type="text" name="comment" placeholder="Комментарий к продлению">
+            <button type="submit">Продлить</button>
+          </form>
+          <form method="post" action="/admin/restrictions/{{ restriction.id }}/revoke" class="inline-form">
+            <input type="text" name="comment" placeholder="Причина снятия">
+            <button type="submit" class="danger">Снять</button>
           </form>
           {% else %}
           —
@@ -70,7 +141,7 @@
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="7">Ограничений нет.</td></tr>
+      <tr><td colspan="8">Ограничений пока нет.</td></tr>
       {% endfor %}
     </tbody>
   </table>

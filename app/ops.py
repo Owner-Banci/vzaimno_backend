@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, Dict, Optional
+from functools import lru_cache
+from typing import Any, Dict, Optional, Sequence
 
-from app.db import execute, fetch_one
+from app.db import execute, fetch_all, fetch_one
 from app.schema_compat import get_table_columns, table_has_column
 
 
@@ -26,7 +27,7 @@ def _build_insert_sql(table_name: str, values: Dict[str, Any], jsonb_columns: se
 
 def _report_open_filter_sql() -> str:
     if table_has_column("reports", "status"):
-        return "status = 'open'"
+        return "status::text IN ('new', 'in_review', 'open')"
     if table_has_column("reports", "resolved_at"):
         return "resolved_at IS NULL"
     if table_has_column("reports", "resolution"):
@@ -36,12 +37,71 @@ def _report_open_filter_sql() -> str:
 
 def report_status_select_sql(alias: str = "reports") -> str:
     if table_has_column("reports", "status"):
-        return f"{alias}.status"
+        return (
+            f"CASE WHEN {alias}.status::text IN ('resolved', 'closed', 'done') "
+            f"THEN 'resolved' ELSE 'open' END"
+        )
     if table_has_column("reports", "resolved_at"):
         return f"CASE WHEN {alias}.resolved_at IS NULL THEN 'open' ELSE 'resolved' END"
     if table_has_column("reports", "resolution"):
         return f"CASE WHEN {alias}.resolution IS NULL THEN 'open' ELSE 'resolved' END"
     return "'open'"
+
+
+@lru_cache(maxsize=None)
+def _column_udt_name(table_name: str, column_name: str) -> Optional[str]:
+    row = fetch_one(
+        """
+        SELECT udt_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+          AND column_name = %s
+        """,
+        (table_name, column_name),
+    )
+    if not row or not row[0]:
+        return None
+    return str(row[0])
+
+
+@lru_cache(maxsize=None)
+def _enum_labels(enum_name: str) -> tuple[str, ...]:
+    rows = fetch_all(
+        """
+        SELECT e.enumlabel
+        FROM pg_enum e
+        JOIN pg_type t ON t.oid = e.enumtypid
+        JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE n.nspname = 'public'
+          AND t.typname = %s
+        ORDER BY e.enumsortorder
+        """,
+        (enum_name,),
+    )
+    return tuple(str(row[0]) for row in rows if row and row[0])
+
+
+def _enum_value(
+    table_name: str,
+    column_name: str,
+    desired: str,
+    fallbacks: Sequence[str] = (),
+) -> str:
+    udt_name = _column_udt_name(table_name, column_name)
+    if not udt_name:
+        return desired
+
+    labels = _enum_labels(udt_name)
+    if not labels:
+        return desired
+
+    by_lower = {label.lower(): label for label in labels}
+    for candidate in (desired, *fallbacks):
+        value = by_lower.get(str(candidate).lower())
+        if value:
+            return value
+    return labels[0]
 
 
 def _notification_user_id_requires_uuid() -> bool:
@@ -89,6 +149,7 @@ def create_report(
     target_id: str,
     reason_code: str,
     reason_text: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
 ) -> str:
     report_id = str(uuid.uuid4())
     columns = get_table_columns("reports")
@@ -102,8 +163,14 @@ def create_report(
     if "reason_text" in columns:
         values["reason_text"] = reason_text
     if "status" in columns:
-        values["status"] = "open"
-    sql, params = _build_insert_sql("reports", values)
+        values["status"] = _enum_value("reports", "status", "new", ("open", "in_review"))
+    if "meta" in columns:
+        values["meta"] = meta or {}
+    sql, params = _build_insert_sql(
+        "reports",
+        values,
+        jsonb_columns={"meta"} if "meta" in values else set(),
+    )
     execute(sql, params)
     return report_id
 
@@ -135,6 +202,7 @@ def ensure_appeal_report(
         target_id=announcement_id,
         reason_code="APPEAL",
         reason_text=reason_text,
+        meta={"submitted_target_type": "announcement", "report_kind": "appeal"},
     )
 
 

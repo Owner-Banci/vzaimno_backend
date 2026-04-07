@@ -212,6 +212,88 @@ pre {
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
 }
 
+.info-grid,
+.route-list {
+  display: grid;
+  gap: 14px;
+}
+
+.info-grid {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.info-card,
+.route-card,
+.callout {
+  padding: 16px 18px;
+  border-radius: 20px;
+  border: 1px solid var(--line);
+  background: var(--surface-strong);
+}
+
+.info-label {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.kv-list,
+.list-block {
+  display: grid;
+  gap: 10px;
+}
+
+.list-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.details-block {
+  display: grid;
+  gap: 12px;
+}
+
+.details-block summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.table-meta {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.mono {
+  font-family: "IBM Plex Mono", "SFMono-Regular", "Menlo", monospace;
+  word-break: break-all;
+}
+
+.inline-form {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.inline-form input,
+.inline-form button {
+  min-width: 0;
+}
+
+.inline-link {
+  display: inline-block;
+  margin-top: 6px;
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
 label {
   display: grid;
   gap: 8px;

@@ -122,53 +122,52 @@ def _normalize_text(text: str) -> str:
     return " ".join((text or "").strip().split())
 
 
-@lru_cache(maxsize=1)
-def _chat_message_sender_storage() -> tuple[str, bool]:
+def _user_sender_identity(user_id: str) -> tuple[str, str]:
     row = fetch_one(
         """
-        SELECT data_type, is_nullable
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'chat_messages'
-          AND column_name = 'sender_id'
+        SELECT
+            COALESCE(
+                NULLIF(BTRIM(up.display_name), ''),
+                NULLIF(BTRIM(u.phone), ''),
+                NULLIF(BTRIM(u.email), ''),
+                'Пользователь'
+            ) AS display_name,
+            'Пользователь' AS sender_label
+        FROM users u
+        LEFT JOIN user_profiles up
+          ON up.user_id = u.id
+        WHERE u.id = %s
+        LIMIT 1
         """
+        ,
+        (user_id,),
     )
     if not row:
-        return ("text", False)
-    return (str(row[0] or "").lower(), str(row[1] or "").upper() == "YES")
-
-
-def _system_sender_db_value(thread_id: str) -> str | None:
-    data_type, is_nullable = _chat_message_sender_storage()
-    if data_type in {"text", "character varying", "character"}:
-        return SYSTEM_CHAT_SENDER_ID
-    if is_nullable:
-        return None
-
-    participant = fetch_one(
-        """
-        SELECT user_id::text
-        FROM chat_participants
-        WHERE thread_id = %s
-          AND left_at IS NULL
-        ORDER BY user_id
-        LIMIT 1
-        """,
-        (thread_id,),
-    )
-    if participant and participant[0]:
-        return str(participant[0])
-
-    raise HTTPException(status_code=500, detail="System sender could not be resolved")
+        return ("Пользователь", "Пользователь")
+    return (str(row[0] or "Пользователь"), str(row[1] or "Пользователь"))
 
 
 def _message_row_to_dict(row) -> Dict[str, Any]:
     message_type = str(row[5]) if len(row) > 5 and row[5] is not None else "text"
-    sender_value = SYSTEM_CHAT_SENDER_ID if message_type == "system" or row[2] is None else str(row[2])
+    sender_type = str(row[6]) if len(row) > 6 and row[6] is not None else ("system" if message_type == "system" else "user")
+    sender_user_account_id = str(row[7]) if len(row) > 7 and row[7] is not None else None
+    sender_admin_account_id = str(row[8]) if len(row) > 8 and row[8] is not None else None
+    sender_display_name = str(row[9]) if len(row) > 9 and row[9] is not None else None
+    sender_label = str(row[10]) if len(row) > 10 and row[10] is not None else None
+    sender_value = SYSTEM_CHAT_SENDER_ID
+    if sender_type == "user":
+        sender_value = sender_user_account_id or (str(row[2]) if row[2] is not None else None)
+    elif sender_type == "admin":
+        sender_value = sender_admin_account_id or (str(row[2]) if row[2] is not None else None)
     return {
         "id": str(row[0]),
         "thread_id": str(row[1]),
         "sender_id": sender_value,
+        "sender_type": sender_type,
+        "sender_user_account_id": sender_user_account_id,
+        "sender_admin_account_id": sender_admin_account_id,
+        "sender_display_name": sender_display_name,
+        "sender_label": sender_label,
         "text": row[3],
         "created_at": row[4],
         "type": message_type,
@@ -375,34 +374,62 @@ def _thread_preview_rows(user_id: str, thread_id: str | None = None) -> List[Dic
         SELECT
             ct.id::text,
             ct.kind::text,
-            other.user_id::text,
+            partner.partner_id,
+            CASE
+                WHEN ct.kind = 'support' THEN 'Поддержка Vzaimno'
+                ELSE COALESCE(partner.partner_display_name, 'Собеседник')
+            END AS partner_display_name,
+            partner.partner_avatar_url,
             COALESCE(
-                NULLIF(BTRIM(up.display_name), ''),
-                NULLIF(BTRIM(u.phone), ''),
-                NULLIF(BTRIM(u.email), ''),
-                'Собеседник'
-            ) AS partner_display_name,
-            {_avatar_select_sql("up")},
-            COALESCE(lm.text, 'Чат открыт') AS last_message_text,
+                lm.text,
+                CASE WHEN ct.kind = 'support' THEN 'Чат с поддержкой открыт' ELSE 'Чат открыт' END
+            ) AS last_message_text,
             COALESCE(ct.last_message_at, lm.created_at, ct.created_at) AS last_message_at,
             COALESCE(unread.unread_count, 0) AS unread_count,
             t.id::text AS task_id,
-            t.title AS task_title
+            t.title AS task_title,
+            CASE WHEN ct.kind = 'support' THEN TRUE ELSE FALSE END AS is_pinned
         FROM chat_threads ct
         JOIN chat_participants me
           ON me.thread_id = ct.id
          AND me.user_id = %s
          AND me.left_at IS NULL
+        LEFT JOIN support_threads st
+          ON st.id = ct.id
+         AND st.user_account_id = me.user_id
         LEFT JOIN chat_messages read_msg
           ON read_msg.id = me.last_read_message_id
-        LEFT JOIN chat_participants other
-          ON other.thread_id = ct.id
-         AND other.user_id <> %s
-         AND other.left_at IS NULL
-        LEFT JOIN users u
-          ON u.id = other.user_id
-        LEFT JOIN user_profiles up
-          ON up.user_id = other.user_id
+        LEFT JOIN LATERAL (
+            SELECT
+                cp.user_id::text AS partner_id,
+                COALESCE(
+                    NULLIF(BTRIM(pup.display_name), ''),
+                    NULLIF(BTRIM(pu.phone), ''),
+                    NULLIF(BTRIM(pu.email), ''),
+                    CASE WHEN ct.kind = 'support' THEN 'Поддержка Vzaimno' ELSE 'Собеседник' END
+                ) AS partner_display_name,
+                pup.extra->>'avatar_url' AS partner_avatar_url,
+                COALESCE(pu.role::text, 'user') AS partner_role
+            FROM chat_participants cp
+            LEFT JOIN users pu
+              ON pu.id = cp.user_id
+            LEFT JOIN user_profiles pup
+              ON pup.user_id = cp.user_id
+            WHERE cp.thread_id = ct.id
+              AND cp.user_id <> %s
+              AND cp.left_at IS NULL
+            ORDER BY
+                CASE
+                    WHEN ct.kind = 'support'
+                     AND COALESCE(pu.role::text, '') IN ('support', 'moderator', 'admin')
+                    THEN 0
+                    WHEN ct.kind = 'support' THEN 1
+                    ELSE 0
+                END,
+                cp.joined_at ASC,
+                cp.user_id ASC
+            LIMIT 1
+        ) partner ON TRUE
         LEFT JOIN task_assignments ta
           ON ta.id = ct.assignment_id
         LEFT JOIN task_offers tf
@@ -423,8 +450,9 @@ def _thread_preview_rows(user_id: str, thread_id: str | None = None) -> List[Dic
             WHERE m.thread_id = ct.id
               AND m.deleted_at IS NULL
               AND (
-                    COALESCE(m.type, 'text') = 'system'
-                    OR m.sender_id::text <> %s
+                    COALESCE(m.sender_type, CASE WHEN COALESCE(m.type::text, 'text') = 'system' THEN 'system' ELSE 'user' END) = 'system'
+                    OR COALESCE(m.sender_type, 'user') = 'admin'
+                    OR COALESCE(m.sender_user_account_id::text, m.sender_id::text, '') <> %s
               )
               AND (
                     me.last_read_message_id IS NULL
@@ -435,11 +463,38 @@ def _thread_preview_rows(user_id: str, thread_id: str | None = None) -> List[Dic
                     )
                   )
         ) unread ON TRUE
-        WHERE ct.kind <> 'support'
-          AND ct.archived_at IS NULL
+        WHERE ct.archived_at IS NULL
           AND (t.id IS NULL OR t.deleted_at IS NULL)
+          AND (
+                ct.kind <> 'support'
+                OR (
+                    st.id IS NOT NULL
+                    AND st.closed_at IS NULL
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM support_threads st2
+                        JOIN chat_threads ct2
+                          ON ct2.id = st2.id
+                        WHERE st2.user_account_id = me.user_id
+                          AND st2.closed_at IS NULL
+                          AND ct2.archived_at IS NULL
+                          AND (
+                                COALESCE(ct2.last_message_at, st2.updated_at, ct2.created_at)
+                                    > COALESCE(ct.last_message_at, st.updated_at, ct.created_at)
+                                OR (
+                                    COALESCE(ct2.last_message_at, st2.updated_at, ct2.created_at)
+                                        = COALESCE(ct.last_message_at, st.updated_at, ct.created_at)
+                                    AND ct2.id::text > ct.id::text
+                                )
+                              )
+                    )
+                )
+              )
           {extra_filter}
-        ORDER BY COALESCE(ct.last_message_at, lm.created_at, ct.created_at) DESC, ct.created_at DESC
+        ORDER BY
+            CASE WHEN ct.kind = 'support' THEN 0 ELSE 1 END,
+            COALESCE(ct.last_message_at, lm.created_at, ct.created_at) DESC,
+            ct.created_at DESC
         """,
         tuple(params),
     )
@@ -456,6 +511,7 @@ def _thread_preview_rows(user_id: str, thread_id: str | None = None) -> List[Dic
             "unread_count": int(row[7] or 0),
             "announcement_id": row[8],
             "announcement_title": row[9],
+            "is_pinned": bool(row[10]),
         }
         for row in rows
     ]
@@ -501,7 +557,18 @@ def list_thread_messages(
     lim = max(1, min(int(limit), 100))
     params: List[Any] = [thread_id]
     sql = """
-        SELECT id, thread_id, sender_id, text, created_at, type
+        SELECT
+            id,
+            thread_id,
+            sender_id,
+            text,
+            created_at,
+            type,
+            sender_type,
+            sender_user_account_id,
+            sender_admin_account_id,
+            sender_display_name,
+            sender_label
         FROM chat_messages
         WHERE thread_id = %s
           AND deleted_at IS NULL
@@ -531,6 +598,28 @@ def list_thread_messages(
     return [_message_row_to_dict(row) for row in ordered]
 
 
+def _fetch_chat_message_row(message_id: str):
+    return fetch_one(
+        """
+        SELECT
+            id,
+            thread_id,
+            sender_id,
+            text,
+            created_at,
+            type,
+            sender_type,
+            sender_user_account_id,
+            sender_admin_account_id,
+            sender_display_name,
+            sender_label
+        FROM chat_messages
+        WHERE id = %s
+        """,
+        (message_id,),
+    )
+
+
 def post_thread_message(thread_id: str, sender_id: str, text: str) -> Dict[str, Any]:
     assert_thread_access(thread_id, sender_id)
 
@@ -538,13 +627,25 @@ def post_thread_message(thread_id: str, sender_id: str, text: str) -> Dict[str, 
     if not clean_text:
         raise HTTPException(status_code=400, detail="Message text is required")
 
+    sender_display_name, sender_label = _user_sender_identity(sender_id)
     message_id = str(uuid.uuid4())
     execute(
         """
-        INSERT INTO chat_messages (id, thread_id, sender_id, type, text)
-        VALUES (%s, %s, %s, 'text', %s)
+        INSERT INTO chat_messages (
+            id,
+            thread_id,
+            sender_id,
+            type,
+            text,
+            sender_type,
+            sender_user_account_id,
+            sender_admin_account_id,
+            sender_display_name,
+            sender_label
+        )
+        VALUES (%s, %s, %s, 'text', %s, 'user', %s, NULL, %s, %s)
         """,
-        (message_id, thread_id, sender_id, clean_text),
+        (message_id, thread_id, sender_id, clean_text, sender_id, sender_display_name, sender_label),
     )
     execute(
         """
@@ -582,14 +683,7 @@ def post_thread_message(thread_id: str, sender_id: str, text: str) -> Dict[str, 
             payload={"thread_id": thread_id, "message_id": message_id},
         )
 
-    row = fetch_one(
-        """
-        SELECT id, thread_id, sender_id, text, created_at, type
-        FROM chat_messages
-        WHERE id = %s
-        """,
-        (message_id,),
-    )
+    row = _fetch_chat_message_row(message_id)
     if not row:
         raise HTTPException(status_code=500, detail="Message was not saved")
 
@@ -604,13 +698,23 @@ def post_system_thread_message(thread_id: str, text: str) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Message text is required")
 
     message_id = str(uuid.uuid4())
-    sender_db_value = _system_sender_db_value(thread_id)
     execute(
         """
-        INSERT INTO chat_messages (id, thread_id, sender_id, type, text)
-        VALUES (%s, %s, %s, 'system', %s)
+        INSERT INTO chat_messages (
+            id,
+            thread_id,
+            sender_id,
+            type,
+            text,
+            sender_type,
+            sender_user_account_id,
+            sender_admin_account_id,
+            sender_display_name,
+            sender_label
+        )
+        VALUES (%s, %s, NULL, 'system', %s, 'system', NULL, NULL, 'Система', 'Система')
         """,
-        (message_id, thread_id, sender_db_value, clean_text),
+        (message_id, thread_id, clean_text),
     )
     execute(
         """
@@ -638,14 +742,7 @@ def post_system_thread_message(thread_id: str, text: str) -> Dict[str, Any]:
             payload={"thread_id": thread_id, "message_id": message_id, "sender_id": SYSTEM_CHAT_SENDER_ID},
         )
 
-    row = fetch_one(
-        """
-        SELECT id, thread_id, sender_id, text, created_at, type
-        FROM chat_messages
-        WHERE id = %s
-        """,
-        (message_id,),
-    )
+    row = _fetch_chat_message_row(message_id)
     if not row:
         raise HTTPException(status_code=500, detail="System message was not saved")
 

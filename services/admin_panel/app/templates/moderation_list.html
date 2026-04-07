@@ -3,15 +3,16 @@
 <section class="panel">
   <div class="section-head">
     <div>
-      <p class="eyebrow">Ручная проверка контента</p>
-      <h2>Модерация объявлений</h2>
+      <p class="eyebrow">Ручная проверка task-domain карточек</p>
+      <h2>Модерация</h2>
+      <p class="muted">Список строится по canonical `tasks`, а legacy `announcements` используется только как совместимый projection.</p>
     </div>
   </div>
   <form class="toolbar" method="get">
-    <input type="search" name="search" placeholder="Заголовок, категория или email" value="{{ search }}">
+    <input type="search" name="search" placeholder="ID, заголовок, категория, email или имя" value="{{ search }}">
     <select name="status">
       <option value="">Только очередь</option>
-      {% for value in ["pending_review", "needs_fix", "rejected", "active", "archived"] %}
+      {% for value in ["pending_review", "needs_fix", "rejected", "active", "archived", "deleted"] %}
       <option value="{{ value }}" {% if status_filter == value %}selected{% endif %}>{{ labels.announcement_statuses.get(value, value) }}</option>
       {% endfor %}
     </select>
@@ -26,10 +27,10 @@
     <thead>
       <tr>
         <th>Статус</th>
-        <th>Апелляция</th>
-        <th>Заголовок</th>
-        <th>Пользователь</th>
-        <th>Категория</th>
+        <th>Карточка</th>
+        <th>Автор</th>
+        <th>Сигналы</th>
+        <th>Состояние task</th>
         <th>Обновлено</th>
         <th></th>
       </tr>
@@ -37,16 +38,35 @@
     <tbody>
       {% for item in announcements %}
       <tr>
-        <td><span class="badge">{{ labels.announcement_statuses.get(item.status, item.status) }}</span></td>
-        <td>{% if item.appeal_requested %}Да{% else %}Нет{% endif %}</td>
-        <td>{{ item.title }}</td>
-        <td>{{ item.user_email or item.user_id }}</td>
-        <td>{{ item.category }}</td>
-        <td>{{ format_dt(item.updated_at) }}</td>
+        <td>
+          <span class="badge">{{ labels.announcement_statuses.get(item.status, item.status) }}</span>
+        </td>
+        <td>
+          <strong>{{ item.title }}</strong>
+          <div class="table-meta">{{ item.category or "—" }}</div>
+          <div class="table-meta mono">{{ item.id }}</div>
+        </td>
+        <td>
+          <strong>{{ item.user_display_label }}</strong>
+          <div class="table-meta mono">{{ item.user_id }}</div>
+        </td>
+        <td>
+          <div class="table-meta">Апелляция: {% if item.appeal_requested %}Да{% else %}Нет{% endif %}</div>
+          <div class="table-meta">Медиа: {% if item.has_media %}Есть{% else %}Нет{% endif %}</div>
+          <div class="table-meta">Отклики: {{ item.responses_count }}</div>
+        </td>
+        <td>
+          <div class="table-meta">Task: {{ labels.task_statuses.get(item.task_status, item.task_status or "—") }}</div>
+          <div class="table-meta">Moderation: {{ labels.moderation_statuses.get(item.moderation_status, item.moderation_status or "—") }}</div>
+          {% if item.decision_message %}
+          <div class="table-meta">{{ item.decision_message }}</div>
+          {% endif %}
+        </td>
+        <td>{{ format_dt(item.updated_at or item.created_at) }}</td>
         <td><a class="action-link" href="/admin/announcements/{{ item.id }}">Открыть</a></td>
       </tr>
       {% else %}
-      <tr><td colspan="7">В очереди объявлений нет.</td></tr>
+      <tr><td colspan="7">Карточек в очереди сейчас нет.</td></tr>
       {% endfor %}
     </tbody>
   </table>

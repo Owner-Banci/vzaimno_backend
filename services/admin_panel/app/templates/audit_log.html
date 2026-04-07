@@ -3,23 +3,33 @@
 <section class="panel">
   <div class="section-head">
     <div>
-      <p class="eyebrow">История действий команды</p>
+      <p class="eyebrow">Audit Trail</p>
       <h2>Аудит</h2>
+      <p class="muted">Журнал использует отдельную таблицу <code>audit_logs</code> и сохраняет actor type, actor id, target entity, результат и payload для staff-действий и support/admin сообщений.</p>
     </div>
   </div>
+</section>
+
+<section class="panel">
+  <h3>Фильтры</h3>
   <form class="toolbar" method="get">
-    <input type="search" name="moderator" placeholder="Email модератора" value="{{ moderator }}">
+    <input type="search" name="moderator" placeholder="Логин или почта staff" value="{{ moderator }}">
     <input type="text" name="action_type" placeholder="Тип действия" value="{{ action_type }}">
     <input type="text" name="target_type" placeholder="Тип объекта" value="{{ target_type }}">
     <button type="submit">Показать</button>
   </form>
+</section>
+
+<section class="panel">
+  <h3>События</h3>
   <table class="table">
     <thead>
       <tr>
         <th>Когда</th>
-        <th>Модератор</th>
+        <th>Actor</th>
         <th>Действие</th>
         <th>Объект</th>
+        <th>Результат</th>
         <th>Причина</th>
         <th>Payload</th>
       </tr>
@@ -28,14 +38,23 @@
       {% for action in actions %}
       <tr>
         <td>{{ format_dt(action.created_at) }}</td>
-        <td>{{ action.moderator_email or action.moderator_id }}</td>
+        <td>
+          <strong>{{ action.moderator_display_label }}</strong>
+          <div class="table-meta">{{ action.actor_type }}</div>
+          {% if action.moderator_admin_account_id %}
+          <div class="table-meta mono">{{ action.moderator_admin_account_id }}</div>
+          {% elif action.moderator_id %}
+          <div class="table-meta mono">{{ action.moderator_id }}</div>
+          {% endif %}
+        </td>
         <td>{{ labels.actions.get(action.action_type, action.action_type) }}</td>
         <td>{{ labels.target_types.get(action.target_type, action.target_type) }} / {{ action.target_id }}</td>
+        <td>{{ action.result or "success" }}</td>
         <td>{{ action.reason or "—" }}</td>
         <td><pre>{{ action.payload | tojson(indent=2) }}</pre></td>
       </tr>
       {% else %}
-      <tr><td colspan="6">Действий модерации пока нет.</td></tr>
+      <tr><td colspan="7">Записанных действий пока нет.</td></tr>
       {% endfor %}
     </tbody>
   </table>

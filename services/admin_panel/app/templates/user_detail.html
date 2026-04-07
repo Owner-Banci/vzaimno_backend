@@ -1,26 +1,144 @@
 {% extends "base.html" %}
 {% block content %}
 <section class="panel">
-  <p class="eyebrow">Карточка пользователя</p>
-  <h2>{{ user.email }}</h2>
-  <p><strong>ID:</strong> {{ user.id }}</p>
-  <p><strong>Роль:</strong> {{ labels.roles.get(user.role, user.role) }}</p>
-  <p><strong>Создан:</strong> {{ format_dt(user.created_at) }}</p>
+  <div class="section-head">
+    <div>
+      <p class="eyebrow">Карточка пользователя</p>
+      <h2>{{ user.email }}</h2>
+      <p class="muted">Обычный user account остаётся независимым от admin access и больше не используется как админский principal.</p>
+    </div>
+    <a class="action-link" href="/admin/users">К списку</a>
+  </div>
+
+  <div class="info-grid">
+    <article class="info-card">
+      <span class="info-label">User Account</span>
+      <strong>{{ labels.roles.get(user.role, user.role) }}</strong>
+      <div class="table-meta mono">{{ user.id }}</div>
+      <div class="table-meta">Создан: {{ format_dt(user.created_at) }}</div>
+    </article>
+    <article class="info-card">
+      <span class="info-label">Admin Access</span>
+      <strong>{{ labels.admin_access_statuses.get(user.admin_access.status, user.admin_access.status) }}</strong>
+      {% if user.admin_access.admin_account_id %}
+      <div class="table-meta mono">{{ user.admin_access.admin_account_id }}</div>
+      <div class="table-meta">{{ labels.roles.get(user.admin_access.role, user.admin_access.role or "—") }}</div>
+      {% else %}
+      <div class="table-meta">Отдельный admin principal ещё не создан.</div>
+      {% endif %}
+    </article>
+  </div>
 </section>
 
-{% if is_admin %}
-<section class="panel">
-  <h3>Изменить роль</h3>
-  <form method="post" action="/admin/users/{{ user.id }}/role" class="stack">
-    <select name="role">
-      {% for role in ["user", "support", "moderator", "admin"] %}
-      <option value="{{ role }}" {% if role == user.role %}selected{% endif %}>{{ labels.roles.get(role, role) }}</option>
-      {% endfor %}
-    </select>
-    <button type="submit">Сохранить роль</button>
-  </form>
+<section class="grid two">
+  <article class="panel">
+    <h3>Данные user account</h3>
+    <div class="kv-list">
+      <div><strong>Email:</strong> {{ user.email }}</div>
+      <div><strong>User ID:</strong> <span class="mono">{{ user.id }}</span></div>
+      <div><strong>Системная роль:</strong> {{ labels.roles.get(user.role, user.role) }}</div>
+      <div><strong>Создан:</strong> {{ format_dt(user.created_at) }}</div>
+    </div>
+  </article>
+
+  <article class="panel">
+    <h3>Admin Access</h3>
+    {% if user.admin_access.admin_account_id %}
+    <div class="kv-list">
+      <div><strong>Статус:</strong> {{ labels.admin_access_statuses.get(user.admin_access.status, user.admin_access.status) }}</div>
+      <div><strong>Admin account ID:</strong> <span class="mono">{{ user.admin_access.admin_account_id }}</span></div>
+      <div><strong>Admin login:</strong> {{ user.admin_access.login_identifier }}</div>
+      <div><strong>Admin email:</strong> {{ user.admin_access.email or "—" }}</div>
+      <div><strong>Display name:</strong> {{ user.admin_access.display_name or "—" }}</div>
+      <div><strong>Admin role:</strong> {{ labels.roles.get(user.admin_access.role, user.admin_access.role or "—") }}</div>
+      <div><strong>Создан:</strong> {{ format_dt(user.admin_access.created_at) }}</div>
+      <div><strong>Выдан:</strong> {{ user.admin_access.created_by_display_label or "—" }}</div>
+      <div><strong>Последний вход:</strong> {{ format_dt(user.admin_access.last_login_at) }}</div>
+      <div><strong>Отключён:</strong> {{ format_dt(user.admin_access.disabled_at) }}</div>
+      <div><strong>Password reset required:</strong> {{ "Да" if user.admin_access.password_reset_required else "Нет" }}</div>
+    </div>
+
+    {% if is_admin %}
+    <div class="actions">
+      {% if user.admin_access.is_active %}
+      <form method="post" action="/admin/admin-accounts/{{ user.admin_access.admin_account_id }}/disable" class="inline-form">
+        <input type="hidden" name="user_id" value="{{ user.id }}">
+        <button type="submit">Отключить admin account</button>
+      </form>
+      {% else %}
+      <form method="post" action="/admin/admin-accounts/{{ user.admin_access.admin_account_id }}/enable" class="inline-form">
+        <input type="hidden" name="user_id" value="{{ user.id }}">
+        <button type="submit">Включить admin account</button>
+      </form>
+      {% endif %}
+
+      <form method="post" action="/admin/admin-accounts/{{ user.admin_access.admin_account_id }}/reset-credentials" class="stack">
+        <input type="hidden" name="user_id" value="{{ user.id }}">
+        <label>Новый пароль admin account
+          <input type="password" name="password" minlength="8" required placeholder="Новый пароль для отдельного admin login">
+        </label>
+        <button type="submit">Сбросить credentials</button>
+      </form>
+    </div>
+    {% endif %}
+    {% else %}
+    <p>Для этого пользователя нет отдельного admin account. Выдача staff-доступа делается созданием новой записи в <code>admin_accounts</code>, а не сменой <code>users.role</code>.</p>
+
+    {% if is_admin %}
+    <form method="post" action="/admin/users/{{ user.id }}/admin-access" class="stack">
+      <label>Admin login
+        <input type="text" name="login_identifier" minlength="3" maxlength="255" required placeholder="support-user-01">
+      </label>
+      <label>Display name
+        <input type="text" name="display_name" minlength="2" maxlength="120" required placeholder="Имя сотрудника">
+      </label>
+      <label>Admin email
+        <input type="email" name="email" placeholder="{{ user.email }}">
+      </label>
+      <label>Admin role
+        <select name="role" required>
+          <option value="support">Поддержка</option>
+          <option value="moderator">Модератор</option>
+          <option value="admin">Администратор</option>
+        </select>
+      </label>
+      <label>Стартовый пароль
+        <input type="password" name="password" minlength="8" required placeholder="Отдельный пароль для admin account">
+      </label>
+      <button type="submit">Создать отдельный admin account</button>
+    </form>
+    {% endif %}
+    {% endif %}
+  </article>
 </section>
-{% endif %}
+
+<section class="panel">
+  <h3>Audit Trail</h3>
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Когда</th>
+        <th>Кто</th>
+        <th>Действие</th>
+        <th>Объект</th>
+        <th>Причина</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for action in user.audit_trail %}
+      <tr>
+        <td>{{ format_dt(action.created_at) }}</td>
+        <td>{{ action.moderator_display_label }}</td>
+        <td>{{ labels.actions.get(action.action_type, action.action_type) }}</td>
+        <td>{{ labels.target_types.get(action.target_type, action.target_type) }} / {{ action.target_id }}</td>
+        <td>{{ action.reason or "—" }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5">Записей аудита пока нет.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
 
 <section class="panel">
   <h3>Ограничения</h3>

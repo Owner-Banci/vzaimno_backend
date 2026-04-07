@@ -9,13 +9,14 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
+from app.auth_context import UserPrincipal, get_current_user, get_websocket_user
 from app.bootstrap import ensure_all_tables
 from app.chat import (
     assert_thread_access,
@@ -58,6 +59,7 @@ from app.schemas import (
     RegisterIn,
     ReportCreateIn,
     ReportOut,
+    ReportReasonOptionOut,
     SupportMessageIn,
     SupportMessageOut,
     SupportThreadOut,
@@ -71,7 +73,7 @@ from app.schemas import (
     UserStatsOut,
     UserOut,
 )
-from app.security import create_access_token, decode_token, hash_password, verify_password
+from app.security import create_user_access_token, hash_password, verify_password
 from app.support import get_or_create_support_thread, list_support_messages, post_support_message
 from app.task_compat import (
     announcement_status_to_task_fields,
@@ -95,7 +97,6 @@ from app.task_compat import (
 )
 
 app = FastAPI(title="Slayma Backend (MVP)")
-bearer = HTTPBearer(auto_error=True)
 app.include_router(routes_router)
 
 # ----------------------------
@@ -111,6 +112,62 @@ REVIEW_ROLE_ALL = "all"
 REVIEW_ROLE_CUSTOMER = "customer"
 REVIEW_ROLE_PERFORMER = "performer"
 VALID_REVIEW_ROLES = {REVIEW_ROLE_ALL, REVIEW_ROLE_CUSTOMER, REVIEW_ROLE_PERFORMER}
+REPORT_REASON_OPTIONS: List[Dict[str, Any]] = [
+    {
+        "code": "abuse_insults",
+        "title": "Оскорбления и абьюз",
+        "description": "Грубость, унижения, токсичное общение.",
+        "allowed_target_types": ["message", "user"],
+    },
+    {
+        "code": "spam",
+        "title": "Спам",
+        "description": "Повторяющиеся навязчивые сообщения или нерелевантные предложения.",
+        "allowed_target_types": ["message", "user", "task", "announcement"],
+    },
+    {
+        "code": "scam_suspicious_behavior",
+        "title": "Подозрение на мошенничество",
+        "description": "Подозрительные схемы, выманивание денег или данных.",
+        "allowed_target_types": ["message", "user", "task", "announcement"],
+    },
+    {
+        "code": "fake_information",
+        "title": "Ложная информация",
+        "description": "Неверные сведения о задаче, пользователе или сообщении.",
+        "allowed_target_types": ["message", "user", "task", "announcement"],
+    },
+    {
+        "code": "harassment_threats",
+        "title": "Угрозы и преследование",
+        "description": "Запугивание, угрозы, навязчивое преследование.",
+        "allowed_target_types": ["message", "user"],
+    },
+    {
+        "code": "prohibited_content",
+        "title": "Запрещённый контент",
+        "description": "Нелегальный или запрещённый контент в карточке или сообщении.",
+        "allowed_target_types": ["message", "task", "announcement"],
+    },
+    {
+        "code": "off_platform_coercion",
+        "title": "Увод с платформы",
+        "description": "Принуждение продолжить сделку или общение вне приложения.",
+        "allowed_target_types": ["message", "user", "task", "announcement"],
+    },
+    {
+        "code": "unsafe_behavior",
+        "title": "Небезопасное поведение",
+        "description": "Действия, создающие риск для безопасности участников.",
+        "allowed_target_types": ["message", "user", "task", "announcement"],
+    },
+    {
+        "code": "other",
+        "title": "Другое",
+        "description": "Иная причина, которую пользователь опишет в комментарии.",
+        "allowed_target_types": ["message", "user", "task", "announcement"],
+    },
+]
 
 
 class ReviewFeedItemOut(BaseModel):
@@ -167,53 +224,6 @@ def ensure_tables() -> None:
 # ----------------------------
 # Auth
 # ----------------------------
-def _user_from_token(token: str) -> UserOut:
-    if token == "DEV_TOKEN":
-        return UserOut(id="dev", email="dev@localdomain.com", role="user")
-
-    try:
-        payload = decode_token(token)
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token payload")
-
-    row = fetch_one("SELECT id::text, email, role FROM users WHERE id = %s", (user_id,))
-    if not row:
-        raise HTTPException(status_code=401, detail="User not found")
-
-    return UserOut(id=row[0], email=row[1], role=row[2])
-
-
-def get_current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> UserOut:
-    return _user_from_token(creds.credentials)
-
-
-def _extract_ws_token(websocket: WebSocket) -> Optional[str]:
-    auth_header = websocket.headers.get("authorization")
-    if auth_header:
-        prefix = "bearer "
-        if auth_header.lower().startswith(prefix):
-            token = auth_header[len(prefix) :].strip()
-            if token:
-                return token
-
-    query_token = websocket.query_params.get("token")
-    if query_token:
-        return query_token.strip() or None
-
-    return None
-
-
-def _ws_current_user(websocket: WebSocket) -> UserOut:
-    token = _extract_ws_token(websocket)
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing token")
-    return _user_from_token(token)
-
-
 @app.post("/auth/register", response_model=TokenOut)
 def register(data: RegisterIn) -> TokenOut:
     existing = fetch_one("SELECT 1 FROM users WHERE email=%s", (data.email,))
@@ -229,30 +239,27 @@ def register(data: RegisterIn) -> TokenOut:
     )
     _ensure_profile_and_stats(user_id)
 
-    token = create_access_token({"sub": user_id, "role": "user"})
+    token = create_user_access_token(user_id, role="user")
     return TokenOut(access_token=token)
 
 
 @app.post("/auth/login", response_model=TokenOut)
 def login(data: LoginIn) -> TokenOut:
-    row = fetch_one(
-        "SELECT id::text, password_hash, role FROM users WHERE email=%s",
-        (data.email,),
-    )
+    row = fetch_one("SELECT id::text, password_hash FROM users WHERE email=%s", (data.email,))
     if not row:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    user_id, pwd_hash, role = row
+    user_id, pwd_hash = row
     if not verify_password(data.password, pwd_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    token = create_access_token({"sub": user_id, "role": role})
+    token = create_user_access_token(str(user_id), role="user")
     return TokenOut(access_token=token)
 
 
 @app.get("/me", response_model=UserOut)
-def me(user: UserOut = Depends(get_current_user)) -> UserOut:
-    return user
+def me(user: UserPrincipal = Depends(get_current_user)) -> UserOut:
+    return UserOut(id=user.id, email=user.email, role=user.role)
 
 
 # ----------------------------
@@ -992,6 +999,7 @@ TASK_ANNOUNCEMENT_SELECT = """
         t.customer_id::text,
         COALESCE(c.slug, COALESCE(t.extra->>'category', t.extra->>'main_group', 'help')) AS category_slug,
         t.title,
+        t.description,
         t.extra,
         t.created_at,
         t.status::text,
@@ -1025,46 +1033,135 @@ def _default_category_slug(extra: Dict[str, Any]) -> str:
 
 
 def _task_row_to_announcement(row) -> AnnouncementOut:
-    extra = _normalize_json_object(row[4])
+    extra = _normalize_json_object(row[5])
     payload = {
         "id": row[0],
         "customer_id": row[1],
         "category_slug": row[2] or _default_category_slug(extra),
         "title": row[3],
+        "description": row[4],
         "extra": extra,
-        "created_at": row[5],
-        "task_status": row[6],
-        "moderation_status": row[7],
-        "deleted_at": row[8],
-        "responses_count": row[9],
-        "address_text": row[10],
-        "location_lat": row[11],
-        "location_lon": row[12],
-        "assignment_id": row[13],
-        "assignment_status": row[14],
-        "execution_stage": row[15],
-        "assignment_performer_id": row[16],
-        "assignment_chat_thread_id": row[17],
-        "route_visibility": row[18],
+        "created_at": row[6],
+        "task_status": row[7],
+        "moderation_status": row[8],
+        "deleted_at": row[9],
+        "responses_count": row[10],
+        "address_text": row[11],
+        "location_lat": row[12],
+        "location_lon": row[13],
+        "assignment_id": row[14],
+        "assignment_status": row[15],
+        "execution_stage": row[16],
+        "assignment_performer_id": row[17],
+        "assignment_chat_thread_id": row[18],
+        "route_visibility": row[19],
     }
     return AnnouncementOut(**task_row_to_announcement_dict(payload))
 
 
 def _row_to_report(row) -> ReportOut:
     return ReportOut(
-        id=row[0],
-        reporter_id=row[1],
-        target_type=row[2],
-        target_id=row[3],
-        reason_code=row[4],
+        id=str(row[0]) if row[0] is not None else "",
+        reporter_id=str(row[1]) if row[1] is not None else "",
+        target_type=str(row[2]) if row[2] is not None else "",
+        target_id=str(row[3]) if row[3] is not None else "",
+        reason_code=str(row[4]) if row[4] is not None else "",
         reason_text=row[5],
-        status=row[6],
-        resolution=row[7],
-        resolved_by=row[8],
+        status=str(row[6]) if row[6] is not None else "open",
+        resolution=str(row[7]) if row[7] is not None else None,
+        resolved_by=str(row[8]) if row[8] is not None else None,
         moderator_comment=row[9],
         created_at=row[10],
         resolved_at=row[11],
     )
+
+
+def _prepare_report_target(target_type: str, target_id: str, reporter_id: str) -> tuple[str, str, Dict[str, Any]]:
+    normalized_type = (target_type or "").strip().lower()
+    clean_target_id = str(target_id or "").strip()
+    if normalized_type not in {"announcement", "message", "user", "task"}:
+        raise HTTPException(status_code=400, detail="Unsupported target type")
+    if not is_uuid_like(clean_target_id):
+        raise HTTPException(status_code=400, detail="Invalid target id")
+
+    meta: Dict[str, Any] = {}
+
+    if normalized_type in {"announcement", "task"}:
+        task_row = fetch_one(
+            """
+            SELECT t.id::text,
+                   t.customer_id::text,
+                   t.title
+            FROM tasks t
+            WHERE t.id::text = %s
+            LIMIT 1
+            """,
+            (clean_target_id,),
+        )
+        legacy_row = fetch_one(
+            """
+            SELECT a.id::text
+            FROM announcements a
+            WHERE a.id::text = %s
+              AND a.deleted_at IS NULL
+            LIMIT 1
+            """,
+            (clean_target_id,),
+        )
+        if not task_row and not legacy_row:
+            raise HTTPException(status_code=404, detail="Report target not found")
+        if task_row:
+            meta["source_task_id"] = str(task_row[0])
+            meta["target_user_id"] = str(task_row[1])
+            meta["task_title"] = str(task_row[2] or "")
+        return normalized_type, clean_target_id, meta
+
+    if normalized_type == "user":
+        user_row = fetch_one(
+            """
+            SELECT id::text
+            FROM users
+            WHERE id::text = %s
+            LIMIT 1
+            """,
+            (clean_target_id,),
+        )
+        if not user_row:
+            raise HTTPException(status_code=404, detail="Report target not found")
+        meta["target_user_id"] = str(user_row[0])
+        return normalized_type, clean_target_id, meta
+
+    message_row = fetch_one(
+        """
+        SELECT m.id::text,
+               ct.id::text AS thread_id,
+               COALESCE(ct.task_id::text, ta.task_id::text, tf.task_id::text) AS task_id,
+               m.sender_id::text
+        FROM chat_messages m
+        JOIN chat_threads ct
+          ON ct.id = m.thread_id
+        LEFT JOIN task_assignments ta
+          ON ta.id = ct.assignment_id
+        LEFT JOIN task_offers tf
+          ON tf.id = COALESCE(ct.offer_id, ta.offer_id)
+        JOIN chat_participants cp
+          ON cp.thread_id = ct.id
+         AND cp.user_id::text = %s
+         AND cp.left_at IS NULL
+        WHERE m.id::text = %s
+          AND m.deleted_at IS NULL
+        LIMIT 1
+        """,
+        (reporter_id, clean_target_id),
+    )
+    if not message_row:
+        raise HTTPException(status_code=404, detail="Report target not found")
+    meta["source_message_id"] = str(message_row[0])
+    meta["source_thread_id"] = str(message_row[1])
+    if message_row[2]:
+        meta["source_task_id"] = str(message_row[2])
+    meta["target_user_id"] = str(message_row[3])
+    return normalized_type, clean_target_id, meta
 
 
 def _ensure_obj(x: Any) -> Dict[str, Any]:
@@ -1176,6 +1273,98 @@ def _normalize_message(value: Any) -> Optional[str]:
     return normalized or None
 
 
+def _user_timezone_name(user_id: str, data: Dict[str, Any]) -> Optional[str]:
+    for key in ("timezone", "schedule_timezone", "time_zone"):
+        raw = _normalize_optional_text(data.get(key))
+        if not raw:
+            continue
+        try:
+            ZoneInfo(raw)
+            return raw
+        except Exception:
+            continue
+
+    if not table_has_column("user_devices", "timezone"):
+        return None
+
+    row = fetch_one(
+        """
+        SELECT timezone
+        FROM user_devices
+        WHERE user_id = %s
+          AND deleted_at IS NULL
+          AND timezone IS NOT NULL
+          AND BTRIM(timezone) <> ''
+        ORDER BY last_seen_at DESC, created_at DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+    if not row or not row[0]:
+        return None
+    raw = _normalize_optional_text(row[0])
+    if not raw:
+        return None
+    try:
+        ZoneInfo(raw)
+    except Exception:
+        return None
+    return raw
+
+
+def _normalize_schedule_timestamp(raw_value: Any, timezone_name: Optional[str]) -> Optional[str]:
+    value = _normalize_optional_text(raw_value)
+    if not value:
+        return None
+    if "T" not in value and " " not in value:
+        return value
+
+    normalized = value.replace("Z", "+00:00")
+    try:
+        dt_value = datetime.fromisoformat(normalized)
+    except ValueError:
+        return value
+
+    if dt_value.tzinfo is None:
+        if not timezone_name:
+            return dt_value.replace(microsecond=0).isoformat()
+        try:
+            dt_value = dt_value.replace(tzinfo=ZoneInfo(timezone_name))
+        except Exception:
+            return dt_value.replace(microsecond=0).isoformat()
+        return dt_value.replace(microsecond=0).isoformat()
+
+    if not timezone_name:
+        return dt_value.replace(microsecond=0).isoformat()
+
+    try:
+        return dt_value.astimezone(ZoneInfo(timezone_name)).replace(microsecond=0).isoformat()
+    except Exception:
+        return dt_value.replace(microsecond=0).isoformat()
+
+
+def _normalize_schedule_fields_for_user(*, user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    timezone_name = _user_timezone_name(user_id, data)
+    task = data.get("task") if isinstance(data.get("task"), dict) else None
+    route = task.get("route") if isinstance(task, dict) and isinstance(task.get("route"), dict) else None
+    if timezone_name:
+        data["timezone"] = timezone_name
+        data.setdefault("schedule_timezone", timezone_name)
+        if route is not None:
+            route["timezone"] = timezone_name
+
+    for key in ("start_at", "end_at"):
+        source_value = data.get(key)
+        if source_value is None and route is not None:
+            source_value = route.get(key)
+        normalized = _normalize_schedule_timestamp(source_value, timezone_name)
+        if normalized:
+            data[key] = normalized
+            if route is not None:
+                route[key] = normalized
+    return data
+
+
 def _parse_float(value: Any) -> Optional[float]:
     if isinstance(value, (int, float)):
         return float(value)
@@ -1272,6 +1461,88 @@ def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _sync_legacy_announcement_projection(
+    task_id: str,
+    *,
+    user_id: str,
+    category: str,
+    title: str,
+    task_status: str,
+    moderation_status: str,
+    data: Dict[str, Any],
+    deleted_at: Any = None,
+    created_at: Optional[datetime] = None,
+    updated_at: Optional[datetime] = None,
+) -> None:
+    legacy_status = task_to_announcement_status(task_status, moderation_status, deleted_at)
+    point = primary_map_point(data)
+    normalized_category = (
+        _normalize_optional_text(data.get("category"), collapse_spaces=True)
+        or _normalize_optional_text(category, collapse_spaces=True)
+        or "help"
+    )
+    created_value = created_at or datetime.now(timezone.utc)
+    updated_value = updated_at or created_value
+    payload_json = json.dumps(data, ensure_ascii=False)
+
+    existing = fetch_one("SELECT 1 FROM announcements WHERE id::text = %s", (task_id,))
+    params = (
+        user_id,
+        normalized_category.lower(),
+        title,
+        legacy_status,
+        payload_json,
+        created_value,
+        updated_value,
+        deleted_at,
+        point[1] if point else None,
+        point[0] if point else None,
+        point[1] if point else None,
+        point[0] if point else None,
+        task_id,
+    )
+    if existing:
+        execute(
+            """
+            UPDATE announcements
+            SET user_id = %s,
+                category = %s,
+                title = %s,
+                status = %s,
+                data = %s::jsonb,
+                created_at = COALESCE(created_at, %s),
+                updated_at = %s,
+                deleted_at = %s,
+                location_point = CASE
+                    WHEN %s::double precision IS NULL OR %s::double precision IS NULL THEN NULL
+                    ELSE ST_SetSRID(ST_MakePoint(%s::double precision, %s::double precision), 4326)::geography
+                END
+            WHERE id::text = %s
+            """,
+            params,
+        )
+        return
+
+    execute(
+        """
+        INSERT INTO announcements (
+            user_id, category, title, status, data,
+            created_at, updated_at, deleted_at, location_point, id
+        )
+        VALUES (
+            %s, %s, %s, %s, %s::jsonb,
+            %s, %s, %s,
+            CASE
+                WHEN %s::double precision IS NULL OR %s::double precision IS NULL THEN NULL
+                ELSE ST_SetSRID(ST_MakePoint(%s::double precision, %s::double precision), 4326)::geography
+            END,
+            %s
+        )
+        """,
+        params,
+    )
+
+
 def _offer_avatar_select_sql() -> str:
     if _profile_has_extra_column():
         return "up.extra->>'avatar_url' AS avatar_url"
@@ -1366,6 +1637,22 @@ def _fetch_announcement_or_404(ann_id: str) -> AnnouncementOut:
     return _task_row_to_announcement(_fetch_task_row_or_404(ann_id))
 
 
+def _sync_legacy_announcement_from_current_task(task_id: str) -> None:
+    row = _fetch_task_row_or_404(task_id)
+    announcement = _task_row_to_announcement(row)
+    _sync_legacy_announcement_projection(
+        task_id,
+        user_id=announcement.user_id,
+        category=announcement.category,
+        title=announcement.title,
+        task_status=str(row[7] or ""),
+        moderation_status=str(row[8] or ""),
+        data=dict(announcement.data or {}),
+        deleted_at=row[9],
+        created_at=row[6],
+    )
+
+
 def _count_pending_offers(task_id: str) -> int:
     row = fetch_one(
         """
@@ -1396,6 +1683,7 @@ def _sync_announcement_offers_count(task_id: str) -> int:
         """,
         (offers_count, offers_count, offers_count, task_id),
     )
+    _sync_legacy_announcement_from_current_task(task_id)
     return offers_count
 
 
@@ -1494,6 +1782,7 @@ def _task_columns_from_payload(
         announcement_status=legacy_status,
         deleted_at=deleted_at,
     )
+    normalized_data = _normalize_schedule_fields_for_user(user_id=user_id, data=normalized_data)
     task_status, moderation_status = announcement_status_to_task_fields(
         legacy_status,
         deleted=deleted_at is not None,
@@ -1521,7 +1810,7 @@ def _task_columns_from_payload(
         "closed_at": closed_at,
         "reoffer_policy": _normalize_optional_text(normalized_data.get("offer_policy", {}).get("reoffer_policy")) or "blocked_after_reject",
         "customer_comment": _normalize_optional_text(normalized_data.get("notes")),
-        "description": _normalize_optional_text(normalized_data.get("generated_description")) or _normalize_optional_text(normalized_data.get("notes")) or title,
+        "description": _normalize_optional_text(normalized_data.get("description")) or _normalize_optional_text(normalized_data.get("generated_description")) or _normalize_optional_text(normalized_data.get("notes")) or title,
     }
 
 
@@ -1534,6 +1823,7 @@ def _insert_task(task_id: str, user_id: str, category: str, title: str, legacy_s
         data=data,
     )
     point = fields["point"]
+    created_at = datetime.now(timezone.utc)
     execute(
         """
         INSERT INTO tasks (
@@ -1557,7 +1847,7 @@ def _insert_task(task_id: str, user_id: str, category: str, title: str, legacy_s
             %s, %s, NULL,
             %s, %s,
             0, 0, 0, NULL,
-            %s::jsonb, now(), now(), %s, %s, NULL,
+            %s::jsonb, %s, %s, %s, %s, NULL,
             %s, %s, %s, %s
         )
         """,
@@ -1578,6 +1868,8 @@ def _insert_task(task_id: str, user_id: str, category: str, title: str, legacy_s
             fields["task_status"],
             fields["moderation_status"],
             json.dumps(fields["data"], ensure_ascii=False),
+            created_at,
+            created_at,
             fields["published_at"],
             fields["closed_at"],
             fields["budget_min"],
@@ -1585,6 +1877,17 @@ def _insert_task(task_id: str, user_id: str, category: str, title: str, legacy_s
             fields["quick_offer_price"],
             fields["reoffer_policy"],
         ),
+    )
+    _sync_legacy_announcement_projection(
+        task_id,
+        user_id=user_id,
+        category=category,
+        title=title,
+        task_status=fields["task_status"],
+        moderation_status=fields["moderation_status"],
+        data=fields["data"],
+        created_at=created_at,
+        updated_at=created_at,
     )
     _sync_task_route_points(task_id, fields["data"])
     execute(
@@ -1614,9 +1917,10 @@ def _update_task_content(
         legacy_status=legacy_status,
         data=data,
         deleted_at=deleted_at,
-        has_accepted_offer=bool(current[13]),
+        has_accepted_offer=bool(current[14]),
     )
     point = fields["point"]
+    updated_at = datetime.now(timezone.utc)
     execute(
         """
         UPDATE tasks
@@ -1644,7 +1948,7 @@ def _update_task_content(
             budget_max = %s,
             quick_offer_price = %s,
             reoffer_policy = %s,
-            updated_at = now()
+            updated_at = %s
         WHERE id::text = %s
         """,
         (
@@ -1669,8 +1973,20 @@ def _update_task_content(
             fields["budget_max"],
             fields["quick_offer_price"],
             fields["reoffer_policy"],
+            updated_at,
             task_id,
         ),
+    )
+    _sync_legacy_announcement_projection(
+        task_id,
+        user_id=user_id,
+        category=category,
+        title=title,
+        task_status=fields["task_status"],
+        moderation_status=fields["moderation_status"],
+        data=fields["data"],
+        deleted_at=deleted_at,
+        updated_at=updated_at,
     )
     _sync_task_route_points(task_id, fields["data"])
 
@@ -1747,6 +2063,7 @@ def _create_or_update_assignment(task_id: str, offer_id: str, customer_id: str, 
         """,
         (str(uuid.uuid4()), task_id, customer_id, "offer_accepted"),
     )
+    _sync_legacy_announcement_from_current_task(task_id)
     return assignment_id
 
 
@@ -2573,6 +2890,15 @@ def update_announcement_execution_stage(
         """,
         (next_task_status, json.dumps(data_obj, ensure_ascii=False), next_task_status, ann_id),
     )
+    _sync_legacy_announcement_projection(
+        ann_id,
+        user_id=ann.user_id,
+        category=ann.category,
+        title=ann.title,
+        task_status=next_task_status,
+        moderation_status="published",
+        data=data_obj,
+    )
     if previous_task_status != next_task_status:
         execute(
             """
@@ -2581,22 +2907,6 @@ def update_announcement_execution_stage(
             """,
             (str(uuid.uuid4()), ann_id, previous_task_status, next_task_status, user.id, "execution_stage_updated"),
         )
-
-    legacy_announcement_status = STATUS_ACTIVE
-    if new_stage == "completed":
-        legacy_announcement_status = "completed"
-    elif new_stage == "cancelled":
-        legacy_announcement_status = "cancelled"
-    execute(
-        """
-        UPDATE announcements
-        SET status = %s,
-            updated_at = now()
-        WHERE id::text = %s
-          AND deleted_at IS NULL
-        """,
-        (legacy_announcement_status, ann_id),
-    )
 
     if chat_thread_id:
         if new_stage == "completed":
@@ -2681,7 +2991,7 @@ def _parse_ws_chat_text(raw_message: str) -> Optional[str]:
 @app.websocket("/ws/chats/{thread_id}")
 async def chat_websocket(thread_id: str, websocket: WebSocket) -> None:
     try:
-        user = _ws_current_user(websocket)
+        user = get_websocket_user(websocket)
     except HTTPException:
         await websocket.close(code=4401)
         return
@@ -2725,21 +3035,29 @@ async def chat_websocket(thread_id: str, websocket: WebSocket) -> None:
 # ----------------------------
 # Reports
 # ----------------------------
+@app.get("/reports/reason-codes", response_model=List[ReportReasonOptionOut])
+def list_report_reason_codes() -> List[ReportReasonOptionOut]:
+    return [ReportReasonOptionOut(**item) for item in REPORT_REASON_OPTIONS]
+
+
 @app.post("/reports", response_model=ReportOut, status_code=201)
 def submit_report(
     payload: ReportCreateIn,
     user: UserOut = Depends(get_current_user),
 ) -> ReportOut:
-    allowed_targets = {"announcement", "message", "user", "task"}
-    if payload.target_type not in allowed_targets:
-        raise HTTPException(status_code=400, detail="Unsupported target type")
+    canonical_target_type, canonical_target_id, report_meta = _prepare_report_target(
+        payload.target_type,
+        payload.target_id,
+        user.id,
+    )
 
     report_id = create_report(
         reporter_id=user.id,
-        target_type=payload.target_type,
-        target_id=payload.target_id,
-        reason_code=payload.reason_code,
+        target_type=canonical_target_type,
+        target_id=canonical_target_id,
+        reason_code=(payload.reason_code or "").strip(),
         reason_text=payload.reason_text,
+        meta=report_meta,
     )
     row = fetch_one(
         f"""
@@ -2760,7 +3078,7 @@ def submit_report(
 # ----------------------------
 @app.get("/support/thread", response_model=SupportThreadOut)
 def get_support_thread(user: UserOut = Depends(get_current_user)) -> SupportThreadOut:
-    return SupportThreadOut(thread_id=get_or_create_support_thread(user.id))
+    return SupportThreadOut(thread_id=str(get_or_create_support_thread(user.id)))
 
 
 @app.get("/support/thread/{thread_id}/messages", response_model=List[SupportMessageOut])

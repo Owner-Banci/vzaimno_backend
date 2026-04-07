@@ -1,44 +1,161 @@
 {% extends "base.html" %}
 {% block content %}
-{% set data = announcement.data or {} %}
-{% set moderation = data.get("moderation", {}) %}
-{% set media = data.get("media", []) %}
+{% set summary = announcement.moderation_summary or {} %}
+{% set appeal = summary.get("appeal", {}) %}
 <section class="panel">
-  <p class="eyebrow">Карточка объявления</p>
-  <h2>{{ announcement.title }}</h2>
-  <p><strong>ID:</strong> {{ announcement.id }}</p>
-  <p><strong>Пользователь:</strong> {{ announcement.user_email or announcement.user_id }}</p>
-  <p><strong>Статус:</strong> {{ labels.announcement_statuses.get(announcement.status, announcement.status) }}</p>
-  <p><strong>Категория:</strong> {{ announcement.category }}</p>
-  <p><strong>Создано:</strong> {{ format_dt(announcement.created_at) }}</p>
-  <p><strong>Обновлено:</strong> {{ format_dt(announcement.updated_at) }}</p>
+  <div class="section-head">
+    <div>
+      <p class="eyebrow">Human-readable view</p>
+      <h2>{{ announcement.title }}</h2>
+      <p class="muted">Модератор работает с canonical task-представлением. JSON ниже остаётся только вспомогательным режимом.</p>
+    </div>
+    <a class="action-link" href="/admin/announcements">К списку</a>
+  </div>
+
+  <div class="info-grid">
+    <div class="info-card">
+      <span class="info-label">Статус</span>
+      <strong>{{ labels.announcement_statuses.get(announcement.status, announcement.status) }}</strong>
+      <div class="table-meta">Task: {{ labels.task_statuses.get(announcement.task_status, announcement.task_status or "—") }}</div>
+      <div class="table-meta">Moderation: {{ labels.moderation_statuses.get(announcement.moderation_status, announcement.moderation_status or "—") }}</div>
+      <div class="table-meta">Legacy: {{ labels.announcement_statuses.get(announcement.legacy_status, announcement.legacy_status or "—") }}</div>
+    </div>
+    <div class="info-card">
+      <span class="info-label">Автор</span>
+      <strong>{{ announcement.user_display_name }}</strong>
+      <div class="table-meta">{{ announcement.user_email or "—" }}</div>
+      <div class="table-meta mono">{{ announcement.user_id }}</div>
+    </div>
+    <div class="info-card">
+      <span class="info-label">Основное</span>
+      <strong>{{ announcement.category }}</strong>
+      <div class="table-meta">Создано: {{ format_dt(announcement.created_at) }}</div>
+      <div class="table-meta">Обновлено: {{ format_dt(announcement.updated_at) }}</div>
+      <div class="table-meta">Опубликовано: {{ format_dt(announcement.published_at) }}</div>
+    </div>
+    <div class="info-card">
+      <span class="info-label">Цена и отклики</span>
+      <strong>
+        {% if announcement.reward_amount %}
+        {{ announcement.reward_amount }} ₽
+        {% elif announcement.quick_offer_price %}
+        {{ announcement.quick_offer_price }} ₽
+        {% else %}
+        —
+        {% endif %}
+      </strong>
+      <div class="table-meta">Price type: {{ announcement.price_type or "—" }}</div>
+      <div class="table-meta">Budget: {{ announcement.budget_min or "—" }} - {{ announcement.budget_max or "—" }}</div>
+      <div class="table-meta">Отклики: {{ announcement.responses_count }}</div>
+    </div>
+  </div>
 </section>
 
 <section class="grid two">
   <article class="panel">
-    <h3>Данные объявления</h3>
-    <pre>{{ data | tojson(indent=2) }}</pre>
+    <h3>Описание и адрес</h3>
+    <p>{{ announcement.description }}</p>
+    <div class="kv-list">
+      <div><strong>Адрес:</strong> {{ announcement.address_text or "—" }}</div>
+      <div><strong>Маршрут:</strong> {{ announcement.source_address or "—" }}{% if announcement.destination_address %} → {{ announcement.destination_address }}{% endif %}</div>
+      <div><strong>Координаты:</strong> {% if announcement.location_lat is not none and announcement.location_lon is not none %}{{ announcement.location_lat }}, {{ announcement.location_lon }}{% else %}—{% endif %}</div>
+      <div><strong>Accepted offer:</strong> {{ announcement.accepted_offer_id or "—" }}</div>
+      <div><strong>Удалено:</strong> {{ format_dt(announcement.deleted_at) }}</div>
+      <div><strong>Закрыто:</strong> {{ format_dt(announcement.closed_at) }}</div>
+    </div>
   </article>
+
   <article class="panel">
-    <h3>Данные модерации</h3>
-    <pre>{{ moderation | tojson(indent=2) }}</pre>
+    <h3>Сводка модерации</h3>
+    <div class="kv-list">
+      <div><strong>Последнее решение:</strong> {{ labels.announcement_statuses.get(summary.get("decision_status"), summary.get("decision_status") or "—") }}</div>
+      <div><strong>Сообщение:</strong> {{ summary.get("decision_message") or "—" }}</div>
+      <div><strong>Апелляция:</strong> {% if appeal.get("requested") %}Запрошена{% else %}Нет{% endif %}</div>
+    </div>
+    {% if summary.get("reasons") %}
+    <div class="list-block">
+      <strong>Причины</strong>
+      {% for reason in summary.get("reasons", []) %}
+      <div class="list-row">
+        <span class="badge">{{ reason.code }}</span>
+        <div>
+          <div><strong>{{ reason.field }}</strong></div>
+          <div class="table-meta">{{ reason.details }}</div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+    {% if summary.get("suggestions") %}
+    <div class="list-block">
+      <strong>Рекомендации</strong>
+      {% for suggestion in summary.get("suggestions", []) %}
+      <div class="table-meta">• {{ suggestion }}</div>
+      {% endfor %}
+    </div>
+    {% endif %}
   </article>
 </section>
+
+{% if announcement.route_points %}
+<section class="panel">
+  <h3>Маршрут</h3>
+  <div class="route-list">
+    {% for point in announcement.route_points %}
+    <article class="route-card">
+      <strong>{{ point.title }}</strong>
+      <div class="table-meta">{{ point.address_text or "—" }}</div>
+      <div class="table-meta">Kind: {{ point.point_kind or "—" }}</div>
+      <div class="table-meta">{% if point.lat is not none and point.lon is not none %}{{ point.lat }}, {{ point.lon }}{% else %}—{% endif %}</div>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if announcement.sections %}
+<section class="panel">
+  <h3>Дополнительные параметры</h3>
+  <div class="grid two">
+    {% for section in announcement.sections %}
+    <article class="info-card">
+      <span class="info-label">{{ section.title }}</span>
+      {% for item in section["items"] %}
+      <div class="table-meta"><strong>{{ item.label }}:</strong> {{ item.value }}</div>
+      {% endfor %}
+    </article>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if announcement.assignment %}
+<section class="panel">
+  <h3>Назначение</h3>
+  <div class="kv-list">
+    <div><strong>Assignment:</strong> {{ announcement.assignment.id }}</div>
+    <div><strong>Статус:</strong> {{ labels.task_statuses.get(announcement.assignment.assignment_status, announcement.assignment.assignment_status or "—") }}</div>
+    <div><strong>Этап:</strong> {{ announcement.assignment.execution_stage or "—" }}</div>
+    <div><strong>Исполнитель:</strong> {{ announcement.assignment.performer_display_name }}</div>
+    <div><strong>Email:</strong> {{ announcement.assignment.performer_email or "—" }}</div>
+    <div><strong>Chat thread:</strong> {{ announcement.assignment.chat_thread_id or "—" }}</div>
+    <div><strong>Route visibility:</strong> {{ announcement.assignment.route_visibility or "—" }}</div>
+  </div>
+</section>
+{% endif %}
 
 <section class="panel">
   <h3>Медиа</h3>
   <div class="media-grid">
-    {% for item in media %}
+    {% for item in announcement.media %}
     <div class="media-card">
-      {% if item.path %}
-      <img src="/{{ item.path }}" alt="{{ item.filename or 'media' }}">
-      {% endif %}
-      <p>{{ item.filename }}</p>
-      <p><strong>NSFW:</strong> {{ item.nsfw }}</p>
-      <p><strong>Метка:</strong> {{ item.top_label }}</p>
+      <img src="{{ item.url }}" alt="{{ item.filename or 'media' }}">
+      <p><strong>{{ item.filename }}</strong></p>
+      <p><strong>NSFW:</strong> {{ item.nsfw if item.nsfw is not none else "—" }}</p>
+      <p><strong>Метка:</strong> {{ item.top_label or "—" }}</p>
     </div>
     {% else %}
-    <p>Медиа не загружены.</p>
+    <p>Медиа не найдены в payload.</p>
     {% endfor %}
   </div>
 </section>
@@ -46,40 +163,49 @@
 <section class="panel">
   <h3>Решение модератора</h3>
   <form method="post" action="/admin/announcements/{{ announcement.id }}/decision" class="stack">
-    <label>Сообщение пользователю</label>
-    <textarea name="message" rows="4" required>{{ moderation.get("decision", {}).get("message", "") }}</textarea>
+    <label>Сообщение пользователю
+      <textarea name="message" rows="4" required>{{ summary.get("decision_message") or "" }}</textarea>
+    </label>
 
     <div class="grid two">
-      <div>
-        <label>Поле причины</label>
-        <input type="text" name="reason_field" placeholder="media / title / notes">
-      </div>
-      <div>
-        <label>Код причины</label>
-        <input type="text" name="reason_code" placeholder="NSFW_REVIEW / TEXT_ILLEGAL">
-      </div>
+      <label>Поле причины
+        <input type="text" name="reason_field" placeholder="media / description / route / price">
+      </label>
+      <label>Код причины
+        <input type="text" name="reason_code" placeholder="NSFW_REVIEW / FAKE_INFO / PROHIBITED_CONTENT">
+      </label>
     </div>
 
-    <label>Описание причины</label>
-    <textarea name="reason_details" rows="2"></textarea>
+    <label>Описание причины
+      <textarea name="reason_details" rows="3" placeholder="Что именно должен исправить пользователь"></textarea>
+    </label>
 
-    <label>Рекомендации для исправления (по одной на строку)</label>
-    <textarea name="suggestions" rows="4">{% for suggestion in moderation.get("suggestions", []) %}{{ suggestion }}
+    <label>Рекомендации для исправления
+      <textarea name="suggestions" rows="4" placeholder="По одной рекомендации на строку">{% for suggestion in summary.get("suggestions", []) %}{{ suggestion }}
 {% endfor %}</textarea>
+    </label>
 
-    <label>Можно ли оспорить</label>
-    <select name="can_appeal">
-      <option value="true">Да</option>
-      <option value="false">Нет</option>
-    </select>
+    <label>Можно ли оспорить
+      <select name="can_appeal">
+        <option value="true" {% if appeal.get("can_appeal", True) %}selected{% endif %}>Да</option>
+        <option value="false" {% if not appeal.get("can_appeal", True) %}selected{% endif %}>Нет</option>
+      </select>
+    </label>
 
     <div class="actions">
       <button type="submit" name="decision" value="approve">Одобрить</button>
-      <button type="submit" name="decision" value="needs_fix">На доработку</button>
+      <button type="submit" name="decision" value="needs_fix">Нужно исправить</button>
       <button type="submit" name="decision" value="reject">Отклонить</button>
-      <button type="submit" name="decision" value="archive">В архив</button>
       <button type="submit" name="decision" value="delete" class="danger">Удалить</button>
     </div>
+    <p class="muted">Action `archive` сохранён в backend только для совместимости, но из интерфейса скрыт как дублирующий неактивное состояние.</p>
   </form>
+</section>
+
+<section class="panel">
+  <details class="details-block">
+    <summary>Показать JSON</summary>
+    <pre>{{ announcement.raw_json | tojson(indent=2) }}</pre>
+  </details>
 </section>
 {% endblock %}

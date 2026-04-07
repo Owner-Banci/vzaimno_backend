@@ -22,6 +22,37 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class AdminAccount(Base):
+    __tablename__ = "admin_accounts"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    login_identifier: Mapped[str] = mapped_column(String, nullable=False)
+    email: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    password_hash: Mapped[str] = mapped_column(String, nullable=False)
+    role: Mapped[str] = mapped_column(String, nullable=False, default="support")
+    status: Mapped[str] = mapped_column(String, nullable=False, default="active")
+    display_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    linked_user_account_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    created_by_admin_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    mfa_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=sa_text("FALSE"),
+    )
+    mfa_secret: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    disabled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    password_reset_required: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=sa_text("FALSE"),
+    )
+
+
 class Announcement(Base):
     __tablename__ = "announcements"
 
