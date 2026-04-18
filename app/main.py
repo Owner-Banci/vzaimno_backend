@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -213,7 +213,39 @@ UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", "uploads"))
 NSFW_REVIEW = float(os.getenv("NSFW_REVIEW", "0.30"))
 NSFW_HARD_BLOCK = float(os.getenv("NSFW_HARD_BLOCK", "0.85"))
 
-app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR), check_dir=False), name="uploads")
+@app.get("/uploads/{ann_id}/{filename}")
+def download_announcement_media(
+    ann_id: str,
+    filename: str,
+    user: UserPrincipal = Depends(get_current_user),
+) -> FileResponse:
+    """Serve an uploaded file only to users who have access to the announcement.
+
+    Replaces the previous ``app.mount("/uploads", StaticFiles(...))`` which
+    served any file to anyone who knew the URL. Access reuses
+    ``_user_can_fetch_announcement`` (owner / active performer / public-listed
+    task). Path traversal is blocked by rejecting separators and '..' in both
+    path parts and by resolving the path inside ``UPLOADS_DIR``.
+    """
+    for part_name, part_value in (("ann_id", ann_id), ("filename", filename)):
+        if "/" in part_value or "\\" in part_value or ".." in part_value:
+            raise HTTPException(status_code=400, detail=f"Invalid {part_name}")
+
+    uploads_root = UPLOADS_DIR.resolve()
+    file_path = (uploads_root / ann_id / filename).resolve()
+    try:
+        file_path.relative_to(uploads_root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid path")
+
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    ann = _fetch_announcement_or_404(ann_id)
+    if not _user_can_fetch_announcement(ann_id, user.id, ann.user_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    return FileResponse(str(file_path))
 
 
 @app.on_event("startup")

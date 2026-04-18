@@ -1,0 +1,57 @@
+# --- Secrets / environment ---------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# --- Virtual environments ----------------------------------------------------
+venv/
+.venv/
+env/
+ENV/
+
+# --- Testing / coverage ------------------------------------------------------
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- OS ----------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+
+# --- IDE ---------------------------------------------------------------------
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+
+# --- Local uploads (dev data; do NOT commit user media) ----------------------
+uploads/*
+!uploads/.gitkeep
+
+# --- Developer artifacts: combined-code dumps (may contain secrets) ----------
+CombinedCode*.pdf
+CombinedCode*.py
+temp_code_export/
+
+# --- ML model caches ---------------------------------------------------------
+.cache/
+*.pt
+*.pth
+
+# --- Logs --------------------------------------------------------------------
+*.log
+logs/
+
+# --- Docker local overrides --------------------------------------------------
+docker-compose.override.yml

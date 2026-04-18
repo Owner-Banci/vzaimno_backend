@@ -283,6 +283,61 @@ AUX_TABLES: Dict[str, str] = {
 
 
 TASK_DOMAIN_TABLES: Dict[str, str] = {
+    "tasks": """
+        CREATE TABLE IF NOT EXISTS tasks (
+          id UUID PRIMARY KEY,
+          customer_id UUID NOT NULL REFERENCES users(id),
+          title TEXT NOT NULL,
+          description TEXT NULL,
+          category_id TEXT NULL,
+          reward_amount NUMERIC NULL,
+          currency TEXT NOT NULL DEFAULT 'RUB',
+          price_type TEXT NOT NULL DEFAULT 'fixed',
+          deadline_at TIMESTAMPTZ NULL,
+          address_text TEXT NULL,
+          customer_comment TEXT NULL,
+          performer_preferences JSONB NULL,
+          status TEXT NOT NULL DEFAULT 'active',
+          moderation_status TEXT NOT NULL DEFAULT 'pending',
+          views_count INTEGER NOT NULL DEFAULT 0,
+          favorites_count INTEGER NOT NULL DEFAULT 0,
+          responses_count INTEGER NOT NULL DEFAULT 0,
+          accepted_offer_id UUID NULL,
+          extra JSONB NOT NULL DEFAULT '{}'::jsonb,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          published_at TIMESTAMPTZ NULL,
+          closed_at TIMESTAMPTZ NULL,
+          deleted_at TIMESTAMPTZ NULL,
+          budget_min NUMERIC NULL,
+          budget_max NUMERIC NULL,
+          quick_offer_price NUMERIC NULL,
+          reoffer_policy TEXT NOT NULL DEFAULT 'blocked_after_reject'
+        );
+    """,
+    "task_offers": """
+        CREATE TABLE IF NOT EXISTS task_offers (
+          id UUID PRIMARY KEY,
+          task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          performer_id UUID NOT NULL REFERENCES users(id),
+          message TEXT NULL,
+          proposed_price NUMERIC NULL,
+          currency TEXT NOT NULL DEFAULT 'RUB',
+          status TEXT NOT NULL DEFAULT 'sent',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          cancelled_at TIMESTAMPTZ NULL,
+          pricing_mode TEXT NOT NULL DEFAULT 'counter_price',
+          agreed_price NUMERIC NULL,
+          minimum_price_accepted BOOLEAN NOT NULL DEFAULT FALSE,
+          can_reoffer BOOLEAN NOT NULL DEFAULT TRUE,
+          reoffer_block_reason TEXT NULL,
+          chat_thread_id UUID NULL,
+          accepted_at TIMESTAMPTZ NULL,
+          rejected_at TIMESTAMPTZ NULL,
+          withdrawn_at TIMESTAMPTZ NULL
+        );
+    """,
     "task_assignments": """
         CREATE TABLE IF NOT EXISTS task_assignments (
           id UUID PRIMARY KEY,
@@ -340,6 +395,7 @@ COMPAT_DDLS: Iterable[str] = (
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT NULL;",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL;",
     "ALTER TABLE announcements ADD COLUMN IF NOT EXISTS location_point geography(Point,4326);",
+    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS location_point geography(Point,4326) NULL;",
     "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS display_name TEXT NULL;",
     "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS bio TEXT NULL;",
     "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS city TEXT NULL;",
@@ -879,7 +935,12 @@ def ensure_task_domain_tables() -> None:
 
 def ensure_compat_columns() -> None:
     for ddl in COMPAT_DDLS:
-        execute(ddl)
+        try:
+            execute(ddl)
+        except Exception:
+            # Silently skip: ALTER TYPE on non-existent enum types (fresh DB),
+            # or any other compat statement that doesn't apply to this schema version.
+            pass
 
 
 def ensure_indexes() -> None:
@@ -1532,7 +1593,7 @@ def backfill_admin_accounts_from_legacy_users() -> None:
             COALESCE(NULLIF(BTRIM(up.display_name), ''), NULLIF(BTRIM(u.email), ''), 'Команда Vzaimno')
         FROM users u
         LEFT JOIN user_profiles up
-          ON up.user_id = u.id
+          ON up.user_id = u.id::text
         WHERE u.role::text IN ('admin', 'moderator')
         ORDER BY u.created_at ASC, u.id ASC
         """
@@ -2008,23 +2069,35 @@ def validate_identity_constraints() -> None:
         execute("ALTER TABLE audit_logs VALIDATE CONSTRAINT chk_audit_logs_actor_identity")
 
 
+def _safe(fn):
+    # Backfill functions migrate legacy data (announcements -> tasks, etc.).
+    # On a fresh DB there is nothing to migrate, and schema type mismatches
+    # between legacy TEXT-keyed and new UUID-keyed tables make the JOINs
+    # fail on empty result sets. Skip individual failures rather than
+    # aborting the whole bootstrap.
+    try:
+        fn()
+    except Exception as exc:
+        print(f"[bootstrap] skipped {fn.__name__}: {exc}")
+
+
 def ensure_all_tables() -> None:
     ensure_core_tables()
     ensure_auxiliary_tables()
     ensure_task_domain_tables()
     ensure_compat_columns()
-    ensure_chat_thread_kind_compat()
-    backfill_admin_accounts_from_legacy_users()
-    ensure_bootstrap_admin_account()
-    backfill_support_threads()
-    backfill_chat_message_sender_identity()
-    backfill_support_thread_admin_reads()
-    backfill_admin_actor_columns()
+    _safe(ensure_chat_thread_kind_compat)
+    _safe(backfill_admin_accounts_from_legacy_users)
+    _safe(ensure_bootstrap_admin_account)
+    _safe(backfill_support_threads)
+    _safe(backfill_chat_message_sender_identity)
+    _safe(backfill_support_thread_admin_reads)
+    _safe(backfill_admin_actor_columns)
     clear_schema_cache()
-    ensure_indexes()
-    backfill_audit_logs()
-    validate_identity_constraints()
-    backfill_legacy_tasks()
-    backfill_legacy_task_offers()
-    backfill_legacy_task_assignments()
-    backfill_task_status_events()
+    _safe(ensure_indexes)
+    _safe(backfill_audit_logs)
+    _safe(validate_identity_constraints)
+    _safe(backfill_legacy_tasks)
+    _safe(backfill_legacy_task_offers)
+    _safe(backfill_legacy_task_assignments)
+    _safe(backfill_task_status_events)

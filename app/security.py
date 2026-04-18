@@ -58,12 +58,35 @@ def verify_password(password: str, password_hash: str) -> bool:
         return bcrypt.checkpw(_password_bytes(password)[:72], encoded_hash)
 
 
-JWT_SECRET = os.getenv("JWT_SECRET", "DEV_JWT_SECRET_CHANGE_ME")
+_KNOWN_PLACEHOLDER_SECRETS = {
+    "",
+    "DEV_JWT_SECRET_CHANGE_ME",
+    "CHANGE_ME_SUPER_SECRET",
+    "CHANGE_ME",
+}
+
+
+def _require_secret(var_name: str, value: str | None) -> str:
+    normalized = (value or "").strip()
+    if normalized in _KNOWN_PLACEHOLDER_SECRETS:
+        raise RuntimeError(
+            f"{var_name} is not set or uses a known placeholder value. "
+            f"Generate a strong random secret (>=32 bytes) and put it in .env "
+            f"as {var_name}=...\n"
+            f"  Example:\n"
+            f"    python3 -c \"import secrets; print(secrets.token_urlsafe(48))\""
+        )
+    return normalized
+
+
+JWT_SECRET = _require_secret("JWT_SECRET", os.getenv("JWT_SECRET"))
 JWT_ALG = os.getenv("JWT_ALG", "HS256")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "10080"))
-ADMIN_JWT_SECRET = os.getenv("ADMIN_JWT_SECRET", JWT_SECRET)
+ADMIN_JWT_SECRET = _require_secret(
+    "ADMIN_JWT_SECRET", os.getenv("ADMIN_JWT_SECRET") or JWT_SECRET
+)
 ADMIN_JWT_ALG = os.getenv("ADMIN_JWT_ALG", JWT_ALG)
-ADMIN_JWT_EXPIRE_MINUTES = int(os.getenv("ADMIN_JWT_EXPIRE_MINUTES", str(JWT_EXPIRE_MINUTES)))
+ADMIN_JWT_EXPIRE_MINUTES = int(os.getenv("ADMIN_JWT_EXPIRE_MINUTES") or JWT_EXPIRE_MINUTES)
 USER_TOKEN_AUDIENCE = os.getenv("USER_TOKEN_AUDIENCE", "user-api")
 ADMIN_TOKEN_AUDIENCE = os.getenv("ADMIN_TOKEN_AUDIENCE", "admin-api")
 

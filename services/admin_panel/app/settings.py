@@ -32,9 +32,29 @@ def get_settings() -> Settings:
     if not database_url:
         raise RuntimeError("DATABASE_URL is not set")
 
-    jwt_secret = os.getenv("JWT_SECRET", "DEV_JWT_SECRET_CHANGE_ME")
+    _placeholder_secrets = {
+        "",
+        "DEV_JWT_SECRET_CHANGE_ME",
+        "CHANGE_ME_SUPER_SECRET",
+        "CHANGE_ME",
+    }
+
+    jwt_secret = (os.getenv("JWT_SECRET") or "").strip()
+    if jwt_secret in _placeholder_secrets:
+        raise RuntimeError(
+            "JWT_SECRET is not set or uses a known placeholder value. "
+            "Generate a strong random secret (>=32 bytes) and put it in .env "
+            "as JWT_SECRET=...\n"
+            "  Example:\n"
+            "    python3 -c \"import secrets; print(secrets.token_urlsafe(48))\""
+        )
+
     jwt_alg = os.getenv("JWT_ALG", "HS256")
-    session_secret = os.getenv("ADMIN_SESSION_SECRET", jwt_secret)
+    session_secret = (os.getenv("ADMIN_SESSION_SECRET") or jwt_secret).strip()
+    if session_secret in _placeholder_secrets:
+        raise RuntimeError(
+            "ADMIN_SESSION_SECRET (or JWT_SECRET fallback) is not set or uses a placeholder."
+        )
 
     return Settings(
         database_url=database_url,

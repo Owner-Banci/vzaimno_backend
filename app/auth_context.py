@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -11,6 +12,19 @@ from app.security import decode_user_access_token
 
 
 bearer = HTTPBearer(auto_error=True)
+
+
+# The hardcoded "DEV_TOKEN" bypass is only accepted when the process is
+# explicitly started in dev mode AND the opt-in flag is set. In any other
+# environment this bypass is completely off.
+#
+# To enable locally, put BOTH in .env:
+#   ENV=dev
+#   ALLOW_DEV_TOKEN=1
+_DEV_TOKEN_ALLOWED = (
+    os.getenv("ENV", "").strip().lower() == "dev"
+    and os.getenv("ALLOW_DEV_TOKEN", "").strip().lower() in {"1", "true", "yes"}
+)
 
 
 @dataclass(frozen=True)
@@ -37,7 +51,7 @@ def _extract_ws_token(websocket: WebSocket) -> Optional[str]:
 
 
 def user_from_token(token: str) -> UserPrincipal:
-    if token == "DEV_TOKEN":
+    if _DEV_TOKEN_ALLOWED and token == "DEV_TOKEN":
         return UserPrincipal(id="dev", email="dev@localdomain.com", role="user")
 
     try:
