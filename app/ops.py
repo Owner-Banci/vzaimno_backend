@@ -8,6 +8,8 @@ from typing import Any, Dict, Optional, Sequence
 from app.db import execute, fetch_all, fetch_one
 from app.schema_compat import get_table_columns, table_has_column
 
+NOTIFICATION_BODY_MAX_LEN = 2000
+
 
 def _build_insert_sql(table_name: str, values: Dict[str, Any], jsonb_columns: set[str] | None = None) -> tuple[str, tuple[Any, ...]]:
     jsonb_columns = jsonb_columns or set()
@@ -119,6 +121,13 @@ def _notification_user_id_requires_uuid() -> bool:
     return str(row[0]).lower() == "uuid"
 
 
+def _normalize_notification_body(body: str) -> str:
+    normalized = str(body or "").strip()
+    if len(normalized) <= NOTIFICATION_BODY_MAX_LEN:
+        return normalized
+    return normalized[: NOTIFICATION_BODY_MAX_LEN - 3].rstrip() + "..."
+
+
 def create_notification(
     user_id: str,
     notif_type: str,
@@ -133,7 +142,12 @@ def create_notification(
             return notification_id
 
     columns = get_table_columns("notifications")
-    values: Dict[str, Any] = {"id": notification_id, "user_id": user_id, "type": notif_type, "body": body}
+    values: Dict[str, Any] = {
+        "id": notification_id,
+        "user_id": user_id,
+        "type": notif_type,
+        "body": _normalize_notification_body(body),
+    }
     if "payload" in columns:
         values["payload"] = payload or {}
     if "is_read" in columns:
@@ -163,7 +177,7 @@ def create_report(
     if "reason_text" in columns:
         values["reason_text"] = reason_text
     if "status" in columns:
-        values["status"] = _enum_value("reports", "status", "new", ("open", "in_review"))
+        values["status"] = _enum_value("reports", "status", "open", ("new", "in_review"))
     if "meta" in columns:
         values["meta"] = meta or {}
     sql, params = _build_insert_sql(

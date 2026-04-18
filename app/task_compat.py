@@ -552,6 +552,10 @@ def task_row_to_announcement_dict(row: Dict[str, Any]) -> Dict[str, Any]:
 
     if row.get("location_lat") is not None and row.get("location_lon") is not None:
         data.setdefault("point", {"lat": float(row["location_lat"]), "lon": float(row["location_lon"])})
+    else:
+        fallback_point = primary_map_point(data) or destination_point(data)
+        if fallback_point:
+            data.setdefault("point", {"lat": float(fallback_point[0]), "lon": float(fallback_point[1])})
 
     description = (
         normalize_optional_text(row.get("description"))

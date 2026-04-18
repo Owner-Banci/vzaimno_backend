@@ -83,6 +83,7 @@ from app.task_compat import (
     derive_budget_bounds,
     derive_quick_offer_price,
     derive_reward_amount,
+    destination_point,
     ensure_task_payload,
     is_uuid_like,
     legacy_offer_status_to_canonical,
@@ -1091,6 +1092,55 @@ def _task_row_to_announcement(row) -> AnnouncementOut:
     return AnnouncementOut(**task_row_to_announcement_dict(payload))
 
 
+def _fetch_task_row(task_id: str):
+    return fetch_one(
+        f"""
+        {TASK_ANNOUNCEMENT_SELECT}
+        WHERE t.id::text = %s
+        """,
+        (task_id,),
+    )
+
+
+def _repair_announcement_row_if_needed(row):
+    if not row:
+        return row
+    if row[12] is not None and row[13] is not None:
+        return row
+
+    extra = _normalize_json_object(row[5])
+    category = (
+        _normalize_optional_text(extra.get("category"), collapse_spaces=True)
+        or row[2]
+        or _default_category_slug(extra)
+    )
+    announcement_status = task_to_announcement_status(
+        row[7],
+        row[8],
+        row[9],
+        assignment_status=row[15],
+        execution_stage=row[16],
+    )
+    data = ensure_task_payload(
+        extra,
+        title=row[3] or "",
+        announcement_status=announcement_status,
+        deleted_at=row[9],
+        assignment={
+            "id": row[14],
+            "assignment_status": row[15],
+            "execution_stage": row[16],
+            "performer_id": row[17],
+            "chat_thread_id": row[18],
+            "route_visibility": row[19],
+        },
+    )
+    if not _persist_repaired_task_point(str(row[0]), category, data):
+        return row
+
+    return _fetch_task_row(str(row[0])) or row
+
+
 def _row_to_report(row) -> ReportOut:
     return ReportOut(
         id=str(row[0]) if row[0] is not None else "",
@@ -1427,6 +1477,106 @@ def _point_obj(point: Tuple[float, float]) -> Dict[str, float]:
     return {"lat": point[0], "lon": point[1]}
 
 
+def _task_route_node(data: Dict[str, Any], key: str) -> Dict[str, Any]:
+    task = data.get("task")
+    if not isinstance(task, dict):
+        task = {}
+        data["task"] = task
+
+    route = task.get("route")
+    if not isinstance(route, dict):
+        route = {}
+        task["route"] = route
+
+    node = route.get(key)
+    if not isinstance(node, dict):
+        node = {}
+        route[key] = node
+    return node
+
+
+def _source_point_from_payload(category: str, data: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    normalized_category = (category or "").strip().lower()
+    route_source = _task_route_node(data, "source")
+
+    if normalized_category == "delivery":
+        return (
+            _extract_point(data.get("pickup_point"))
+            or _extract_point(data.get("source_point"))
+            or _extract_point(data.get("start_point"))
+            or _extract_point(route_source.get("point"))
+            or _extract_point(data.get("point"))
+        )
+
+    if normalized_category == "help":
+        return (
+            _extract_point(data.get("help_point"))
+            or _extract_point(data.get("source_point"))
+            or _extract_point(data.get("start_point"))
+            or _extract_point(route_source.get("point"))
+            or _extract_point(data.get("point"))
+        )
+
+    return (
+        _extract_point(data.get("point"))
+        or _extract_point(data.get("source_point"))
+        or _extract_point(data.get("start_point"))
+        or _extract_point(route_source.get("point"))
+    )
+
+
+def _destination_point_from_payload(data: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    route_destination = _task_route_node(data, "destination")
+    return destination_point(data) or _extract_point(route_destination.get("point"))
+
+
+def _store_source_point(category: str, data: Dict[str, Any], point: Tuple[float, float]) -> None:
+    normalized_category = (category or "").strip().lower()
+    point_obj = _point_obj(point)
+
+    if normalized_category == "delivery":
+        data["pickup_point"] = point_obj
+    elif normalized_category == "help":
+        data["help_point"] = point_obj
+    else:
+        data["point"] = point_obj
+
+    data.setdefault("point", point_obj)
+    _task_route_node(data, "source")["point"] = point_obj
+
+
+def _store_destination_point(category: str, data: Dict[str, Any], point: Tuple[float, float]) -> None:
+    normalized_category = (category or "").strip().lower()
+    point_obj = _point_obj(point)
+
+    if normalized_category == "delivery":
+        data["dropoff_point"] = point_obj
+    else:
+        data["destination_point"] = point_obj
+
+    _task_route_node(data, "destination")["point"] = point_obj
+
+
+def _ensure_payload_points(category: str, data: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    source_point = _source_point_from_payload(category, data)
+    if source_point is None:
+        source_address = primary_source_address(data)
+        if source_address:
+            source_point = geocode_address(source_address)
+    if source_point is not None:
+        _store_source_point(category, data, source_point)
+
+    destination_fallback_point = _destination_point_from_payload(data)
+    if destination_fallback_point is None:
+        destination_address = primary_destination_address(data)
+        if destination_address:
+            destination_fallback_point = geocode_address(destination_address)
+    if destination_fallback_point is not None:
+        _store_destination_point(category, data, destination_fallback_point)
+
+    return source_point or primary_map_point(data) or destination_fallback_point
+
+
 def _normalize_budget_fields(data: Dict[str, Any]) -> None:
     for key in ("budget", "budget_min", "budget_max"):
         if key not in data:
@@ -1478,6 +1628,59 @@ def _announcement_point_for_storage(category: str, data: Dict[str, Any]) -> Opti
     if normalized_category == "help":
         return _extract_point(data.get("help_point")) or _extract_point(data.get("point"))
     return _extract_point(data.get("point"))
+
+
+def _persist_repaired_task_point(task_id: str, category: str, data: Dict[str, Any]) -> bool:
+    point = _ensure_payload_points(category, data)
+    if point is None:
+        return False
+
+    payload_json = json.dumps(data, ensure_ascii=False)
+    address_text = _normalize_optional_text(data.get("address_text"), collapse_spaces=True) or primary_source_address(data)
+
+    execute(
+        """
+        UPDATE tasks
+        SET extra = %s::jsonb,
+            address_text = COALESCE(%s, address_text),
+            location_point = CASE
+                WHEN %s::double precision IS NULL OR %s::double precision IS NULL THEN location_point
+                ELSE ST_SetSRID(ST_MakePoint(%s::double precision, %s::double precision), 4326)::geography
+            END,
+            updated_at = now()
+        WHERE id::text = %s
+        """,
+        (
+            payload_json,
+            address_text,
+            point[1],
+            point[0],
+            point[1],
+            point[0],
+            task_id,
+        ),
+    )
+    execute(
+        """
+        UPDATE announcements
+        SET data = %s::jsonb,
+            location_point = CASE
+                WHEN %s::double precision IS NULL OR %s::double precision IS NULL THEN location_point
+                ELSE ST_SetSRID(ST_MakePoint(%s::double precision, %s::double precision), 4326)::geography
+            END,
+            updated_at = now()
+        WHERE id::text = %s
+        """,
+        (
+            payload_json,
+            point[1],
+            point[0],
+            point[1],
+            point[0],
+            task_id,
+        ),
+    )
+    return True
 
 
 def _save_upload(ann_id: str, file: UploadFile, content: bytes) -> str:
@@ -1653,13 +1856,7 @@ def _announcement_exists(task_id: str) -> bool:
 
 
 def _fetch_task_row_or_404(task_id: str):
-    row = fetch_one(
-        f"""
-        {TASK_ANNOUNCEMENT_SELECT}
-        WHERE t.id::text = %s
-        """,
-        (task_id,),
-    )
+    row = _repair_announcement_row_if_needed(_fetch_task_row(task_id))
     if not row:
         raise HTTPException(status_code=404, detail="Announcement not found")
     return row
@@ -1823,7 +2020,7 @@ def _task_columns_from_payload(
     budget_min, budget_max = derive_budget_bounds(normalized_data)
     quick_offer_price = derive_quick_offer_price(normalized_data)
     reward_amount = derive_reward_amount(normalized_data)
-    point = _announcement_point_for_storage(category, normalized_data) or primary_map_point(normalized_data)
+    point = _ensure_payload_points(category, normalized_data)
     address_text = _normalize_optional_text(normalized_data.get("address_text"), collapse_spaces=True) or primary_source_address(normalized_data)
     published_at = datetime.now(timezone.utc) if moderation_status == "published" and task_status in {"published", "in_responses"} else None
     closed_at = datetime.now(timezone.utc) if task_status in {"closed", "completed", "cancelled"} or deleted_at is not None else None
@@ -3153,6 +3350,7 @@ def my_announcements(user: UserOut = Depends(get_current_user)) -> List[Announce
         """,
         (user.id,),
     )
+    rows = [_repair_announcement_row_if_needed(row) for row in rows]
     return [_task_row_to_announcement(r) for r in rows]
 
 
@@ -3177,6 +3375,7 @@ def public_announcements(limit: int = 200) -> List[AnnouncementOut]:
         """,
         (lim,),
     )
+    rows = [_repair_announcement_row_if_needed(row) for row in rows]
     return [_task_row_to_announcement(r) for r in rows]
 
 

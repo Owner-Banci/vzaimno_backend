@@ -3,11 +3,56 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from pathlib import Path
 from typing import Dict, Iterable, Sequence
 
-from app.db import execute, fetch_all, fetch_one
+import psycopg
+
+from app.db import DATABASE_URL, execute, fetch_all, fetch_one
 from app.security import hash_password
 from app.schema_compat import clear_schema_cache, table_has_columns
+
+
+SCHEMA_SQL_PATH = Path(__file__).resolve().parent / "schema.sql"
+
+
+def _db_is_empty() -> bool:
+    """Return True if the core `users` table does not yet exist.
+
+    We treat presence of `users` as the signal that schema.sql has
+    already been applied (the v2 schema creates it in section 1, so
+    an empty DB will have no such relation).
+    """
+    row = fetch_one("SELECT to_regclass('public.users') IS NOT NULL")
+    return not bool(row and row[0])
+
+
+def _apply_schema_sql() -> None:
+    """Apply the release-grade v2 schema from app/schema.sql in one atomic tx."""
+    if not SCHEMA_SQL_PATH.exists():
+        raise RuntimeError(
+            f"[bootstrap] schema.sql not found at {SCHEMA_SQL_PATH}. "
+            f"The backend ships this file alongside bootstrap.py; if it is "
+            f"missing, restore it from version control before starting the app."
+        )
+
+    sql = SCHEMA_SQL_PATH.read_text(encoding="utf-8")
+    print(f"[bootstrap] empty database detected — applying {SCHEMA_SQL_PATH.name} ...")
+
+    # Use a short-lived dedicated connection with autocommit OFF so the whole
+    # schema file is applied as a single transaction. The shared db.conn is
+    # autocommit=True which would defeat the point.
+    with psycopg.connect(DATABASE_URL) as schema_conn:
+        schema_conn.autocommit = False
+        try:
+            with schema_conn.cursor() as cur:
+                cur.execute(sql)
+            schema_conn.commit()
+        except Exception:
+            schema_conn.rollback()
+            raise
+
+    print("[bootstrap] schema.sql applied successfully.")
 from app.task_compat import (
     TASK_PUBLIC_STATUSES,
     announcement_status_to_task_fields,
@@ -100,6 +145,14 @@ AUX_TABLES: Dict[str, str] = {
           created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           deleted_at TIMESTAMPTZ NULL
+        );
+    """,
+    "categories": """
+        CREATE TABLE IF NOT EXISTS categories (
+          id UUID PRIMARY KEY,
+          slug TEXT NOT NULL UNIQUE,
+          name TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
     """,
     "announcement_offers": """
@@ -289,7 +342,7 @@ TASK_DOMAIN_TABLES: Dict[str, str] = {
           customer_id UUID NOT NULL REFERENCES users(id),
           title TEXT NOT NULL,
           description TEXT NULL,
-          category_id TEXT NULL,
+          category_id UUID NULL REFERENCES categories(id),
           reward_amount NUMERIC NULL,
           currency TEXT NOT NULL DEFAULT 'RUB',
           price_type TEXT NOT NULL DEFAULT 'fixed',
@@ -967,6 +1020,125 @@ def ensure_chat_thread_kind_compat() -> None:
     udt_name = str(row[1] or "").lower()
     if data_type == "user-defined" and udt_name == "chat_thread_kind":
         execute("ALTER TYPE chat_thread_kind ADD VALUE IF NOT EXISTS 'offer';")
+
+
+def _replace_check_constraint(table_name: str, constraint_name: str, predicate_sql: str) -> None:
+    execute(f"ALTER TABLE {table_name} DROP CONSTRAINT IF EXISTS {constraint_name}")
+    execute(f"ALTER TABLE {table_name} ADD CONSTRAINT {constraint_name} CHECK ({predicate_sql})")
+
+
+def ensure_release_schema_compat() -> None:
+    """Repair known drift between release schema.sql and live code paths."""
+    if table_exists("chat_participants") and table_has_columns("chat_participants", ("role",)):
+        _replace_check_constraint(
+            "chat_participants",
+            "chk_chat_participants_role",
+            "role IN ('owner', 'performer', 'customer', 'support', 'admin', 'user')",
+        )
+        if table_has_columns("chat_participants", ("user_id", "thread_id", "left_at")):
+            execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chat_participants_active_user_thread
+                ON chat_participants(user_id, thread_id)
+                WHERE left_at IS NULL
+                """
+            )
+
+    if table_exists("notifications") and table_has_columns("notifications", ("type",)):
+        _replace_check_constraint(
+            "notifications",
+            "chk_notifications_type",
+            """
+            type IN (
+                'chat', 'chat_system', 'task', 'offer', 'support', 'system',
+                'review', 'review_received', 'offer_accepted', 'offer_rejected',
+                'moderation', 'report'
+            )
+            """,
+        )
+
+    if table_exists("task_route_points") and table_has_columns("task_route_points", ("point_kind",)):
+        _replace_check_constraint(
+            "task_route_points",
+            "chk_task_route_points_kind",
+            """
+            point_kind IS NULL OR point_kind IN (
+                'pickup', 'delivery', 'help', 'waypoint', 'start', 'end',
+                'source', 'destination'
+            )
+            """,
+        )
+
+    if table_exists("user_restrictions"):
+        for legacy_value, canonical_value in (
+            ("publish_ban", "restrict_posting"),
+            ("response_ban", "restrict_offers"),
+            ("temp_ban", "temporary_ban"),
+            ("perm_ban", "permanent_ban"),
+            ("custom_restriction", "custom"),
+        ):
+            execute(
+                """
+                UPDATE user_restrictions
+                SET type = %s
+                WHERE type = %s
+                """,
+                (canonical_value, legacy_value),
+            )
+
+        if table_has_columns("user_restrictions", ("type",)):
+            _replace_check_constraint(
+                "user_restrictions",
+                "chk_user_restrictions_type",
+                """
+                type IN (
+                    'warning', 'mute_chat', 'restrict_posting', 'restrict_offers',
+                    'temporary_ban', 'permanent_ban', 'custom', 'shadowban'
+                )
+                """,
+            )
+        if table_has_columns("user_restrictions", ("status",)):
+            _replace_check_constraint(
+                "user_restrictions",
+                "chk_user_restrictions_status",
+                "status IN ('active', 'revoked', 'expired')",
+            )
+        if table_has_columns("user_restrictions", ("source_type",)):
+            _replace_check_constraint(
+                "user_restrictions",
+                "chk_user_restrictions_source_type",
+                "source_type IS NULL OR source_type IN ('manual', 'report', 'moderation')",
+            )
+        if table_has_columns("user_restrictions", ("reason_text",)):
+            _replace_check_constraint(
+                "user_restrictions",
+                "chk_user_restrictions_reason_text_len",
+                "reason_text IS NULL OR char_length(reason_text) <= 2000",
+            )
+        if table_has_columns("user_restrictions", ("revocation_reason",)):
+            _replace_check_constraint(
+                "user_restrictions",
+                "chk_user_restrictions_revocation_reason_len",
+                "revocation_reason IS NULL OR char_length(revocation_reason) <= 2000",
+            )
+        if table_has_columns("user_restrictions", ("starts_at", "ends_at", "revoked_at")):
+            _replace_check_constraint(
+                "user_restrictions",
+                "chk_user_restrictions_time_order",
+                """
+                (ends_at IS NULL OR ends_at >= starts_at)
+                AND (revoked_at IS NULL OR revoked_at >= starts_at)
+                """,
+            )
+        if table_has_columns("user_restrictions", ("status", "starts_at")):
+            execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_user_restrictions_status_starts_at
+                ON user_restrictions(status, starts_at DESC)
+                """
+            )
+
+    clear_schema_cache()
 
 
 def _category_id_for_slug(slug: str) -> str | None:
@@ -1813,7 +1985,7 @@ def backfill_chat_message_sender_identity() -> None:
         LEFT JOIN users u
           ON u.id = m.sender_id
         LEFT JOIN user_profiles up
-          ON up.user_id = m.sender_id
+          ON up.user_id = m.sender_id::text
         LEFT JOIN admin_accounts aa
           ON aa.linked_user_account_id = m.sender_id
         ORDER BY m.created_at ASC, m.id ASC
@@ -1921,7 +2093,7 @@ def backfill_admin_actor_columns() -> None:
             FROM admin_accounts aa
             WHERE r.resolved_by_admin_account_id IS NULL
               AND r.resolved_by IS NOT NULL
-              AND aa.linked_user_account_id = r.resolved_by
+              AND aa.linked_user_account_id::text = r.resolved_by
             """
         )
 
@@ -1933,7 +2105,7 @@ def backfill_admin_actor_columns() -> None:
             FROM admin_accounts aa
             WHERE ur.issued_by_admin_account_id IS NULL
               AND ur.issued_by IS NOT NULL
-              AND aa.linked_user_account_id = ur.issued_by
+              AND aa.linked_user_account_id::text = ur.issued_by
             """
         )
         execute(
@@ -2069,6 +2241,24 @@ def validate_identity_constraints() -> None:
         execute("ALTER TABLE audit_logs VALIDATE CONSTRAINT chk_audit_logs_actor_identity")
 
 
+def seed_default_categories() -> None:
+    defaults = [
+        ("errands", "Помощь / поручения"),
+        ("delivery", "Доставка"),
+        ("shopping", "Покупки"),
+        ("help", "Помощь"),
+    ]
+    for slug, name in defaults:
+        execute(
+            """
+            INSERT INTO categories (id, slug, name)
+            VALUES (gen_random_uuid(), %s, %s)
+            ON CONFLICT (slug) DO NOTHING
+            """,
+            (slug, name),
+        )
+
+
 def _safe(fn):
     # Backfill functions migrate legacy data (announcements -> tasks, etc.).
     # On a fresh DB there is nothing to migrate, and schema type mismatches
@@ -2082,22 +2272,25 @@ def _safe(fn):
 
 
 def ensure_all_tables() -> None:
-    ensure_core_tables()
-    ensure_auxiliary_tables()
-    ensure_task_domain_tables()
-    ensure_compat_columns()
-    _safe(ensure_chat_thread_kind_compat)
-    _safe(backfill_admin_accounts_from_legacy_users)
-    _safe(ensure_bootstrap_admin_account)
-    _safe(backfill_support_threads)
-    _safe(backfill_chat_message_sender_identity)
-    _safe(backfill_support_thread_admin_reads)
-    _safe(backfill_admin_actor_columns)
+    """Ensure the database schema is ready for the backend to run.
+
+    Two paths:
+      1) Empty database → apply app/schema.sql (v2 release-grade schema) in
+         one atomic transaction. No legacy CREATE / ALTER / backfill dance.
+      2) Already-populated database → assume v2 schema is in place and only
+         seed the bootstrap admin account if configured. We intentionally do
+         NOT run the legacy backfill pipeline any more: the new schema is the
+         source of truth, and the backfills were one-off v1→v2 migrations.
+    """
+    if _db_is_empty():
+        _apply_schema_sql()
+
+    # Post-apply (or on already-initialized DB): repair known schema drift,
+    # ensure runtime indexes exist, and seed a bootstrap super-admin if
+    # ADMIN_BOOTSTRAP_LOGIN / ADMIN_BOOTSTRAP_PASSWORD are set in the env.
+    # All of this is idempotent.
     clear_schema_cache()
+    _safe(ensure_release_schema_compat)
     _safe(ensure_indexes)
-    _safe(backfill_audit_logs)
     _safe(validate_identity_constraints)
-    _safe(backfill_legacy_tasks)
-    _safe(backfill_legacy_task_offers)
-    _safe(backfill_legacy_task_assignments)
-    _safe(backfill_task_status_events)
+    _safe(ensure_bootstrap_admin_account)

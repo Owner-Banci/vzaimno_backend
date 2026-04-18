@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from app.bootstrap import ensure_all_tables
 from app.db import execute, fetch_one
 from app.main import _insert_task, app as public_app
+from app.ops import create_notification, create_report
 from app.security import hash_password
 from app.support import ensure_support_participant, get_or_create_support_thread
 from services.admin_panel.app import crud as admin_crud
@@ -27,6 +28,7 @@ class AdminIdentitySeparationIntegrationTests(unittest.TestCase):
         self.admin_ids: list[str] = []
         self.thread_ids: list[str] = []
         self.task_ids: list[str] = []
+        self.report_ids: list[str] = []
 
     def tearDown(self) -> None:
         for thread_id in self.thread_ids:
@@ -52,6 +54,10 @@ class AdminIdentitySeparationIntegrationTests(unittest.TestCase):
             execute("DELETE FROM moderation_actions WHERE target_id = %s", (task_id,))
             execute("DELETE FROM tasks WHERE id = %s::uuid", (task_id,))
 
+        for report_id in self.report_ids:
+            execute("DELETE FROM audit_logs WHERE target_type = 'report' AND target_id = %s", (report_id,))
+            execute("DELETE FROM reports WHERE id = %s", (report_id,))
+
         for admin_id in self.admin_ids:
             execute("DELETE FROM admin_sessions WHERE admin_account_id = %s::uuid", (admin_id,))
             execute("DELETE FROM audit_logs WHERE actor_admin_account_id = %s::uuid OR target_id = %s", (admin_id, admin_id))
@@ -64,7 +70,7 @@ class AdminIdentitySeparationIntegrationTests(unittest.TestCase):
             execute("DELETE FROM user_stats WHERE user_id = %s::uuid", (user_id,))
             execute("DELETE FROM user_devices WHERE user_id = %s::uuid", (user_id,))
             execute("DELETE FROM audit_logs WHERE actor_user_account_id = %s::uuid OR target_id = %s", (user_id, user_id))
-            execute("DELETE FROM moderation_actions WHERE moderator_id = %s::uuid OR target_id = %s", (user_id, user_id))
+            execute("DELETE FROM moderation_actions WHERE moderator_id = %s OR target_id = %s", (user_id, user_id))
             execute("DELETE FROM users WHERE id = %s::uuid", (user_id,))
 
     def _create_user(self, prefix: str) -> dict[str, str]:
@@ -81,10 +87,9 @@ class AdminIdentitySeparationIntegrationTests(unittest.TestCase):
                 is_email_verified,
                 is_phone_verified,
                 created_at,
-                updated_at,
-                last_seen_at
+                updated_at
             )
-            VALUES (%s::uuid, %s, %s, 'user', TRUE, FALSE, now(), now(), now())
+            VALUES (%s::uuid, %s, %s, 'user', TRUE, FALSE, now(), now())
             """,
             (user_id, email, hash_password(password)),
         )
@@ -356,6 +361,26 @@ class AdminIdentitySeparationIntegrationTests(unittest.TestCase):
             )
             self.assertIsNotNone(row)
 
+    def test_runtime_schema_repairs_allow_current_backend_values(self) -> None:
+        ensure_all_tables()
+        expectations = {
+            "chk_chat_participants_role": "'user'",
+            "chk_notifications_type": "'review_received'",
+            "chk_user_restrictions_type": "'shadowban'",
+        }
+        for constraint_name, expected_fragment in expectations.items():
+            row = fetch_one(
+                """
+                SELECT pg_get_constraintdef(oid)
+                FROM pg_constraint
+                WHERE conname = %s
+                LIMIT 1
+                """,
+                (constraint_name,),
+            )
+            self.assertIsNotNone(row, constraint_name)
+            self.assertIn(expected_fragment, str(row[0]), constraint_name)
+
     def test_existing_support_messages_are_migrated_to_explicit_sender_identity(self) -> None:
         ensure_all_tables()
         invalid_row = fetch_one(
@@ -463,6 +488,130 @@ class AdminIdentitySeparationIntegrationTests(unittest.TestCase):
         support_threads = [item for item in response.json() if item["kind"] == "support"]
         self.assertEqual(len(support_threads), 1)
         self.assertEqual(support_threads[0]["thread_id"], stale_thread_id)
+
+    def test_notifications_accept_runtime_types_and_truncate_long_body(self) -> None:
+        owner = self._create_user("notif-owner")
+        runtime_types = [
+            "chat",
+            "chat_system",
+            "task",
+            "offer",
+            "support",
+            "system",
+            "review",
+            "review_received",
+            "offer_accepted",
+            "offer_rejected",
+            "moderation",
+            "report",
+        ]
+        body = "x" * 2500
+        created_ids = []
+        for notif_type in runtime_types:
+            created_ids.append(
+                create_notification(
+                    user_id=owner["id"],
+                    notif_type=notif_type,
+                    body=body,
+                    payload={"type": notif_type},
+                )
+            )
+
+        row = fetch_one(
+            """
+            SELECT COUNT(*), MAX(char_length(body))
+            FROM notifications
+            WHERE user_id = %s::uuid
+            """,
+            (owner["id"],),
+        )
+        self.assertEqual(int(row[0] or 0), len(runtime_types))
+        self.assertLessEqual(int(row[1] or 0), 2000)
+
+        stored = fetch_one(
+            """
+            SELECT body
+            FROM notifications
+            WHERE id = %s
+            """,
+            (created_ids[0],),
+        )
+        self.assertIsNotNone(stored)
+        self.assertTrue(str(stored[0]).endswith("..."))
+
+    def test_report_resolution_creates_canonical_restriction_and_notifications(self) -> None:
+        reporter = self._create_user("reporter")
+        target = self._create_user("reported")
+        staff_user = self._create_user("report-staff")
+        self._create_admin_account(linked_user_id=staff_user["id"], prefix="report-admin", role="moderator")
+
+        report_id = create_report(
+            reporter_id=reporter["id"],
+            target_type="user",
+            target_id=target["id"],
+            reason_code="ABUSE",
+            reason_text="abusive behavior",
+            meta={"target_user_id": target["id"]},
+        )
+        self.report_ids.append(report_id)
+
+        with SessionLocal() as session:
+            resolved = admin_crud.resolve_report(
+                session=session,
+                report_id=report_id,
+                moderator_id=staff_user["id"],
+                resolution="restrict_posting",
+                moderator_comment="posting restricted",
+            )
+
+        self.assertEqual(resolved["status"], "resolved")
+        self.assertEqual(resolved["resolution"], "restrict_posting")
+
+        restriction_row = fetch_one(
+            """
+            SELECT type, status, source_type, source_id::text
+            FROM user_restrictions
+            WHERE user_id = %s::uuid
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (target["id"],),
+        )
+        self.assertIsNotNone(restriction_row)
+        self.assertEqual(restriction_row[0], "restrict_posting")
+        self.assertEqual(restriction_row[1], "active")
+        self.assertEqual(restriction_row[2], "report")
+        self.assertEqual(restriction_row[3], report_id)
+
+        notification_types = {
+            str(row[0])
+            for row in (
+                fetch_one(
+                    """
+                    SELECT type
+                    FROM notifications
+                    WHERE user_id = %s::uuid
+                      AND type = 'report'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (reporter["id"],),
+                ),
+                fetch_one(
+                    """
+                    SELECT type
+                    FROM notifications
+                    WHERE user_id = %s::uuid
+                      AND type = 'moderation'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (target["id"],),
+                ),
+            )
+            if row and row[0]
+        }
+        self.assertEqual(notification_types, {"report", "moderation"})
 
     def test_public_announcement_payload_exposes_description_and_normalizes_schedule_timezone(self) -> None:
         owner = self._create_user("announcement-public")
