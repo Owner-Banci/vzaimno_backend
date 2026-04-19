@@ -105,7 +105,7 @@ AUX_TABLES: Dict[str, str] = {
           bio TEXT NULL,
           city TEXT NULL,
           home_location JSONB NULL,
-          extra JSONB NULL DEFAULT '{}'::jsonb,
+          extra JSONB NOT NULL DEFAULT '{}'::jsonb,
           created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
@@ -453,7 +453,7 @@ COMPAT_DDLS: Iterable[str] = (
     "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS bio TEXT NULL;",
     "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS city TEXT NULL;",
     "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS home_location JSONB NULL;",
-    "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS extra JSONB NULL DEFAULT '{}'::jsonb;",
+    "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS extra JSONB NOT NULL DEFAULT '{}'::jsonb;",
     "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();",
     "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();",
     "ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS rating_avg DOUBLE PRECISION NOT NULL DEFAULT 0;",
@@ -1029,6 +1029,11 @@ def _replace_check_constraint(table_name: str, constraint_name: str, predicate_s
 
 def ensure_release_schema_compat() -> None:
     """Repair known drift between release schema.sql and live code paths."""
+    if table_exists("user_profiles") and table_has_columns("user_profiles", ("extra",)):
+        execute("UPDATE user_profiles SET extra = '{}'::jsonb WHERE extra IS NULL")
+        execute("ALTER TABLE user_profiles ALTER COLUMN extra SET DEFAULT '{}'::jsonb")
+        execute("ALTER TABLE user_profiles ALTER COLUMN extra SET NOT NULL")
+
     if table_exists("chat_participants") and table_has_columns("chat_participants", ("role",)):
         _replace_check_constraint(
             "chat_participants",

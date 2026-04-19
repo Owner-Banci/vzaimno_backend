@@ -636,7 +636,7 @@ def update_my_profile(
             extra_payload.pop("preferred_address", None)
 
         set_clauses.append("extra = %s::jsonb")
-        params.append(json.dumps(extra_payload, ensure_ascii=False) if extra_payload else None)
+        params.append(json.dumps(extra_payload or {}, ensure_ascii=False))
 
     home_location_type = _profile_home_location_udt_name()
     if home_location_type in {"geography", "geometry"}:
