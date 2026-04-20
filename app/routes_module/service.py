@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import math
-import os
 from typing import Any
 
 from fastapi import HTTPException
 
+from app.config import get_env, get_int
 from app.db import fetch_all, fetch_one
 from app.geocoding import geocode_address
+from app.storage import default_presigned_expires_seconds, get_storage
 from app.task_compat import ensure_task_payload
 
 from .schemas import CoordinateOut, RouteContextOut, RouteDetailsOut, RouteTaskByPathOut
@@ -19,9 +20,9 @@ from .sql import (
 )
 
 EARTH_RADIUS_M = 6_371_008.8
-DEFAULT_ROUTE_RADIUS_METERS = int(os.getenv("ROUTE_TASK_RADIUS_METERS", "500"))
-DEFAULT_ROUTE_LIMIT = int(os.getenv("ROUTE_TASKS_LIMIT", "50"))
-DEFAULT_TRAVEL_MODE = os.getenv("ROUTE_DEFAULT_TRAVEL_MODE", "driving")
+DEFAULT_ROUTE_RADIUS_METERS = max(50, get_int("ROUTE_TASK_RADIUS_METERS", 500))
+DEFAULT_ROUTE_LIMIT = max(1, get_int("ROUTE_TASKS_LIMIT", 50))
+DEFAULT_TRAVEL_MODE = get_env("ROUTE_DEFAULT_TRAVEL_MODE", "driving") or "driving"
 SUPPORTED_TRAVEL_MODES = {"driving", "walking", "truck", "transit", "bicycle", "scooter"}
 
 
@@ -598,6 +599,17 @@ def _extract_media_url(value: Any) -> str | None:
         return normalized or None
 
     if isinstance(value, dict):
+        object_key = value.get("object_key")
+        if isinstance(object_key, str) and object_key.strip():
+            normalized_key = object_key.strip().lstrip("/")
+            try:
+                return get_storage().get_url(
+                    normalized_key,
+                    expires_seconds=default_presigned_expires_seconds(),
+                )
+            except Exception:
+                return f"/uploads/{normalized_key}"
+
         for key in (
             "preview_url",
             "previewUrl",

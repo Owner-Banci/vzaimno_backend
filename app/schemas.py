@@ -18,8 +18,22 @@ class LoginIn(BaseModel):
 
 class TokenOut(BaseModel):
     access_token: str
+    refresh_token: Optional[str] = None
     token_type: str = "bearer"
     principal_type: str = "user"
+
+
+class RefreshTokenIn(BaseModel):
+    refresh_token: str = Field(..., min_length=32, max_length=512)
+
+
+class PasswordResetRequestIn(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetConfirmIn(BaseModel):
+    token: str = Field(..., min_length=32, max_length=512)
+    new_password: str = Field(..., min_length=8, max_length=255)
 
 
 class UserOut(BaseModel):

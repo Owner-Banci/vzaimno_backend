@@ -53,6 +53,10 @@ temp_code_export/
 *.log
 logs/
 
+# --- DB backups / dumps -------------------------------------------------------
+backups/
+*.dump
+
 # --- Docker local overrides --------------------------------------------------
 docker-compose.override.yml
 

@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 import urllib.request
 from functools import lru_cache
 from typing import Any, Dict, Optional
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "shieldgemma:2b")
-OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "15"))
+from app.config import get_env, get_float, get_int
+from app.external import call_external_sync
+
+
+OLLAMA_URL = get_env("OLLAMA_URL", "http://localhost:11434/api/generate") or "http://localhost:11434/api/generate"
+OLLAMA_MODEL = get_env("OLLAMA_MODEL", "shieldgemma:2b") or "shieldgemma:2b"
+OLLAMA_TIMEOUT = max(0.5, get_float("OLLAMA_TIMEOUT_S", get_float("OLLAMA_TIMEOUT", 15.0)))
+OLLAMA_RETRIES = max(0, get_int("OLLAMA_RETRIES", 1))
 
 SYSTEM = (
     "You are a legality classification model. "
@@ -66,19 +70,27 @@ def classify_text(text: str) -> Dict[str, Any]:
         method="POST",
     )
 
-    t0 = time.perf_counter()
-    try:
+    def _invoke_ollama() -> Dict[str, Any]:
+        t0 = time.perf_counter()
         with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
             raw = resp.read().decode("utf-8")
         obj = json.loads(raw)
         model_text = obj.get("response", "") or ""
         parsed = _to_json_or_none(model_text)
         if not parsed:
-            return {"label": "UNKNOWN", "reason": f"Model ответила не-JSON: {model_text[:200]}"}
+            raise RuntimeError(f"non-JSON model output: {model_text[:200]}")
         # нормализуем выход
         label = str(parsed.get("label", "UNKNOWN")).upper()
         reason = str(parsed.get("reason", "")).strip()
         dt = time.perf_counter() - t0
         return {"label": label, "reason": reason, "t": dt}
-    except Exception as e:
-        return {"label": "UNKNOWN", "reason": f"Ollama error: {e!s}"}
+
+    result = call_external_sync(
+        "ollama",
+        _invoke_ollama,
+        retries=OLLAMA_RETRIES,
+        fallback={"label": "UNKNOWN", "reason": "Ollama error: degraded mode", "t": None},
+    )
+    if isinstance(result, dict):
+        return result
+    return {"label": "UNKNOWN", "reason": "Ollama error: degraded mode", "t": None}

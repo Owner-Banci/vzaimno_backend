@@ -1,14 +1,16 @@
 # app/moderation_image.py
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Any, Dict, Optional, Tuple
 
-NSFW_MODEL_ID = os.getenv("NSFW_MODEL_ID", "hf_hub:Marqo/nsfw-image-detection-384")
-NSFW_DEVICE = os.getenv("NSFW_DEVICE", "cpu")  # cpu / mps (если есть)
+from app.config import get_env
+
+
+NSFW_MODEL_ID = get_env("NSFW_MODEL_ID", "hf_hub:Marqo/nsfw-image-detection-384") or "hf_hub:Marqo/nsfw-image-detection-384"
+NSFW_DEVICE = get_env("NSFW_DEVICE", "cpu") or "cpu"  # cpu / mps (если есть)
 
 _detector = None  # singleton
 

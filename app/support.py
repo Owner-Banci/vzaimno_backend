@@ -10,6 +10,7 @@ from app.audit import log_audit_event
 from app.chat import publish_chat_message_sync, publish_thread_preview_sync
 from app.db import execute, fetch_all, fetch_one
 from app.ops import create_notification
+from app.pii import decrypt_phone_expr
 from app.schema_compat import table_has_column
 
 
@@ -63,12 +64,13 @@ def _message_row_to_dict(row) -> Dict[str, Any]:
 
 
 def _user_sender_identity(user_id: str) -> tuple[str, str]:
+    phone_expr, phone_expr_params = decrypt_phone_expr("u.phone_enc")
     row = fetch_one(
-        """
+        f"""
         SELECT
             COALESCE(
                 NULLIF(BTRIM(up.display_name), ''),
-                NULLIF(BTRIM(u.phone), ''),
+                NULLIF(BTRIM({phone_expr}), ''),
                 NULLIF(BTRIM(u.email), ''),
                 'Пользователь'
             ) AS display_name,
@@ -79,7 +81,7 @@ def _user_sender_identity(user_id: str) -> tuple[str, str]:
         WHERE u.id = %s
         LIMIT 1
         """,
-        (user_id,),
+        (*phone_expr_params, user_id),
     )
     if not row:
         return ("Пользователь", "Пользователь")

@@ -1,7 +1,8 @@
 # app/security.py
 
+from __future__ import annotations
+
 import hashlib
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 from uuid import UUID
@@ -9,6 +10,8 @@ from uuid import UUID
 import bcrypt
 from dotenv import load_dotenv
 from jose import JWTError, jwt
+
+from app.config import get_env, get_int, get_secret
 
 load_dotenv()
 
@@ -22,6 +25,10 @@ def _password_bytes(password: str) -> bytes:
 
 def _bcrypt_sha256_input(password: str) -> bytes:
     return hashlib.sha256(_password_bytes(password)).hexdigest().encode("ascii")
+
+
+def hash_token(value: str) -> str:
+    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
 
 
 def _json_safe(value: Any) -> Any:
@@ -79,16 +86,25 @@ def _require_secret(var_name: str, value: str | None) -> str:
     return normalized
 
 
-JWT_SECRET = _require_secret("JWT_SECRET", os.getenv("JWT_SECRET"))
-JWT_ALG = os.getenv("JWT_ALG", "HS256")
-JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "10080"))
-ADMIN_JWT_SECRET = _require_secret(
-    "ADMIN_JWT_SECRET", os.getenv("ADMIN_JWT_SECRET") or JWT_SECRET
+JWT_SECRET = _require_secret("JWT_SECRET", get_secret("JWT_SECRET"))
+JWT_ALG = get_env("JWT_ALG", "HS256") or "HS256"
+ACCESS_EXPIRE_MINUTES = get_int(
+    "ACCESS_EXPIRE_MINUTES",
+    get_int("JWT_EXPIRE_MINUTES", 15),
 )
-ADMIN_JWT_ALG = os.getenv("ADMIN_JWT_ALG") or JWT_ALG
-ADMIN_JWT_EXPIRE_MINUTES = int(os.getenv("ADMIN_JWT_EXPIRE_MINUTES") or JWT_EXPIRE_MINUTES)
-USER_TOKEN_AUDIENCE = os.getenv("USER_TOKEN_AUDIENCE", "user-api")
-ADMIN_TOKEN_AUDIENCE = os.getenv("ADMIN_TOKEN_AUDIENCE", "admin-api")
+JWT_EXPIRE_MINUTES = ACCESS_EXPIRE_MINUTES
+ADMIN_JWT_SECRET = _require_secret(
+    "ADMIN_JWT_SECRET",
+    get_env("ADMIN_JWT_SECRET") or JWT_SECRET,
+)
+ADMIN_JWT_ALG = get_env("ADMIN_JWT_ALG") or JWT_ALG
+ADMIN_ACCESS_EXPIRE_MINUTES = get_int(
+    "ADMIN_ACCESS_EXPIRE_MINUTES",
+    get_int("ADMIN_JWT_EXPIRE_MINUTES", ACCESS_EXPIRE_MINUTES),
+)
+ADMIN_JWT_EXPIRE_MINUTES = ADMIN_ACCESS_EXPIRE_MINUTES
+USER_TOKEN_AUDIENCE = get_env("USER_TOKEN_AUDIENCE", "user-api") or "user-api"
+ADMIN_TOKEN_AUDIENCE = get_env("ADMIN_TOKEN_AUDIENCE", "admin-api") or "admin-api"
 
 
 def create_access_token(
@@ -100,7 +116,7 @@ def create_access_token(
 ) -> str:
     data = _json_safe(dict(payload))
 
-    exp_minutes = expires_minutes if expires_minutes is not None else JWT_EXPIRE_MINUTES
+    exp_minutes = expires_minutes if expires_minutes is not None else ACCESS_EXPIRE_MINUTES
     exp = datetime.now(timezone.utc) + timedelta(minutes=exp_minutes)
 
     data["exp"] = exp
@@ -109,15 +125,24 @@ def create_access_token(
     return jwt.encode(data, secret or JWT_SECRET, algorithm=algorithm or JWT_ALG)
 
 
-def create_user_access_token(user_id: str, *, role: str = "user", expires_minutes: int | None = None) -> str:
+def create_user_access_token(
+    user_id: str,
+    *,
+    role: str = "user",
+    session_id: str | None = None,
+    expires_minutes: int | None = None,
+) -> str:
+    payload: Dict[str, Any] = {
+        "sub": str(user_id),
+        "principal_type": "user",
+        "token_kind": "user_access",
+        "role": str(role or "user"),
+        "aud": USER_TOKEN_AUDIENCE,
+    }
+    if session_id:
+        payload["sid"] = str(session_id)
     return create_access_token(
-        {
-            "sub": str(user_id),
-            "principal_type": "user",
-            "token_kind": "user_access",
-            "role": str(role or "user"),
-            "aud": USER_TOKEN_AUDIENCE,
-        },
+        payload,
         expires_minutes=expires_minutes,
         secret=JWT_SECRET,
         algorithm=JWT_ALG,

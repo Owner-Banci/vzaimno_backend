@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+.git/
+*.pdf
+uploads/
+.idea/
+.DS_Store
+tests/__pycache__/
+.claude/
+*.pyc
+*.pyo
+*.pyd
