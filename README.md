@@ -30,9 +30,6 @@ tests/                      # pytest
 
 ```bash
 cd ../pg-docker
-cp .env.example .env
-# сгенерируй сильный пароль и подставь в POSTGRES_PASSWORD
-python3 -c "import secrets; print(secrets.token_urlsafe(24))"
 
 docker compose up -d
 # порт 127.0.0.1:5433 проброшен на host, извне LAN недоступен
