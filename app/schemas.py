@@ -240,8 +240,79 @@ class ChatMessageIn(BaseModel):
     text: str = Field(..., min_length=1, max_length=5000)
 
 
+class DisputeOpenIn(BaseModel):
+    problem_title: str = Field(..., min_length=1, max_length=120)
+    problem_description: str = Field(..., min_length=1, max_length=5000)
+    requested_compensation_rub: int = Field(default=0, ge=0, le=1_000_000_000)
+    desired_resolution: str = Field(default="other", min_length=1, max_length=64)
+
+
+class DisputeCounterpartyResponseIn(BaseModel):
+    response_description: str = Field(..., min_length=1, max_length=5000)
+    acceptable_refund_percent: int = Field(default=0, ge=0, le=100)
+    desired_resolution: str = Field(default="other", min_length=1, max_length=64)
+
+
+class DisputeSelectOptionIn(BaseModel):
+    option_id: str = Field(..., min_length=1, max_length=64)
+
+
+class DisputeQuestionOut(BaseModel):
+    id: str
+    addressed_party: str
+    text: str
+
+
+class DisputeOptionOut(BaseModel):
+    id: str
+    lean: str
+    title: str
+    description: str
+    customer_action: str
+    performer_action: str
+    compensation_rub: Optional[int] = None
+    refund_percent: Optional[int] = None
+    resolution_kind: str
+
+
+class DisputeInitiatorTermsOut(BaseModel):
+    requested_compensation_rub: int = 0
+    desired_resolution: str = "other"
+    problem_title: str = ""
+
+
+class DisputeStateOut(BaseModel):
+    id: str
+    thread_id: str
+    status: str
+    initiator_user_id: str
+    counterparty_user_id: str
+    initiator_party_role: str
+    viewer_side: str
+    viewer_party_role: Optional[str] = None
+    opened_by_display_name: str
+    counterparty_deadline_at: Optional[datetime] = None
+    active_round: int = 1
+    is_model_thinking: bool = False
+    resolution_summary: Optional[str] = None
+    selected_option_id: Optional[str] = None
+    moderator_required: bool = False
+    questions: list[DisputeQuestionOut] = Field(default_factory=list)
+    required_answer_party_roles: list[str] = Field(default_factory=list)
+    options: list[DisputeOptionOut] = Field(default_factory=list)
+    votes: Dict[str, str] = Field(default_factory=dict)
+    my_vote_option_id: Optional[str] = None
+    initiator_terms: DisputeInitiatorTermsOut = Field(default_factory=DisputeInitiatorTermsOut)
+    last_model_error: Optional[str] = None
+
+
 class ExecutionStageUpdateIn(BaseModel):
     stage: str = Field(..., min_length=1, max_length=64)
+
+
+class ChatRealtimeCapabilitiesOut(BaseModel):
+    chat_websocket_enabled: bool = False
+    websocket_path: str = "/ws/chats/{thread_id}"
 
 
 class ChatMessageOut(BaseModel):

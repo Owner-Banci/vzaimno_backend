@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import importlib.util
 import json
 import os
 import uuid
@@ -34,6 +36,15 @@ from app.chat import (
     post_thread_message,
 )
 from app.db import execute, fetch_all, fetch_one
+from app.disputes import (
+    capture_clarification_answer_from_chat_message,
+    counterparty_accept as dispute_counterparty_accept,
+    counterparty_submit_form as dispute_counterparty_submit_form,
+    get_active_dispute_state,
+    open_dispute as dispute_open_case,
+    process_dispute_model_turn,
+    select_settlement_option as dispute_select_settlement_option,
+)
 from app.geocoding import geocode_address
 from app.moderation_image import get_nsfw_detector
 from app.moderation_text import classify_text
@@ -46,9 +57,14 @@ from app.schemas import (
     AppealIn,
     ChatMessageIn,
     ChatMessageOut,
+    ChatRealtimeCapabilitiesOut,
     ChatThreadOut,
     CreateAnnouncementIn,
     CreateOfferIn,
+    DisputeCounterpartyResponseIn,
+    DisputeOpenIn,
+    DisputeSelectOptionIn,
+    DisputeStateOut,
     DeviceRegisterIn,
     DeviceUnregisterIn,
     ExecutionStageUpdateIn,
@@ -75,6 +91,7 @@ from app.schemas import (
 )
 from app.security import create_user_access_token, hash_password, verify_password
 from app.support import get_or_create_support_thread, list_support_messages, post_support_message
+from app.logging_utils import logger
 from app.task_compat import (
     announcement_status_to_task_fields,
     builder_category_slug,
@@ -96,6 +113,7 @@ from app.task_compat import (
     task_row_to_announcement_dict,
     task_to_announcement_status,
 )
+from app.user_identity import user_contact_sql, user_display_name_sql
 
 app = FastAPI(title="Slayma Backend (MVP)")
 app.include_router(routes_router)
@@ -445,19 +463,25 @@ def _ensure_profile_and_stats(user_id: str) -> None:
     if user_id == "dev":
         return
 
+    default_display_name_sql, default_display_name_params = user_display_name_sql(
+        user_alias="u",
+        profile_alias=None,
+        fallback="Пользователь",
+    )
+
     execute(
-        """
+        f"""
         INSERT INTO user_profiles (user_id, display_name, created_at, updated_at)
         SELECT
             u.id,
-            COALESCE(NULLIF(BTRIM(u.phone), ''), NULLIF(BTRIM(u.email), ''), 'Пользователь'),
+            {default_display_name_sql},
             now(),
             now()
         FROM users u
         WHERE u.id = %s
         ON CONFLICT (user_id) DO NOTHING
         """,
-        (user_id,),
+        (*default_display_name_params, user_id),
     )
     execute(
         """
@@ -499,12 +523,13 @@ def _fetch_me_profile(user_id: str) -> MeProfileOut:
 
     _ensure_profile_and_stats(user_id)
 
+    phone_sql, phone_params = user_contact_sql(user_alias="u")
     row = fetch_one(
         f"""
         SELECT
             u.id::text,
             u.email,
-            u.phone,
+            {phone_sql},
             u.created_at,
             up.display_name,
             up.bio,
@@ -520,7 +545,7 @@ def _fetch_me_profile(user_id: str) -> MeProfileOut:
         LEFT JOIN user_stats us ON us.user_id = u.id
         WHERE u.id = %s
         """,
-        (user_id,),
+        (*phone_params, user_id),
     )
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
@@ -702,8 +727,19 @@ def _review_feed_summary(user_id: str, role: str) -> ReviewFeedSummaryOut:
 
 
 def _review_context_for_user(task_id: str, user_id: str) -> Dict[str, Any]:
+    customer_name_sql, customer_name_params = user_display_name_sql(
+        user_alias="cu",
+        profile_alias="cup",
+        fallback="Заказчик",
+    )
+    performer_name_sql, performer_name_params = user_display_name_sql(
+        user_alias="pu",
+        profile_alias="pup",
+        fallback="Исполнитель",
+    )
+
     row = fetch_one(
-        """
+        f"""
         SELECT
             ta.task_id::text,
             ta.assignment_status,
@@ -711,8 +747,8 @@ def _review_context_for_user(task_id: str, user_id: str) -> Dict[str, Any]:
             ta.chat_thread_id::text,
             ta.customer_id::text,
             ta.performer_id::text,
-            COALESCE(NULLIF(BTRIM(cup.display_name), ''), NULLIF(BTRIM(cu.phone), ''), NULLIF(BTRIM(cu.email), ''), 'Заказчик') AS customer_name,
-            COALESCE(NULLIF(BTRIM(pup.display_name), ''), NULLIF(BTRIM(pu.phone), ''), NULLIF(BTRIM(pu.email), ''), 'Исполнитель') AS performer_name,
+            {customer_name_sql} AS customer_name,
+            {performer_name_sql} AS performer_name,
             a.title
         FROM task_assignments ta
         LEFT JOIN announcements a ON a.id::text = ta.task_id::text
@@ -732,7 +768,7 @@ def _review_context_for_user(task_id: str, user_id: str) -> Dict[str, Any]:
             ta.created_at DESC
         LIMIT 1
         """,
-        (task_id,),
+        (*customer_name_params, *performer_name_params, task_id),
     )
     if not row:
         raise HTTPException(status_code=404, detail="Контекст отзыва для задания не найден")
@@ -1947,6 +1983,13 @@ def _sync_task_route_points(task_id: str, data: Dict[str, Any]) -> None:
 
 
 def _fetch_expanded_offer(ann_id: str, offer_id: str) -> Optional[OfferOutExpanded]:
+    performer_name_sql, performer_name_params = user_display_name_sql(
+        user_alias="u",
+        profile_alias="up",
+        fallback="Пользователь",
+    )
+    performer_contact_sql, performer_contact_params = user_contact_sql(user_alias="u")
+
     row = fetch_one(
         f"""
         SELECT
@@ -1962,17 +2005,9 @@ def _fetch_expanded_offer(ann_id: str, offer_id: str) -> Optional[OfferOutExpand
             tf.status::text,
             tf.created_at,
             tf.performer_id::text,
-            COALESCE(
-                NULLIF(BTRIM(up.display_name), ''),
-                NULLIF(BTRIM(u.phone), ''),
-                NULLIF(BTRIM(u.email), ''),
-                'Пользователь'
-            ) AS performer_display_name,
+            {performer_name_sql} AS performer_display_name,
             up.city,
-            COALESCE(
-                NULLIF(BTRIM(u.phone), ''),
-                NULLIF(BTRIM(u.email), '')
-            ) AS performer_contact,
+            {performer_contact_sql} AS performer_contact,
             {_offer_avatar_select_sql()},
             COALESCE(us.rating_avg, 0),
             COALESCE(us.rating_count, 0),
@@ -1988,7 +2023,7 @@ def _fetch_expanded_offer(ann_id: str, offer_id: str) -> Optional[OfferOutExpand
         WHERE tf.task_id::text = %s
           AND tf.id::text = %s
         """,
-        (ann_id, offer_id),
+        (*performer_name_params, *performer_contact_params, ann_id, offer_id),
     )
     if not row:
         return None
@@ -2786,6 +2821,13 @@ def list_announcement_offers(
     if ann.user_id != user.id:
         raise HTTPException(status_code=403, detail="Not your announcement")
 
+    performer_name_sql, performer_name_params = user_display_name_sql(
+        user_alias="u",
+        profile_alias="up",
+        fallback="Пользователь",
+    )
+    performer_contact_sql, performer_contact_params = user_contact_sql(user_alias="u")
+
     rows = fetch_all(
         f"""
         SELECT
@@ -2801,17 +2843,9 @@ def list_announcement_offers(
             tf.status::text,
             tf.created_at,
             tf.performer_id::text,
-            COALESCE(
-                NULLIF(BTRIM(up.display_name), ''),
-                NULLIF(BTRIM(u.phone), ''),
-                NULLIF(BTRIM(u.email), ''),
-                'Пользователь'
-            ) AS performer_display_name,
+            {performer_name_sql} AS performer_display_name,
             up.city,
-            COALESCE(
-                NULLIF(BTRIM(u.phone), ''),
-                NULLIF(BTRIM(u.email), '')
-            ) AS performer_contact,
+            {performer_contact_sql} AS performer_contact,
             {_offer_avatar_select_sql()},
             COALESCE(us.rating_avg, 0),
             COALESCE(us.rating_count, 0),
@@ -2829,7 +2863,7 @@ def list_announcement_offers(
         ORDER BY CASE WHEN tf.status = 'accepted_by_customer' THEN 0 ELSE 1 END,
                  tf.created_at DESC
         """,
-        (ann_id,),
+        (*performer_name_params, *performer_contact_params, ann_id),
     )
 
     return [_offer_expanded_from_row(row) for row in rows]
@@ -3151,6 +3185,43 @@ def update_announcement_execution_stage(
 # ----------------------------
 # Chat (offer threads)
 # ----------------------------
+def _schedule_dispute_model_cycle(dispute_id: str) -> None:
+    async def _job() -> None:
+        await run_in_threadpool(process_dispute_model_turn, dispute_id)
+
+    asyncio.create_task(_job())
+
+
+async def _capture_dispute_answer_if_needed(message: Dict[str, Any], sender_user_id: str) -> None:
+    dispute_id_to_run = await run_in_threadpool(
+        capture_clarification_answer_from_chat_message,
+        thread_id=message.get("thread_id"),
+        sender_user_id=sender_user_id,
+        message_id=message.get("id"),
+        message_text=message.get("text"),
+    )
+    if dispute_id_to_run:
+        _schedule_dispute_model_cycle(str(dispute_id_to_run))
+
+
+def _chat_websocket_runtime_enabled() -> bool:
+    return importlib.util.find_spec("websockets") is not None or importlib.util.find_spec("wsproto") is not None
+
+
+if not _chat_websocket_runtime_enabled():
+    logger.warning(
+        "chat_websocket_transport_missing",
+        extra={"hint": "Install uvicorn[standard] and run backend from .venv", "status_code": 0},
+    )
+
+
+@app.get("/chats/realtime-capabilities", response_model=ChatRealtimeCapabilitiesOut)
+def get_chats_realtime_capabilities(user: UserOut = Depends(get_current_user)) -> ChatRealtimeCapabilitiesOut:
+    if user.id == "dev":
+        return ChatRealtimeCapabilitiesOut(chat_websocket_enabled=False)
+    return ChatRealtimeCapabilitiesOut(chat_websocket_enabled=_chat_websocket_runtime_enabled())
+
+
 @app.get("/chats", response_model=List[ChatThreadOut])
 def get_chats(user: UserOut = Depends(get_current_user)) -> List[ChatThreadOut]:
     if user.id == "dev":
@@ -3186,7 +3257,112 @@ async def send_chat_message(
     await run_in_threadpool(assert_thread_access, thread_id, user.id)
     message = await run_in_threadpool(post_thread_message, thread_id, user.id, payload.text)
     await broadcast_chat_message(thread_id=thread_id, message=message)
+    await _capture_dispute_answer_if_needed(message, user.id)
     return ChatMessageOut(**message)
+
+
+@app.get("/chats/{thread_id}/disputes/active", response_model=Optional[DisputeStateOut])
+def get_active_chat_dispute(
+    thread_id: str,
+    user: UserOut = Depends(get_current_user),
+) -> Optional[DisputeStateOut]:
+    if user.id == "dev":
+        return None
+
+    assert_thread_access(thread_id, user.id)
+    state = get_active_dispute_state(thread_id, user.id)
+    if not state:
+        return None
+    return DisputeStateOut(**state)
+
+
+@app.post("/chats/{thread_id}/disputes/open", response_model=DisputeStateOut, status_code=201)
+async def open_chat_dispute(
+    thread_id: str,
+    payload: DisputeOpenIn,
+    user: UserOut = Depends(get_current_user),
+) -> DisputeStateOut:
+    if user.id == "dev":
+        raise HTTPException(status_code=400, detail="DEV chat is not available")
+
+    await run_in_threadpool(assert_thread_access, thread_id, user.id)
+    state = await run_in_threadpool(
+        dispute_open_case,
+        thread_id=thread_id,
+        actor_user_id=user.id,
+        problem_title=payload.problem_title,
+        problem_description=payload.problem_description,
+        requested_compensation_rub=payload.requested_compensation_rub,
+        desired_resolution=payload.desired_resolution,
+    )
+    return DisputeStateOut(**state)
+
+
+@app.post("/chats/{thread_id}/disputes/{dispute_id}/counterparty/accept", response_model=DisputeStateOut)
+async def accept_chat_dispute(
+    thread_id: str,
+    dispute_id: str,
+    user: UserOut = Depends(get_current_user),
+) -> DisputeStateOut:
+    if user.id == "dev":
+        raise HTTPException(status_code=400, detail="DEV chat is not available")
+
+    await run_in_threadpool(assert_thread_access, thread_id, user.id)
+    state = await run_in_threadpool(
+        dispute_counterparty_accept,
+        thread_id=thread_id,
+        dispute_id=dispute_id,
+        actor_user_id=user.id,
+    )
+    return DisputeStateOut(**state)
+
+
+@app.post("/chats/{thread_id}/disputes/{dispute_id}/counterparty/respond", response_model=DisputeStateOut)
+async def respond_chat_dispute(
+    thread_id: str,
+    dispute_id: str,
+    payload: DisputeCounterpartyResponseIn,
+    user: UserOut = Depends(get_current_user),
+) -> DisputeStateOut:
+    if user.id == "dev":
+        raise HTTPException(status_code=400, detail="DEV chat is not available")
+
+    await run_in_threadpool(assert_thread_access, thread_id, user.id)
+    state, should_run_model = await run_in_threadpool(
+        dispute_counterparty_submit_form,
+        thread_id=thread_id,
+        dispute_id=dispute_id,
+        actor_user_id=user.id,
+        response_description=payload.response_description,
+        acceptable_refund_percent=payload.acceptable_refund_percent,
+        desired_resolution=payload.desired_resolution,
+    )
+    if should_run_model:
+        _schedule_dispute_model_cycle(dispute_id)
+    return DisputeStateOut(**state)
+
+
+@app.post("/chats/{thread_id}/disputes/{dispute_id}/options/select", response_model=DisputeStateOut)
+async def select_chat_dispute_option(
+    thread_id: str,
+    dispute_id: str,
+    payload: DisputeSelectOptionIn,
+    user: UserOut = Depends(get_current_user),
+) -> DisputeStateOut:
+    if user.id == "dev":
+        raise HTTPException(status_code=400, detail="DEV chat is not available")
+
+    await run_in_threadpool(assert_thread_access, thread_id, user.id)
+    state, should_run_model = await run_in_threadpool(
+        dispute_select_settlement_option,
+        thread_id=thread_id,
+        dispute_id=dispute_id,
+        actor_user_id=user.id,
+        option_id=payload.option_id,
+    )
+    if should_run_model:
+        _schedule_dispute_model_cycle(dispute_id)
+    return DisputeStateOut(**state)
 
 
 def _parse_ws_chat_text(raw_message: str) -> Optional[str]:
@@ -3250,6 +3426,7 @@ async def chat_websocket(thread_id: str, websocket: WebSocket) -> None:
                 thread_id=thread_id,
                 payload={"type": "message", "payload": message},
             )
+            await _capture_dispute_answer_if_needed(message, user.id)
     except WebSocketDisconnect:
         pass
     except Exception:

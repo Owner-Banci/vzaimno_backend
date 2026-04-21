@@ -75,6 +75,9 @@ pip install fastapi 'uvicorn[standard]' 'psycopg[binary]' python-dotenv \
 uvicorn app.main:app --reload --port 8000
 ```
 
+Важно для realtime-чата: запускай именно `uvicorn` из `.venv` (после `source .venv/bin/activate`), иначе может не подхватиться websocket-транспорт и в логах появятся предупреждения:
+`Unsupported upgrade request` / `No supported WebSocket library detected`.
+
 Админ-панель (отдельный процесс):
 
 ```bash

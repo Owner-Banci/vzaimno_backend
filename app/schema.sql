@@ -665,7 +665,86 @@ CREATE INDEX idx_support_thread_admin_reads_admin_updated
 
 
 -- =============================================================================
--- 12. REVIEWS
+-- 12. DISPUTES
+-- =============================================================================
+
+CREATE TABLE disputes (
+  id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  thread_id                UUID NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+  status                   TEXT NOT NULL,
+  initiator_user_id        UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  counterparty_user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  initiator_party_role     TEXT NOT NULL,
+  opened_by_display_name   TEXT NOT NULL,
+  initiator_form           JSONB NOT NULL DEFAULT '{}'::jsonb,
+  counterparty_form        JSONB NOT NULL DEFAULT '{}'::jsonb,
+  counterparty_deadline_at TIMESTAMPTZ NULL,
+  active_round             INTEGER NOT NULL DEFAULT 1,
+  clarifying_questions     JSONB NOT NULL DEFAULT '[]'::jsonb,
+  clarification_answers    JSONB NOT NULL DEFAULT '{}'::jsonb,
+  round1_options           JSONB NOT NULL DEFAULT '[]'::jsonb,
+  round2_options           JSONB NOT NULL DEFAULT '[]'::jsonb,
+  round1_votes             JSONB NOT NULL DEFAULT '{}'::jsonb,
+  round2_votes             JSONB NOT NULL DEFAULT '{}'::jsonb,
+  resolution_summary       TEXT NULL,
+  selected_option_id       TEXT NULL,
+  moderator_hook           JSONB NOT NULL DEFAULT '{}'::jsonb,
+  model_provider           TEXT NOT NULL DEFAULT 'gemini-2.5-flash',
+  last_model_error         TEXT NULL,
+  model_attempts           INTEGER NOT NULL DEFAULT 0,
+  created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+  closed_at                TIMESTAMPTZ NULL,
+  CONSTRAINT chk_disputes_status
+    CHECK (status IN (
+      'open_waiting_counterparty',
+      'model_thinking',
+      'waiting_clarification_answers',
+      'waiting_round_1_votes',
+      'waiting_round_2_votes',
+      'closed_by_acceptance',
+      'resolved',
+      'awaiting_moderator'
+    )),
+  CONSTRAINT chk_disputes_initiator_party_role
+    CHECK (initiator_party_role IN ('customer', 'performer')),
+  CONSTRAINT chk_disputes_active_round
+    CHECK (active_round IN (1, 2)),
+  CONSTRAINT chk_disputes_distinct_parties
+    CHECK (initiator_user_id <> counterparty_user_id)
+);
+CREATE INDEX idx_disputes_thread_status_created
+  ON disputes (thread_id, status, created_at DESC);
+CREATE INDEX idx_disputes_counterparty_deadline
+  ON disputes (counterparty_deadline_at)
+  WHERE counterparty_deadline_at IS NOT NULL;
+CREATE UNIQUE INDEX ux_disputes_thread_active
+  ON disputes (thread_id)
+  WHERE status IN (
+    'open_waiting_counterparty',
+    'model_thinking',
+    'waiting_clarification_answers',
+    'waiting_round_1_votes',
+    'waiting_round_2_votes',
+    'awaiting_moderator'
+  );
+
+CREATE TABLE dispute_events (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  dispute_id     UUID NOT NULL REFERENCES disputes(id) ON DELETE CASCADE,
+  event_type     TEXT NOT NULL,
+  actor_user_id  UUID NULL REFERENCES users(id) ON DELETE SET NULL,
+  payload        JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT chk_dispute_events_type_len
+    CHECK (char_length(event_type) BETWEEN 1 AND 120)
+);
+CREATE INDEX idx_dispute_events_dispute_created
+  ON dispute_events (dispute_id, created_at DESC);
+
+
+-- =============================================================================
+-- 13. REVIEWS
 -- =============================================================================
 -- Legacy TEXT-keyed table; one review per (task, from_user) pair.
 
@@ -703,7 +782,7 @@ CREATE UNIQUE INDEX ux_reviews_task_from_user
 
 
 -- =============================================================================
--- 13. REPORTS & MODERATION
+-- 14. REPORTS & MODERATION
 -- =============================================================================
 
 CREATE TABLE reports (
@@ -804,7 +883,7 @@ CREATE INDEX idx_user_restrictions_status_starts_at
 
 
 -- =============================================================================
--- 14. NOTIFICATIONS
+-- 15. NOTIFICATIONS
 -- =============================================================================
 
 CREATE TABLE notifications (
@@ -831,7 +910,7 @@ CREATE INDEX idx_notifications_user_unread
 
 
 -- =============================================================================
--- 15. AUDIT LOGS (append-only action log)
+-- 16. AUDIT LOGS (append-only action log)
 -- =============================================================================
 -- Convention: INSERT only. In prod, create a DB role with only INSERT grants
 -- on this table, and use that role for audit writes.
@@ -867,7 +946,7 @@ CREATE INDEX idx_audit_logs_action_created_at
 
 
 -- =============================================================================
--- 16. SEED DATA
+-- 17. SEED DATA
 -- =============================================================================
 
 INSERT INTO categories (slug, name, sort_order) VALUES

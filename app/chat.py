@@ -14,6 +14,7 @@ from app.db import execute, fetch_all, fetch_one
 from app.ops import create_notification
 from app.schema_compat import table_has_column
 from app.task_compat import normalize_optional_text
+from app.user_identity import user_display_name_sql
 
 
 class ChatWebSocketHub:
@@ -123,24 +124,23 @@ def _normalize_text(text: str) -> str:
 
 
 def _user_sender_identity(user_id: str) -> tuple[str, str]:
+    display_name_sql, display_name_params = user_display_name_sql(
+        user_alias="u",
+        profile_alias="up",
+        fallback="Пользователь",
+    )
     row = fetch_one(
-        """
+        f"""
         SELECT
-            COALESCE(
-                NULLIF(BTRIM(up.display_name), ''),
-                NULLIF(BTRIM(u.phone), ''),
-                NULLIF(BTRIM(u.email), ''),
-                'Пользователь'
-            ) AS display_name,
+            {display_name_sql} AS display_name,
             'Пользователь' AS sender_label
         FROM users u
         LEFT JOIN user_profiles up
           ON up.user_id = u.id
         WHERE u.id = %s
         LIMIT 1
-        """
-        ,
-        (user_id,),
+        """,
+        (*display_name_params, user_id),
     )
     if not row:
         return ("Пользователь", "Пользователь")
@@ -363,7 +363,12 @@ def get_or_create_offer_thread(
 
 
 def _thread_preview_rows(user_id: str, thread_id: str | None = None) -> List[Dict[str, Any]]:
-    params: List[Any] = [user_id, user_id, user_id]
+    partner_name_sql, partner_name_params = user_display_name_sql(
+        user_alias="pu",
+        profile_alias="pup",
+        fallback="Собеседник",
+    )
+    params: List[Any] = [user_id, *partner_name_params, user_id, user_id]
     extra_filter = ""
     if thread_id is not None:
         extra_filter = " AND ct.id::text = %s"
@@ -402,12 +407,7 @@ def _thread_preview_rows(user_id: str, thread_id: str | None = None) -> List[Dic
         LEFT JOIN LATERAL (
             SELECT
                 cp.user_id::text AS partner_id,
-                COALESCE(
-                    NULLIF(BTRIM(pup.display_name), ''),
-                    NULLIF(BTRIM(pu.phone), ''),
-                    NULLIF(BTRIM(pu.email), ''),
-                    CASE WHEN ct.kind = 'support' THEN 'Поддержка Vzaimno' ELSE 'Собеседник' END
-                ) AS partner_display_name,
+                {partner_name_sql} AS partner_display_name,
                 pup.extra->>'avatar_url' AS partner_avatar_url,
                 COALESCE(pu.role::text, 'user') AS partner_role
             FROM chat_participants cp
