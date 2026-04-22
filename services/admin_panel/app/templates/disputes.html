@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <div class="section-head">
+    <div>
+      <p class="eyebrow">Disputes queue</p>
+      <h2>Споры, требующие администратора</h2>
+      <p class="muted">Сюда попадают кейсы, где пользователи не пришли к согласию после автоматического этапа.</p>
+    </div>
+  </div>
+
+  <form class="toolbar" method="get">
+    <input type="search" name="search" placeholder="ID спора, thread ID, email или имя" value="{{ search }}">
+    <select name="state">
+      <option value="" {% if not moderation_state %}selected{% endif %}>Все состояния</option>
+      <option value="pending" {% if moderation_state == 'pending' %}selected{% endif %}>Только новые</option>
+      <option value="in_progress" {% if moderation_state == 'in_progress' %}selected{% endif %}>Только в работе</option>
+    </select>
+    <button type="submit">Применить</button>
+  </form>
+
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Спор</th>
+        <th>Пользователи</th>
+        <th>Статус модерации</th>
+        <th>Последнее сообщение</th>
+        <th>Активность</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for dispute in disputes %}
+      <tr>
+        <td>
+          <strong class="mono">{{ dispute.id }}</strong>
+          <div class="table-meta mono">thread: {{ dispute.thread_id }}</div>
+          <div class="table-meta">{{ labels.dispute_statuses.get(dispute.status, dispute.status) }}</div>
+        </td>
+        <td>
+          <div><strong>Инициатор:</strong> {{ dispute.initiator_display_label }}</div>
+          <div class="table-meta">{{ dispute.initiator_email or "—" }}</div>
+          <div style="margin-top: 6px;"><strong>Вторая сторона:</strong> {{ dispute.counterparty_display_label }}</div>
+          <div class="table-meta">{{ dispute.counterparty_email or "—" }}</div>
+        </td>
+        <td>
+          <span class="badge">{{ labels.moderation_states.get(dispute.moderation_state, dispute.moderation_state) }}</span>
+          <div class="table-meta" style="margin-top: 6px;">
+            {% if dispute.joined_admin_account_id %}
+            {{ dispute.joined_admin_display_label }}
+            {% else %}
+            Не назначен
+            {% endif %}
+          </div>
+        </td>
+        <td>{{ dispute.last_message_text or dispute.resolution_summary or "—" }}</td>
+        <td>{{ format_dt(dispute.activity_at or dispute.updated_at or dispute.created_at) }}</td>
+        <td><a class="action-link" href="/admin/disputes/{{ dispute.id }}">Открыть</a></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6">Открытых споров на модерацию сейчас нет.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

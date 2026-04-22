@@ -2288,6 +2288,683 @@ def assign_support_thread(
     return shared_assign_support_thread(thread_id, assigned_admin_account_id, actor_admin_account_id)
 
 
+def _chat_message_admin_payload(item: dict[str, Any]) -> dict[str, Any]:
+    sender_type = str(item.get("sender_type") or "user")
+    if sender_type == "admin":
+        sender_display_label = _display_name(
+            item.get("sender_admin_display_name"),
+            item.get("sender_display_name"),
+            item.get("sender_label"),
+            item.get("sender_admin_email"),
+            item.get("sender_admin_login_identifier"),
+            item.get("sender_admin_account_id"),
+        )
+    elif sender_type == "system":
+        sender_display_label = _display_name(item.get("sender_display_name"), item.get("sender_label"), "Система")
+    else:
+        sender_display_label = _display_name(
+            item.get("sender_user_display_name"),
+            item.get("sender_display_name"),
+            item.get("sender_user_email"),
+            item.get("sender_user_account_id"),
+            item.get("sender_id"),
+        )
+    return {
+        **item,
+        "sender_display_label": sender_display_label,
+        "sender_badge": _display_name(item.get("sender_label"), sender_type),
+    }
+
+
+def _dispute_select_sql() -> str:
+    return """
+        SELECT
+            d.id::text AS id,
+            d.thread_id::text AS thread_id,
+            d.status::text AS status,
+            d.initiator_user_id::text AS initiator_user_id,
+            d.counterparty_user_id::text AS counterparty_user_id,
+            d.initiator_party_role::text AS initiator_party_role,
+            d.opened_by_display_name,
+            d.resolution_summary,
+            d.last_model_error,
+            d.moderator_hook,
+            d.created_at,
+            d.updated_at,
+            ct.last_message_at,
+            iu.email AS initiator_email,
+            iup.display_name AS initiator_display_name,
+            cu.email AS counterparty_email,
+            cup.display_name AS counterparty_display_name,
+            lm.text AS last_message_text,
+            COALESCE(ct.last_message_at, lm.created_at, d.updated_at, d.created_at) AS activity_at
+        FROM disputes d
+        JOIN chat_threads ct
+          ON ct.id = d.thread_id
+        LEFT JOIN users iu
+          ON iu.id = d.initiator_user_id
+        LEFT JOIN user_profiles iup
+          ON iup.user_id = d.initiator_user_id
+        LEFT JOIN users cu
+          ON cu.id = d.counterparty_user_id
+        LEFT JOIN user_profiles cup
+          ON cup.user_id = d.counterparty_user_id
+        LEFT JOIN LATERAL (
+            SELECT m.text, m.created_at
+            FROM chat_messages m
+            WHERE m.thread_id = d.thread_id
+              AND m.deleted_at IS NULL
+            ORDER BY m.created_at DESC
+            LIMIT 1
+        ) lm ON TRUE
+    """
+
+
+def _dispute_payload(row: dict[str, Any]) -> dict[str, Any]:
+    hook = _ensure_obj(row.get("moderator_hook"))
+    moderation_state = _normalize_text_value(hook.get("status")) or "pending"
+    joined_admin_account_id = _normalize_text_value(hook.get("joined_admin_account_id"))
+    joined_admin_display_label = (
+        _display_name(hook.get("joined_admin_display_name"), joined_admin_account_id)
+        if joined_admin_account_id
+        else "—"
+    )
+    return {
+        "id": str(row["id"]),
+        "thread_id": str(row["thread_id"]),
+        "status": str(row.get("status") or "awaiting_moderator"),
+        "initiator_user_id": str(row["initiator_user_id"]),
+        "counterparty_user_id": str(row["counterparty_user_id"]),
+        "initiator_party_role": str(row.get("initiator_party_role") or "customer"),
+        "opened_by_display_name": _display_name(row.get("opened_by_display_name"), row.get("initiator_email")),
+        "initiator_display_label": _display_name(
+            row.get("initiator_display_name"),
+            row.get("initiator_email"),
+            row.get("initiator_user_id"),
+        ),
+        "counterparty_display_label": _display_name(
+            row.get("counterparty_display_name"),
+            row.get("counterparty_email"),
+            row.get("counterparty_user_id"),
+        ),
+        "initiator_email": row.get("initiator_email"),
+        "counterparty_email": row.get("counterparty_email"),
+        "resolution_summary": _normalize_text_value(row.get("resolution_summary")),
+        "last_model_error": _normalize_text_value(row.get("last_model_error")),
+        "moderator_hook": hook,
+        "moderation_state": moderation_state,
+        "joined_admin_account_id": joined_admin_account_id,
+        "joined_admin_display_label": joined_admin_display_label,
+        "joined_at": hook.get("joined_at"),
+        "moderator_reason": _normalize_text_value(hook.get("reason")),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "last_message_at": row.get("last_message_at"),
+        "last_message_text": _normalize_text_value(row.get("last_message_text")),
+        "activity_at": row.get("activity_at"),
+    }
+
+
+def _get_dispute_row(session: Session, dispute_id: str) -> Optional[dict[str, Any]]:
+    row = session.execute(
+        text(_dispute_select_sql() + " WHERE d.id::text = :dispute_id LIMIT 1"),
+        {"dispute_id": dispute_id},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def _get_thread_messages(session: Session, thread_id: str, limit: int = 200) -> list[dict[str, Any]]:
+    lim = max(1, min(int(limit), 500))
+    rows = session.execute(
+        text(
+            """
+            SELECT
+                m.id::text AS id,
+                m.thread_id::text AS thread_id,
+                m.sender_id::text AS sender_id,
+                COALESCE(m.sender_type, CASE WHEN COALESCE(m.type::text, 'text') = 'system' THEN 'system' ELSE 'user' END) AS sender_type,
+                m.sender_user_account_id::text AS sender_user_account_id,
+                m.sender_admin_account_id::text AS sender_admin_account_id,
+                m.sender_display_name,
+                m.sender_label,
+                m.text,
+                m.created_at,
+                m.type::text AS type,
+                su.email AS sender_user_email,
+                sup.display_name AS sender_user_display_name,
+                aa.email AS sender_admin_email,
+                aa.login_identifier AS sender_admin_login_identifier,
+                aa.display_name AS sender_admin_display_name
+            FROM chat_messages m
+            LEFT JOIN users su
+              ON su.id::text = COALESCE(m.sender_user_account_id::text, m.sender_id::text)
+            LEFT JOIN user_profiles sup
+              ON sup.user_id::text = COALESCE(m.sender_user_account_id::text, m.sender_id::text)
+            LEFT JOIN admin_accounts aa
+              ON aa.id = m.sender_admin_account_id
+            WHERE m.thread_id::text = :thread_id
+              AND m.deleted_at IS NULL
+            ORDER BY m.created_at DESC
+            LIMIT :limit
+            """
+        ),
+        {"thread_id": thread_id, "limit": lim},
+    ).mappings().all()
+    return [_chat_message_admin_payload(dict(item)) for item in reversed(rows)]
+
+
+def _get_message_by_id(session: Session, message_id: str) -> Optional[dict[str, Any]]:
+    row = session.execute(
+        text(
+            """
+            SELECT
+                m.id::text AS id,
+                m.thread_id::text AS thread_id,
+                m.sender_id::text AS sender_id,
+                COALESCE(m.sender_type, CASE WHEN COALESCE(m.type::text, 'text') = 'system' THEN 'system' ELSE 'user' END) AS sender_type,
+                m.sender_user_account_id::text AS sender_user_account_id,
+                m.sender_admin_account_id::text AS sender_admin_account_id,
+                m.sender_display_name,
+                m.sender_label,
+                m.text,
+                m.created_at,
+                m.type::text AS type,
+                su.email AS sender_user_email,
+                sup.display_name AS sender_user_display_name,
+                aa.email AS sender_admin_email,
+                aa.login_identifier AS sender_admin_login_identifier,
+                aa.display_name AS sender_admin_display_name
+            FROM chat_messages m
+            LEFT JOIN users su
+              ON su.id::text = COALESCE(m.sender_user_account_id::text, m.sender_id::text)
+            LEFT JOIN user_profiles sup
+              ON sup.user_id::text = COALESCE(m.sender_user_account_id::text, m.sender_id::text)
+            LEFT JOIN admin_accounts aa
+              ON aa.id = m.sender_admin_account_id
+            WHERE m.id::text = :message_id
+            LIMIT 1
+            """
+        ),
+        {"message_id": message_id},
+    ).mappings().first()
+    return _chat_message_admin_payload(dict(row)) if row else None
+
+
+def _require_active_admin_account(session: Session, admin_account_id: str) -> dict[str, Any]:
+    admin = _get_admin_account_row(session, admin_account_id)
+    if not admin:
+        raise ValueError("Admin account not found")
+    if str(admin.get("status") or "").lower() != "active" or admin.get("disabled_at") is not None:
+        raise PermissionError("Admin account is disabled")
+    return admin
+
+
+def _notify_thread_users(
+    session: Session,
+    thread_id: str,
+    *,
+    notif_type: str,
+    body: str,
+    payload: Optional[dict[str, Any]] = None,
+    exclude_user_ids: Optional[set[str]] = None,
+) -> None:
+    exclude = exclude_user_ids or set()
+    left_filter = "AND cp.left_at IS NULL" if _has_column(session, "chat_participants", "left_at") else ""
+    participants = session.execute(
+        text(
+            f"""
+            SELECT DISTINCT cp.user_id::text AS user_id
+            FROM chat_participants cp
+            JOIN users u
+              ON {_text_eq('u.id', 'cp.user_id')}
+            WHERE cp.thread_id::text = :thread_id
+              {left_filter}
+            """
+        ),
+        {"thread_id": thread_id},
+    ).mappings().all()
+    for participant in participants:
+        user_id = str(participant["user_id"])
+        if user_id in exclude:
+            continue
+        _add_notification(
+            session=session,
+            user_id=user_id,
+            notif_type=notif_type,
+            body=body,
+            payload=payload,
+        )
+
+
+def _insert_chat_message(
+    session: Session,
+    *,
+    thread_id: str,
+    text_value: str,
+    sender_type: str,
+    message_type: str,
+    sender_id: Optional[str],
+    sender_user_account_id: Optional[str],
+    sender_admin_account_id: Optional[str],
+    sender_display_name: Optional[str],
+    sender_label: Optional[str],
+) -> dict[str, Any]:
+    message_id = str(uuid.uuid4())
+    session.execute(
+        text(
+            """
+            INSERT INTO chat_messages (
+                id,
+                thread_id,
+                sender_id,
+                type,
+                text,
+                sender_type,
+                sender_user_account_id,
+                sender_admin_account_id,
+                sender_display_name,
+                sender_label
+            )
+            VALUES (
+                CAST(:id AS uuid),
+                CAST(:thread_id AS uuid),
+                CAST(:sender_id AS uuid),
+                :type,
+                :text,
+                :sender_type,
+                CAST(:sender_user_account_id AS uuid),
+                CAST(:sender_admin_account_id AS uuid),
+                :sender_display_name,
+                :sender_label
+            )
+            """
+        ),
+        {
+            "id": message_id,
+            "thread_id": thread_id,
+            "sender_id": sender_id,
+            "type": message_type,
+            "text": text_value,
+            "sender_type": sender_type,
+            "sender_user_account_id": sender_user_account_id,
+            "sender_admin_account_id": sender_admin_account_id,
+            "sender_display_name": sender_display_name,
+            "sender_label": sender_label,
+        },
+    )
+    session.execute(
+        text(
+            """
+            UPDATE chat_threads
+            SET last_message_at = now()
+            WHERE id::text = :thread_id
+            """
+        ),
+        {"thread_id": thread_id},
+    )
+    message = _get_message_by_id(session, message_id)
+    if message is None:
+        raise ValueError("Failed to save message")
+    return message
+
+
+def count_pending_disputes(session: Session) -> int:
+    row = session.execute(
+        text(
+            """
+            SELECT COUNT(*)
+            FROM disputes d
+            WHERE d.status = 'awaiting_moderator'
+              AND COALESCE(d.moderator_hook->>'status', 'pending') = 'pending'
+            """
+        )
+    ).first()
+    return int(row[0] or 0) if row else 0
+
+
+def list_disputes(
+    session: Session,
+    *,
+    search: Optional[str] = None,
+    moderation_state: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    normalized_state = _normalize_text_value(moderation_state)
+    if normalized_state and normalized_state not in {"pending", "in_progress"}:
+        raise ValueError("Unsupported moderation state")
+
+    sql = _dispute_select_sql() + " WHERE d.status = 'awaiting_moderator'"
+    params: dict[str, Any] = {}
+    if normalized_state:
+        sql += " AND COALESCE(d.moderator_hook->>'status', 'pending') = :moderation_state"
+        params["moderation_state"] = normalized_state
+    if search:
+        sql += """
+            AND (
+                d.id::text ILIKE :search
+                OR d.thread_id::text ILIKE :search
+                OR COALESCE(iu.email, '') ILIKE :search
+                OR COALESCE(cu.email, '') ILIKE :search
+                OR COALESCE(iup.display_name, '') ILIKE :search
+                OR COALESCE(cup.display_name, '') ILIKE :search
+            )
+        """
+        params["search"] = f"%{search.strip()}%"
+
+    sql += """
+        ORDER BY
+            CASE WHEN COALESCE(d.moderator_hook->>'status', 'pending') = 'pending' THEN 0 ELSE 1 END,
+            COALESCE(ct.last_message_at, lm.created_at, d.updated_at, d.created_at) DESC,
+            d.created_at DESC
+        LIMIT 300
+    """
+    rows = session.execute(text(sql), params).mappings().all()
+    return [_dispute_payload(dict(row)) for row in rows]
+
+
+def get_dispute(session: Session, dispute_id: str) -> dict[str, Any]:
+    row = _get_dispute_row(session, dispute_id)
+    if not row:
+        raise ValueError("Dispute not found")
+    return _dispute_payload(row)
+
+
+def get_dispute_messages(session: Session, dispute_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
+    dispute = _get_dispute_row(session, dispute_id)
+    if not dispute:
+        raise ValueError("Dispute not found")
+    return _get_thread_messages(session, str(dispute["thread_id"]), limit=limit)
+
+
+def _set_moderator_hook(
+    session: Session,
+    dispute_id: str,
+    *,
+    current_hook: dict[str, Any],
+    admin_account_id: str,
+    admin_display_name: str,
+) -> dict[str, Any]:
+    updated_hook = {
+        **current_hook,
+        "status": "in_progress",
+        "joined_admin_account_id": admin_account_id,
+        "joined_admin_display_name": admin_display_name,
+        "joined_at": _now_iso(),
+    }
+    session.execute(
+        text(
+            """
+            UPDATE disputes
+            SET moderator_hook = CAST(:moderator_hook AS jsonb),
+                updated_at = now()
+            WHERE id::text = :dispute_id
+            """
+        ),
+        {"moderator_hook": json.dumps(updated_hook, ensure_ascii=False), "dispute_id": dispute_id},
+    )
+    return updated_hook
+
+
+def join_dispute(
+    session: Session,
+    dispute_id: str,
+    actor_admin_account_id: str,
+) -> dict[str, Any]:
+    admin = _require_active_admin_account(session, actor_admin_account_id)
+    dispute = _get_dispute_row(session, dispute_id)
+    if not dispute:
+        raise ValueError("Dispute not found")
+    if str(dispute.get("status") or "") != "awaiting_moderator":
+        raise ValueError("Dispute is no longer awaiting moderator")
+
+    thread_id = str(dispute["thread_id"])
+    hook = _ensure_obj(dispute.get("moderator_hook"))
+    current_joined_admin_id = _normalize_text_value(hook.get("joined_admin_account_id"))
+    admin_display_name = _display_name(
+        admin.get("display_name"),
+        admin.get("email"),
+        admin.get("login_identifier"),
+        admin.get("id"),
+    )
+    _set_moderator_hook(
+        session,
+        dispute_id,
+        current_hook=hook,
+        admin_account_id=str(admin["id"]),
+        admin_display_name=admin_display_name,
+    )
+
+    emitted_messages: list[dict[str, Any]] = []
+    if current_joined_admin_id != str(admin["id"]):
+        system_text = f"К спору подключился администратор {admin_display_name}."
+        system_message = _insert_chat_message(
+            session,
+            thread_id=thread_id,
+            text_value=system_text,
+            sender_type="system",
+            message_type="system",
+            sender_id=None,
+            sender_user_account_id=None,
+            sender_admin_account_id=None,
+            sender_display_name="Система",
+            sender_label="Система",
+        )
+        emitted_messages.append(system_message)
+        _notify_thread_users(
+            session,
+            thread_id,
+            notif_type="chat_system",
+            body=system_text,
+            payload={"thread_id": thread_id, "dispute_id": dispute_id, "kind": "dispute_moderator_joined"},
+        )
+        session.execute(
+            text(
+                """
+                INSERT INTO dispute_events (id, dispute_id, event_type, actor_user_id, payload, created_at)
+                VALUES (
+                    CAST(:id AS uuid),
+                    CAST(:dispute_id AS uuid),
+                    :event_type,
+                    NULL,
+                    CAST(:payload AS jsonb),
+                    now()
+                )
+                """
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "dispute_id": dispute_id,
+                "event_type": "moderator_joined",
+                "payload": json.dumps(
+                    {
+                        "admin_account_id": str(admin["id"]),
+                        "admin_display_name": admin_display_name,
+                        "thread_id": thread_id,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        )
+
+    _add_action(
+        session=session,
+        moderator_id=actor_admin_account_id,
+        action_type="dispute_joined",
+        target_type="dispute",
+        target_id=dispute_id,
+        payload={"thread_id": thread_id, "status": "awaiting_moderator"},
+    )
+    session.commit()
+
+    for message in emitted_messages:
+        publish_chat_message_sync(thread_id, message)
+    if emitted_messages:
+        publish_thread_preview_sync(thread_id)
+    return get_dispute(session, dispute_id)
+
+
+def post_dispute_message(
+    session: Session,
+    dispute_id: str,
+    actor_admin_account_id: str,
+    text_value: str,
+) -> dict[str, Any]:
+    admin = _require_active_admin_account(session, actor_admin_account_id)
+    dispute = _get_dispute_row(session, dispute_id)
+    if not dispute:
+        raise ValueError("Dispute not found")
+    if str(dispute.get("status") or "") != "awaiting_moderator":
+        raise ValueError("Dispute is no longer awaiting moderator")
+
+    clean_text = _normalize_text_value(text_value)
+    if not clean_text:
+        raise ValueError("Message text is required")
+
+    thread_id = str(dispute["thread_id"])
+    hook = _ensure_obj(dispute.get("moderator_hook"))
+    current_joined_admin_id = _normalize_text_value(hook.get("joined_admin_account_id"))
+    admin_display_name = _display_name(
+        admin.get("display_name"),
+        admin.get("email"),
+        admin.get("login_identifier"),
+        admin.get("id"),
+    )
+
+    emitted_messages: list[dict[str, Any]] = []
+    if current_joined_admin_id != str(admin["id"]):
+        _set_moderator_hook(
+            session,
+            dispute_id,
+            current_hook=hook,
+            admin_account_id=str(admin["id"]),
+            admin_display_name=admin_display_name,
+        )
+        join_text = f"К спору подключился администратор {admin_display_name}."
+        join_message = _insert_chat_message(
+            session,
+            thread_id=thread_id,
+            text_value=join_text,
+            sender_type="system",
+            message_type="system",
+            sender_id=None,
+            sender_user_account_id=None,
+            sender_admin_account_id=None,
+            sender_display_name="Система",
+            sender_label="Система",
+        )
+        emitted_messages.append(join_message)
+        _notify_thread_users(
+            session,
+            thread_id,
+            notif_type="chat_system",
+            body=join_text,
+            payload={"thread_id": thread_id, "dispute_id": dispute_id, "kind": "dispute_moderator_joined"},
+        )
+        _add_action(
+            session=session,
+            moderator_id=actor_admin_account_id,
+            action_type="dispute_joined",
+            target_type="dispute",
+            target_id=dispute_id,
+            payload={"thread_id": thread_id, "status": "awaiting_moderator"},
+        )
+        session.execute(
+            text(
+                """
+                INSERT INTO dispute_events (id, dispute_id, event_type, actor_user_id, payload, created_at)
+                VALUES (
+                    CAST(:id AS uuid),
+                    CAST(:dispute_id AS uuid),
+                    :event_type,
+                    NULL,
+                    CAST(:payload AS jsonb),
+                    now()
+                )
+                """
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "dispute_id": dispute_id,
+                "event_type": "moderator_joined",
+                "payload": json.dumps(
+                    {
+                        "admin_account_id": str(admin["id"]),
+                        "admin_display_name": admin_display_name,
+                        "thread_id": thread_id,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        )
+
+    admin_message = _insert_chat_message(
+        session,
+        thread_id=thread_id,
+        text_value=clean_text,
+        sender_type="admin",
+        message_type="text",
+        sender_id=str(admin["id"]),
+        sender_user_account_id=None,
+        sender_admin_account_id=str(admin["id"]),
+        sender_display_name=admin_display_name,
+        sender_label="Администратор",
+    )
+    emitted_messages.append(admin_message)
+    _notify_thread_users(
+        session,
+        thread_id,
+        notif_type="chat",
+        body=clean_text,
+        payload={
+            "thread_id": thread_id,
+            "dispute_id": dispute_id,
+            "message_id": admin_message["id"],
+            "sender_type": "admin",
+        },
+    )
+    session.execute(
+        text(
+            """
+            INSERT INTO dispute_events (id, dispute_id, event_type, actor_user_id, payload, created_at)
+            VALUES (
+                CAST(:id AS uuid),
+                CAST(:dispute_id AS uuid),
+                :event_type,
+                NULL,
+                CAST(:payload AS jsonb),
+                now()
+            )
+            """
+        ),
+        {
+            "id": str(uuid.uuid4()),
+            "dispute_id": dispute_id,
+            "event_type": "moderator_message_sent",
+            "payload": json.dumps(
+                {
+                    "admin_account_id": str(admin["id"]),
+                    "message_id": admin_message["id"],
+                    "thread_id": thread_id,
+                },
+                ensure_ascii=False,
+            ),
+        },
+    )
+    _add_action(
+        session=session,
+        moderator_id=actor_admin_account_id,
+        action_type="dispute_message_sent",
+        target_type="dispute",
+        target_id=dispute_id,
+        payload={"thread_id": thread_id, "message_id": admin_message["id"]},
+    )
+    session.commit()
+
+    for message in emitted_messages:
+        publish_chat_message_sync(thread_id, message)
+    publish_thread_preview_sync(thread_id)
+    return admin_message
+
+
 def list_active_admin_accounts(session: Session) -> list[dict[str, Any]]:
     rows = session.execute(
         text(

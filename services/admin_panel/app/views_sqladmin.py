@@ -86,6 +86,20 @@ UI_LABELS = {
         "valid": "Обоснована",
         "invalid": "Не обоснована",
     },
+    "dispute_statuses": {
+        "open_waiting_counterparty": "Ожидается ответ второй стороны",
+        "model_thinking": "Модель анализирует",
+        "waiting_clarification_answers": "Ожидаются уточнения",
+        "waiting_round_1_votes": "Ожидаются голоса (раунд 1)",
+        "waiting_round_2_votes": "Ожидаются голоса (раунд 2)",
+        "closed_by_acceptance": "Закрыт по согласию",
+        "resolved": "Разрешён",
+        "awaiting_moderator": "Ожидает администратора",
+    },
+    "moderation_states": {
+        "pending": "Новый",
+        "in_progress": "В работе",
+    },
     "target_types": {
         "announcement": "Объявление",
         "message": "Сообщение",
@@ -93,6 +107,7 @@ UI_LABELS = {
         "task": "Задание",
         "report": "Жалоба",
         "support_thread": "Тикет поддержки",
+        "dispute": "Спор",
         "admin_account": "Admin account",
     },
     "sender_roles": {
@@ -115,6 +130,8 @@ UI_LABELS = {
         "support_thread_created": "Создан support thread",
         "support_thread_assigned": "Назначен staff на тикет",
         "support_message_sent": "Отправлено сообщение поддержки",
+        "dispute_joined": "Администратор подключился к спору",
+        "dispute_message_sent": "Отправлено сообщение по спору",
         "admin_access_granted": "Выдан admin access",
         "admin_access_disabled": "Admin access отключен",
         "admin_access_enabled": "Admin access включен",
@@ -150,11 +167,15 @@ def _format_dt(value: Any) -> str:
 
 def _base_context(request: Request, **extra: Any) -> dict[str, Any]:
     staff_user = require_staff_user(request)
+    pending_disputes_count = 0
+    with SessionLocal() as session:
+        pending_disputes_count = crud.count_pending_disputes(session)
     context = {
         "request": request,
         "staff_user": staff_user,
         "is_admin": staff_user.role == "admin",
         "admin_base_url": "/admin",
+        "pending_disputes_count": pending_disputes_count,
         "labels": UI_LABELS,
         "format_dt": _format_dt,
     }
@@ -476,6 +497,84 @@ class SupportThreadsView(BaseView):
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         return _redirect(f"/admin/support/{thread_id}")
+
+
+class DisputesView(BaseView):
+    name = "Споры"
+    identity = "disputes"
+    icon = "fa-solid fa-scale-balanced"
+
+    @expose("/disputes", methods=["GET"], identity="disputes")
+    async def a_index(self, request: Request):
+        require_staff_user(request)
+        search = (request.query_params.get("search") or "").strip()
+        moderation_state = (request.query_params.get("state") or "").strip()
+        with SessionLocal() as session:
+            disputes = crud.list_disputes(
+                session,
+                search=search or None,
+                moderation_state=moderation_state or None,
+            )
+        return await _render(
+            self,
+            request,
+            "disputes.html",
+            disputes=disputes,
+            search=search,
+            moderation_state=moderation_state,
+        )
+
+    @expose("/disputes/{dispute_id}", methods=["GET"], identity="dispute-thread")
+    async def dispute_view(self, request: Request):
+        actor = require_staff_user(request)
+        dispute_id = request.path_params["dispute_id"]
+        with SessionLocal() as session:
+            try:
+                dispute = crud.get_dispute(session, dispute_id)
+                messages = crud.get_dispute_messages(session, dispute_id, limit=300)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+        linked_user_id = actor.linked_user_account_id
+        reply_blocked = bool(
+            linked_user_id
+            and linked_user_id in {dispute["initiator_user_id"], dispute["counterparty_user_id"]}
+        )
+        return await _render(
+            self,
+            request,
+            "dispute_thread.html",
+            dispute=dispute,
+            messages=messages,
+            reply_blocked=reply_blocked,
+        )
+
+    @expose("/disputes/{dispute_id}/join", methods=["POST"], identity="dispute-join")
+    async def join(self, request: Request):
+        actor = require_staff_user(request)
+        dispute_id = request.path_params["dispute_id"]
+        with SessionLocal() as session:
+            try:
+                crud.join_dispute(session, dispute_id, actor.id)
+            except PermissionError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _redirect(f"/admin/disputes/{dispute_id}")
+
+    @expose("/disputes/{dispute_id}/reply", methods=["POST"], identity="dispute-reply")
+    async def reply(self, request: Request):
+        actor = require_staff_user(request)
+        dispute_id = request.path_params["dispute_id"]
+        form = await request.form()
+        text_value = str(form.get("text", "")).strip()
+        with SessionLocal() as session:
+            try:
+                crud.post_dispute_message(session, dispute_id, actor.id, text_value)
+            except PermissionError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _redirect(f"/admin/disputes/{dispute_id}")
 
 
 class RestrictionsView(BaseView):

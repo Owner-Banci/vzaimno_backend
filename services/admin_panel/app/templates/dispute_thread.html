@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <div class="section-head">
+    <div>
+      <p class="eyebrow">Dispute moderation</p>
+      <h2>Спор {{ dispute.id }}</h2>
+      <p class="muted">Администратор работает напрямую в общем чате двух пользователей.</p>
+    </div>
+    <a class="action-link" href="/admin/disputes">К списку споров</a>
+  </div>
+
+  <div class="kv-list">
+    <div><strong>Thread:</strong> <span class="mono">{{ dispute.thread_id }}</span></div>
+    <div><strong>Статус спора:</strong> {{ labels.dispute_statuses.get(dispute.status, dispute.status) }}</div>
+    <div><strong>Статус модерации:</strong> {{ labels.moderation_states.get(dispute.moderation_state, dispute.moderation_state) }}</div>
+    <div><strong>Инициатор:</strong> {{ dispute.initiator_display_label }} ({{ dispute.initiator_email or "—" }})</div>
+    <div><strong>Вторая сторона:</strong> {{ dispute.counterparty_display_label }} ({{ dispute.counterparty_email or "—" }})</div>
+    <div><strong>Подключённый админ:</strong> {{ dispute.joined_admin_display_label or "—" }}</div>
+    <div><strong>Подключение:</strong> {{ format_dt(dispute.joined_at) }}</div>
+    <div><strong>Последняя активность:</strong> {{ format_dt(dispute.activity_at or dispute.updated_at or dispute.created_at) }}</div>
+  </div>
+  {% if dispute.resolution_summary %}
+  <p class="table-meta" style="margin-top: 12px;"><strong>Сводка:</strong> {{ dispute.resolution_summary }}</p>
+  {% endif %}
+  {% if dispute.moderator_reason %}
+  <p class="table-meta"><strong>Причина эскалации:</strong> {{ dispute.moderator_reason }}</p>
+  {% endif %}
+</section>
+
+<section class="grid two">
+  <article class="panel">
+    <h3>Подключение к чату</h3>
+    <p class="muted">При подключении в чат отправляется системное сообщение для двух участников спора.</p>
+    <form method="post" action="/admin/disputes/{{ dispute.id }}/join" class="stack">
+      <button type="submit">Подключиться к спору</button>
+    </form>
+  </article>
+
+  <article class="panel">
+    <h3>Ответ в чат</h3>
+    {% if reply_blocked %}
+    <div class="callout">
+      <strong>Ответ заблокирован</strong>
+      <p>Ваш admin account связан с одним из участников спора. Чтобы не смешивать user/admin контексты, отправка сообщений запрещена.</p>
+    </div>
+    {% endif %}
+    <form method="post" action="/admin/disputes/{{ dispute.id }}/reply" class="stack">
+      <textarea name="text" rows="4" required {% if reply_blocked %}disabled{% endif %} placeholder="Сообщение в общий чат от имени администратора"></textarea>
+      <button type="submit" {% if reply_blocked %}disabled{% endif %}>Отправить</button>
+    </form>
+  </article>
+</section>
+
+<section class="panel">
+  <h3>История чата</h3>
+  <div class="chat">
+    {% for message in messages %}
+    <article class="message {% if message.sender_type == 'admin' %}support{% else %}user{% endif %}">
+      <header>
+        <strong>{{ message.sender_display_label or message.sender_id }}</strong>
+        <span>{{ message.sender_badge or labels.sender_roles.get(message.sender_type, message.sender_type) }}</span>
+        <time>{{ format_dt(message.created_at) }}</time>
+      </header>
+      <p>{{ message.text }}</p>
+      <div class="table-meta">
+        sender_type={{ message.sender_type }}
+        {% if message.sender_user_account_id %}
+        · user={{ message.sender_user_account_id }}
+        {% endif %}
+        {% if message.sender_admin_account_id %}
+        · admin={{ message.sender_admin_account_id }}
+        {% endif %}
+      </div>
+    </article>
+    {% else %}
+    <p>В этом чате пока нет сообщений.</p>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}

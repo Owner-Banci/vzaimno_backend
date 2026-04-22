@@ -22,6 +22,12 @@
         <a href="/admin/users" class="{% if request.url.path.startswith('/admin/users') %}active{% endif %}">Пользователи</a>
         <a href="/admin/announcements" class="{% if request.url.path.startswith('/admin/announcements') %}active{% endif %}">Модерация</a>
         <a href="/admin/reports" class="{% if request.url.path.startswith('/admin/reports') %}active{% endif %}">Жалобы</a>
+        <a href="/admin/disputes" class="{% if request.url.path.startswith('/admin/disputes') %}active{% endif %}">
+          Споры
+          {% if pending_disputes_count %}
+          <span class="nav-badge">{{ pending_disputes_count }}</span>
+          {% endif %}
+        </a>
         <a href="/admin/support" class="{% if request.url.path.startswith('/admin/support') %}active{% endif %}">Поддержка</a>
         <a href="/admin/restrictions" class="{% if request.url.path.startswith('/admin/restrictions') %}active{% endif %}">Ограничения</a>
         <a href="/admin/audit" class="{% if request.url.path.startswith('/admin/audit') %}active{% endif %}">Аудит</a>

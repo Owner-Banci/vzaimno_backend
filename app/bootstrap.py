@@ -5,7 +5,7 @@ from pathlib import Path
 
 import psycopg
 
-from app.config import get_env
+from app.config import app_env, get_bool, get_env
 from app.db import DATABASE_URL, fetch_one
 from app.security import hash_password
 
@@ -126,9 +126,23 @@ def ensure_bootstrap_admin_account() -> None:
 
 
 def ensure_all_tables() -> None:
-    """Initialize schema only on an empty DB, then seed optional bootstrap admin."""
+    """Validate schema presence and seed optional bootstrap admin account.
+
+    Runtime schema creation is disabled by default to avoid service startup races
+    in production. Use Alembic migrations as the single schema source.
+    For legacy/dev emergency bootstrap set:
+      ALLOW_RUNTIME_SCHEMA_BOOTSTRAP=1
+    """
     if _db_is_empty():
-        _apply_schema_sql()
+        allow_runtime_bootstrap = get_bool("ALLOW_RUNTIME_SCHEMA_BOOTSTRAP", False)
+        if allow_runtime_bootstrap:
+            _apply_schema_sql()
+        else:
+            raise RuntimeError(
+                "Database schema is missing. Run `alembic upgrade head` before "
+                "starting services. Runtime bootstrap is disabled by default "
+                f"(ENV={app_env()})."
+            )
 
     # No schema mutations are allowed on non-empty DBs.
     ensure_bootstrap_admin_account()

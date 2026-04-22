@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
 
-from app.config import get_env, get_int
+from app.config import app_env, get_env, get_int
 
 
 class Storage(Protocol):
@@ -36,7 +36,8 @@ def _normalize_ttl(expires_seconds: int) -> int:
 
 class LocalFSStorage:
     def __init__(self) -> None:
-        self._root = Path(get_env("UPLOADS_DIR", "uploads") or "uploads")
+        raw_root = Path(get_env("UPLOADS_DIR", "uploads") or "uploads").expanduser()
+        self._root = raw_root if raw_root.is_absolute() else (Path.cwd() / raw_root).resolve()
         self._root.mkdir(parents=True, exist_ok=True)
 
     def _path(self, key: str) -> Path:
@@ -71,11 +72,28 @@ class S3Storage:
         except Exception as exc:  # pragma: no cover
             raise RuntimeError("boto3 is required for STORAGE_BACKEND=s3") from exc
 
-        endpoint = get_env("S3_ENDPOINT_URL", "http://minio:9000")
-        access_key = get_env("S3_ACCESS_KEY", "minio")
-        secret_key = get_env("S3_SECRET_KEY", "minio123")
+        is_prod = app_env() in {"prod", "production"}
+        endpoint = get_env("S3_ENDPOINT_URL", "http://minio:9000" if not is_prod else "")
+        access_key = get_env("S3_ACCESS_KEY", "minio" if not is_prod else "")
+        secret_key = get_env("S3_SECRET_KEY", "minio123" if not is_prod else "")
         region = get_env("S3_REGION", "us-east-1")
         self._bucket = (get_env("S3_BUCKET", "vzaimno-uploads") or "vzaimno-uploads").strip()
+        if is_prod:
+            missing = [
+                name
+                for name, value in (
+                    ("S3_ENDPOINT_URL", endpoint),
+                    ("S3_ACCESS_KEY", access_key),
+                    ("S3_SECRET_KEY", secret_key),
+                    ("S3_BUCKET", self._bucket),
+                )
+                if not str(value or "").strip()
+            ]
+            if missing:
+                raise RuntimeError(
+                    "S3 storage is enabled in production but required values are missing: "
+                    + ", ".join(missing)
+                )
         self._client = boto3.client(
             "s3",
             endpoint_url=endpoint,
@@ -115,4 +133,3 @@ def get_storage() -> Storage:
     if storage_backend() == "s3":
         return S3Storage()
     return LocalFSStorage()
-

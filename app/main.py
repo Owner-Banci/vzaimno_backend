@@ -272,6 +272,11 @@ def ensure_tables() -> None:
     ensure_all_tables()
 
 
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
 # ----------------------------
 # Auth
 # ----------------------------
@@ -1051,7 +1056,7 @@ def unregister_device(
           AND deleted_at IS NULL
           AND (
               device_id = %s
-              OR (%s IS NOT NULL AND push_token = %s)
+              OR (%s::text IS NOT NULL AND push_token = %s::text)
           )
         """,
         (user.id, device_id, payload.push_token, payload.push_token),

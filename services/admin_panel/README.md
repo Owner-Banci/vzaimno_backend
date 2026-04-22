@@ -21,6 +21,11 @@ pip install -r services/admin_panel/requirements.txt
 uvicorn services.admin_panel.app.main:app --host 0.0.0.0 --port 8001 --reload
 ```
 
+Health endpoints:
+
+- `GET /healthz`
+- `GET /readyz`
+
 ## Основные разделы
 
 - `/admin/users/`

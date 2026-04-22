@@ -7,7 +7,7 @@ from typing import Optional
 from fastapi import Depends, HTTPException, WebSocket
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from app.db import fetch_one
+from app.db import execute, fetch_one
 from app.security import decode_user_access_token
 
 
@@ -75,7 +75,27 @@ def user_from_token(token: str) -> UserPrincipal:
     if not row:
         raise HTTPException(status_code=401, detail="User not found")
 
-    return UserPrincipal(id=str(row[0]), email=str(row[1]), role="user")
+    principal = UserPrincipal(id=str(row[0]), email=str(row[1]), role="user")
+    _touch_user_last_seen(principal.id)
+    return principal
+
+
+def _touch_user_last_seen(user_id: str) -> None:
+    if not user_id or user_id == "dev":
+        return
+    try:
+        execute(
+            """
+            UPDATE user_devices
+            SET last_seen_at = now()
+            WHERE user_id = %s
+              AND deleted_at IS NULL
+            """,
+            (user_id,),
+        )
+    except Exception:
+        # Presence update must never break authentication.
+        return
 
 
 def get_current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> UserPrincipal:

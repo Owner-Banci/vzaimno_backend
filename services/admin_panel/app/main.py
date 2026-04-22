@@ -1,20 +1,21 @@
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
 from sqladmin import Admin
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.templating import Jinja2Templates
 
 from app.bootstrap import ensure_all_tables
+from app.rate_limit import check_redis_ready, redis_url
+from app.runtime_hardening import apply_http_hardening, is_production_env, require_production_env_values, uploads_root
 
 from . import crud
 from .auth import (
     AdminAuth,
+    StaffUser,
     authenticate_admin_credentials,
     require_admin_user,
     require_staff_user,
@@ -27,6 +28,7 @@ from .schemas import (
     AdminLoginIn,
     AdminTokenOut,
     AnnouncementDecisionIn,
+    DisputeReplyIn,
     ReportResolutionIn,
     RestrictionCreateIn,
     RestrictionExtendIn,
@@ -37,6 +39,7 @@ from .schemas import (
 from .settings import get_settings
 from .views_sqladmin import (
     AnnouncementsModerationView,
+    DisputesView,
     ModerationActionsView,
     ReportsView,
     RestrictionsView,
@@ -46,7 +49,16 @@ from .views_sqladmin import (
 
 
 settings = get_settings()
-uploads_dir = Path(os.getenv("UPLOADS_DIR", "uploads"))
+uploads_dir = uploads_root()
+
+_PROD_REQUIRED_ENV = (
+    "DATABASE_URL",
+    "JWT_SECRET",
+    "ADMIN_JWT_SECRET",
+    "ADMIN_SESSION_SECRET",
+    "REDIS_URL",
+    "TRUSTED_HOSTS",
+)
 
 
 class StaffAdmin(Admin):
@@ -55,9 +67,17 @@ class StaffAdmin(Admin):
 
 
 app = FastAPI(title=settings.title)
-app.add_middleware(SessionMiddleware, secret_key=settings.session_secret)
+require_production_env_values("admin", _PROD_REQUIRED_ENV)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.session_secret,
+    session_cookie=settings.session_cookie_name,
+    same_site=settings.session_cookie_samesite,
+    https_only=settings.session_cookie_secure,
+    max_age=settings.session_max_age_seconds,
+)
+apply_http_hardening(app, service_name="admin", cors_origins_env="ADMIN_CORS_ALLOWED_ORIGINS")
 app.mount("/static", StaticFiles(directory=str(settings.static_dir)), name="admin-static")
-app.mount("/uploads", StaticFiles(directory=str(uploads_dir), check_dir=False), name="admin-uploads")
 app.state.templates = Jinja2Templates(directory=str(settings.templates_dir))
 
 
@@ -76,14 +96,76 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/healthz")
+def healthz() -> dict[str, str]:
+    return {"status": "ok", "service": "admin"}
+
+
+def _db_ready() -> bool:
+    try:
+        with engine.connect() as connection:
+            row = connection.execute(text("SELECT 1")).scalar_one()
+        return bool(row == 1)
+    except Exception:
+        return False
+
+
+@app.get("/readyz")
+async def readyz() -> dict[str, object]:
+    db_ok = _db_ready()
+    redis_required = bool(redis_url())
+    redis_ok = True if not redis_required else bool(await check_redis_ready())
+    if not db_ok or not redis_ok:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "not_ready",
+                "db": db_ok,
+                "redis": redis_ok,
+                "redis_required": redis_required,
+            },
+        )
+    return {
+        "status": "ready",
+        "service": "admin",
+        "db": True,
+        "redis": redis_ok,
+        "production_mode": is_production_env(),
+    }
+
+
+@app.get("/uploads/{ann_id}/{filename}")
+def admin_download_upload(
+    ann_id: str,
+    filename: str,
+    _: object = Depends(require_staff_user),
+) -> FileResponse:
+    for field_name, value in (("ann_id", ann_id), ("filename", filename)):
+        if "/" in value or "\\" in value or ".." in value:
+            raise HTTPException(status_code=400, detail=f"Invalid {field_name}")
+
+    file_path = (uploads_dir / ann_id / filename).resolve()
+    try:
+        file_path.relative_to(uploads_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid path") from exc
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(str(file_path))
+
+
 api = APIRouter(prefix="/admin/api")
 
 
 @api.post("/auth/login", response_model=AdminTokenOut)
-def api_admin_login(payload: AdminLoginIn, request: Request):
-    user, token = authenticate_admin_credentials(payload.login_identifier, payload.password, request)
+async def api_admin_login(payload: AdminLoginIn, request: Request):
+    user, access_token, _refresh_token = await authenticate_admin_credentials(
+        payload.login_identifier,
+        payload.password,
+        request,
+    )
     return AdminTokenOut(
-        access_token=token,
+        access_token=access_token,
         admin_account_id=user.id,
         role=user.role,
         display_name=user.display_name,
@@ -98,15 +180,14 @@ def api_admin_logout(request: Request, _: object = Depends(require_staff_user)):
 
 
 @api.get("/auth/me")
-def api_admin_me(request: Request, actor: object = Depends(require_staff_user)):
-    user = require_staff_user(request)
+def api_admin_me(actor: StaffUser = Depends(require_staff_user)):
     return {
-        "id": user.id,
-        "login_identifier": user.login_identifier,
-        "email": user.email,
-        "role": user.role,
-        "display_name": user.display_name,
-        "linked_user_account_id": user.linked_user_account_id,
+        "id": actor.id,
+        "login_identifier": actor.login_identifier,
+        "email": actor.email,
+        "role": actor.role,
+        "display_name": actor.display_name,
+        "linked_user_account_id": actor.linked_user_account_id,
     }
 
 
@@ -163,6 +244,86 @@ def api_support_thread_assign(
     with SessionLocal() as session:
         try:
             return crud.assign_support_thread(session, thread_id, payload.assigned_admin_account_id, actor.id)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@api.get("/disputes")
+def api_disputes(
+    request: Request,
+    search: str | None = None,
+    state: str | None = None,
+    _: object = Depends(require_staff_user),
+):
+    require_staff_user(request)
+    with SessionLocal() as session:
+        try:
+            return {
+                "items": crud.list_disputes(session, search=search, moderation_state=state),
+                "pending_count": crud.count_pending_disputes(session),
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@api.get("/disputes/{dispute_id}")
+def api_dispute_detail(
+    dispute_id: str,
+    request: Request,
+    _: object = Depends(require_staff_user),
+):
+    require_staff_user(request)
+    with SessionLocal() as session:
+        try:
+            return crud.get_dispute(session, dispute_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@api.get("/disputes/{dispute_id}/messages")
+def api_dispute_messages(
+    dispute_id: str,
+    request: Request,
+    limit: int = 200,
+    _: object = Depends(require_staff_user),
+):
+    require_staff_user(request)
+    with SessionLocal() as session:
+        try:
+            return crud.get_dispute_messages(session, dispute_id, limit=limit)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@api.post("/disputes/{dispute_id}/join")
+def api_join_dispute(
+    dispute_id: str,
+    request: Request,
+    _: object = Depends(require_staff_user),
+):
+    actor = require_staff_user(request)
+    with SessionLocal() as session:
+        try:
+            return crud.join_dispute(session, dispute_id, actor.id)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@api.post("/disputes/{dispute_id}/messages")
+def api_post_dispute_message(
+    dispute_id: str,
+    payload: DisputeReplyIn,
+    request: Request,
+    _: object = Depends(require_staff_user),
+):
+    actor = require_staff_user(request)
+    with SessionLocal() as session:
+        try:
+            return crud.post_dispute_message(session, dispute_id, actor.id, payload.text)
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ValueError as exc:
@@ -415,6 +576,7 @@ admin = StaffAdmin(
 admin.add_view(UsersView)
 admin.add_view(AnnouncementsModerationView)
 admin.add_view(ReportsView)
+admin.add_view(DisputesView)
 admin.add_view(SupportThreadsView)
 admin.add_view(RestrictionsView)
 admin.add_view(ModerationActionsView)
