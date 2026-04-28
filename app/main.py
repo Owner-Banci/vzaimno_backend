@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from app.auth_context import UserPrincipal, get_current_user, get_websocket_user
+from app.auth_context import UserPrincipal, get_current_user, get_optional_current_user, get_websocket_user
 from app.bootstrap import ensure_all_tables
 from app.chat import (
     assert_thread_access,
@@ -3536,9 +3536,81 @@ def my_announcements(user: UserOut = Depends(get_current_user)) -> List[Announce
     return [_task_row_to_announcement(r) for r in rows]
 
 
+def _public_announcements_search_filters(
+    *,
+    task_query: Optional[str],
+    address_query: Optional[str],
+) -> tuple[list[str], list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    clean_task_query = _normalize_optional_text(task_query, collapse_spaces=True)
+    if clean_task_query:
+        like = f"%{clean_task_query}%"
+        clauses.append(
+            """
+            (
+                t.title ILIKE %s
+                OR COALESCE(t.description, '') ILIKE %s
+                OR COALESCE(t.customer_comment, '') ILIKE %s
+                OR COALESCE(t.address_text, '') ILIKE %s
+                OR COALESCE(c.slug, '') ILIKE %s
+                OR COALESCE(t.extra->>'notes', '') ILIKE %s
+                OR COALESCE(t.extra->>'generated_description', '') ILIKE %s
+                OR COALESCE(t.extra->>'description', '') ILIKE %s
+            )
+            """
+        )
+        params.extend([like] * 8)
+
+    clean_address_query = _normalize_optional_text(address_query, collapse_spaces=True)
+    if clean_address_query:
+        like = f"%{clean_address_query}%"
+        clauses.append(
+            """
+            (
+                COALESCE(t.address_text, '') ILIKE %s
+                OR COALESCE(t.extra->>'address_text', '') ILIKE %s
+                OR COALESCE(t.extra->>'address', '') ILIKE %s
+                OR COALESCE(t.extra->>'pickup_address', '') ILIKE %s
+                OR COALESCE(t.extra->>'dropoff_address', '') ILIKE %s
+                OR COALESCE(t.extra->>'start_address', '') ILIKE %s
+                OR COALESCE(t.extra->>'end_address', '') ILIKE %s
+                OR COALESCE(t.extra->>'to_address', '') ILIKE %s
+                OR COALESCE(t.extra->>'destination_address', '') ILIKE %s
+                OR COALESCE(t.extra #>> '{task,route,source,address}', '') ILIKE %s
+                OR COALESCE(t.extra #>> '{task,route,destination,address}', '') ILIKE %s
+            )
+            """
+        )
+        params.extend([like] * 11)
+
+    return clauses, params
+
+
 @app.get("/announcements/public", response_model=List[AnnouncementOut])
-def public_announcements(limit: int = 200) -> List[AnnouncementOut]:
+def public_announcements(
+    limit: int = 200,
+    q: Optional[str] = None,
+    search: Optional[str] = None,
+    address: Optional[str] = None,
+    exclude_my: bool = True,
+    user: Optional[UserPrincipal] = Depends(get_optional_current_user),
+) -> List[AnnouncementOut]:
     lim = max(1, min(int(limit), 500))
+    task_query = q if q is not None else search
+    extra_clauses, extra_params = _public_announcements_search_filters(
+        task_query=task_query,
+        address_query=address,
+    )
+    if exclude_my and user is not None:
+        extra_clauses.append("t.customer_id::text <> %s")
+        extra_params.append(user.id)
+
+    extra_where = ""
+    if extra_clauses:
+        extra_where = "\n          AND " + "\n          AND ".join(extra_clauses)
+
     rows = fetch_all(
         f"""
         {TASK_ANNOUNCEMENT_SELECT}
@@ -3552,10 +3624,11 @@ def public_announcements(limit: int = 200) -> List[AnnouncementOut]:
               WHERE ta.task_id = t.id
                 AND ta.assignment_status IN ('assigned', 'in_progress')
           )
+          {extra_where}
         ORDER BY t.created_at DESC
         LIMIT %s
         """,
-        (lim,),
+        (*extra_params, lim),
     )
     rows = [_repair_announcement_row_if_needed(row) for row in rows]
     return [_task_row_to_announcement(r) for r in rows]

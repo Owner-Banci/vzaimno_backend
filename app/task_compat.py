@@ -575,6 +575,8 @@ def task_row_to_announcement_dict(row: Dict[str, Any]) -> Dict[str, Any]:
     if address_text:
         data["address_text"] = address_text
 
+    map_point = primary_map_point(data) or destination_point(data)
+
     return {
         "id": str(row.get("id")),
         "user_id": str(row.get("customer_id")),
@@ -583,6 +585,8 @@ def task_row_to_announcement_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "status": announcement_status,
         "description": description,
         "address_text": address_text,
+        "latitude": float(map_point[0]) if map_point else None,
+        "longitude": float(map_point[1]) if map_point else None,
         "data": data,
         "created_at": row.get("created_at"),
     }

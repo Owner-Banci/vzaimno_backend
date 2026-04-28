@@ -130,6 +130,8 @@ class AnnouncementOut(BaseModel):
     status: str
     description: Optional[str] = None
     address_text: Optional[str] = None
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
     data: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
 

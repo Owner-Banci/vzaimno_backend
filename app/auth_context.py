@@ -12,6 +12,7 @@ from app.security import decode_user_access_token
 
 
 bearer = HTTPBearer(auto_error=True)
+optional_bearer = HTTPBearer(auto_error=False)
 
 
 # The hardcoded "DEV_TOKEN" bypass is only accepted when the process is
@@ -99,6 +100,14 @@ def _touch_user_last_seen(user_id: str) -> None:
 
 
 def get_current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> UserPrincipal:
+    return user_from_token(creds.credentials)
+
+
+def get_optional_current_user(
+    creds: HTTPAuthorizationCredentials | None = Depends(optional_bearer),
+) -> UserPrincipal | None:
+    if creds is None:
+        return None
     return user_from_token(creds.credentials)
 
 

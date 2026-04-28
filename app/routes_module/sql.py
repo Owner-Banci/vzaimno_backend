@@ -46,42 +46,47 @@ WITH route AS (
 ),
 candidates AS (
     SELECT
-        a.id,
-        a.title,
-        a.category,
-        a.status,
-        a.data,
+        t.id,
+        t.title,
+        COALESCE(c.slug, COALESCE(t.extra->>'category', t.extra->>'main_group', 'help')) AS category,
+        CASE
+            WHEN t.status IN ('published', 'in_responses') THEN 'active'
+            ELSE t.status::text
+        END AS status,
+        t.extra AS data,
         COALESCE(
-            a.location_point,
+            t.location_point,
             CASE
-                WHEN jsonb_typeof(a.data -> 'point') = 'object'
-                     AND COALESCE(a.data -> 'point' ->> 'lat', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
-                     AND COALESCE(a.data -> 'point' ->> 'lon', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                WHEN jsonb_typeof(t.extra -> 'point') = 'object'
+                     AND COALESCE(t.extra -> 'point' ->> 'lat', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                     AND COALESCE(t.extra -> 'point' ->> 'lon', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
                 THEN ST_SetSRID(
                     ST_MakePoint(
-                        (a.data -> 'point' ->> 'lon')::double precision,
-                        (a.data -> 'point' ->> 'lat')::double precision
+                        (t.extra -> 'point' ->> 'lon')::double precision,
+                        (t.extra -> 'point' ->> 'lat')::double precision
                     ),
                     4326
                 )::geography
                 ELSE NULL
             END
         ) AS point_geog
-FROM announcements a
-WHERE a.deleted_at IS NULL
-  AND a.status = 'active'
-  AND a.id::text <> %s
-  AND a.user_id::text <> %s
+FROM tasks t
+LEFT JOIN categories c
+  ON c.id = t.category_id
+WHERE t.deleted_at IS NULL
+  AND t.moderation_status = 'published'
+  AND t.status IN ('published', 'in_responses')
+  AND t.id::text <> %s
+  AND t.customer_id::text <> %s
   AND NOT EXISTS (
       SELECT 1
-      FROM announcement_offers ao
-      WHERE ao.announcement_id::text = a.id::text
-        AND ao.status = 'accepted'
-        AND ao.deleted_at IS NULL
+      FROM task_assignments ta
+      WHERE ta.task_id = t.id
+        AND ta.assignment_status IN ('assigned', 'in_progress')
   )
 )
 SELECT
-    c.id,
+    c.id::text,
     c.title,
     c.category,
     c.status,

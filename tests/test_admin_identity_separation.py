@@ -663,6 +663,8 @@ class AdminIdentitySeparationIntegrationTests(unittest.TestCase):
         payload = details.json()
         self.assertEqual(payload["description"], "Нужна аккуратная доставка документов")
         self.assertEqual(payload["address_text"], "Москва, Тверская 1")
+        self.assertEqual(payload["latitude"], 55.7558)
+        self.assertEqual(payload["longitude"], 37.6173)
         self.assertEqual(payload["data"]["description"], "Нужна аккуратная доставка документов")
         self.assertEqual(payload["data"]["generated_description"], "Нужна аккуратная доставка документов")
         self.assertEqual(payload["data"]["timezone"], "Europe/Moscow")
@@ -675,6 +677,72 @@ class AdminIdentitySeparationIntegrationTests(unittest.TestCase):
         public_item = next(item for item in public_list.json() if item["id"] == task_id)
         self.assertEqual(public_item["description"], "Нужна аккуратная доставка документов")
         self.assertEqual(public_item["data"]["description"], "Нужна аккуратная доставка документов")
+
+    def test_public_announcements_support_map_search_and_hide_viewer_tasks(self) -> None:
+        owner = self._create_user("map-owner")
+        viewer = self._create_user("map-viewer")
+
+        owner_task_id = str(uuid.uuid4())
+        viewer_task_id = str(uuid.uuid4())
+        self.task_ids.extend([owner_task_id, viewer_task_id])
+
+        _insert_task(
+            owner_task_id,
+            owner["id"],
+            "help",
+            "Забрать документы",
+            "active",
+            {
+                "address": "Москва, Арбат 10",
+                "address_text": "Москва, Арбат 10",
+                "point": {"lat": 55.7522, "lon": 37.5931},
+                "notes": "Нужно привезти документы в офис",
+            },
+        )
+        _insert_task(
+            viewer_task_id,
+            viewer["id"],
+            "help",
+            "Починить кран",
+            "active",
+            {
+                "address": "Казань, Баумана 5",
+                "address_text": "Казань, Баумана 5",
+                "point": {"lat": 55.7938, "lon": 49.1113},
+                "notes": "Протекает смеситель на кухне",
+            },
+        )
+
+        anonymous_list = self.public_client.get("/announcements/public")
+        self.assertEqual(anonymous_list.status_code, 200, anonymous_list.text)
+        anonymous_ids = {item["id"] for item in anonymous_list.json()}
+        self.assertIn(owner_task_id, anonymous_ids)
+        self.assertIn(viewer_task_id, anonymous_ids)
+
+        viewer_token = self._login_user(viewer)
+        filtered_list = self.public_client.get(
+            "/announcements/public",
+            headers={"Authorization": f"Bearer {viewer_token}"},
+        )
+        self.assertEqual(filtered_list.status_code, 200, filtered_list.text)
+        filtered_ids = {item["id"] for item in filtered_list.json()}
+        self.assertIn(owner_task_id, filtered_ids)
+        self.assertNotIn(viewer_task_id, filtered_ids)
+
+        task_search = self.public_client.get("/announcements/public", params={"q": "кран", "exclude_my": "false"})
+        self.assertEqual(task_search.status_code, 200, task_search.text)
+        task_search_ids = {item["id"] for item in task_search.json()}
+        self.assertIn(viewer_task_id, task_search_ids)
+        self.assertNotIn(owner_task_id, task_search_ids)
+
+        address_search = self.public_client.get(
+            "/announcements/public",
+            params={"address": "Арбат", "exclude_my": "false"},
+        )
+        self.assertEqual(address_search.status_code, 200, address_search.text)
+        address_search_ids = {item["id"] for item in address_search.json()}
+        self.assertIn(owner_task_id, address_search_ids)
+        self.assertNotIn(viewer_task_id, address_search_ids)
 
 
 if __name__ == "__main__":
