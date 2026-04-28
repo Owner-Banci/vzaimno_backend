@@ -41,7 +41,7 @@ services:
       UPLOADS_DIR: /app/uploads
       RUN_MIGRATIONS: "1"
       ALLOW_RUNTIME_SCHEMA_BOOTSTRAP: "0"
-      TRUSTED_HOSTS: localhost,127.0.0.1,::1
+      TRUSTED_HOSTS: localhost,127.0.0.1,::1,10.0.2.2,10.0.3.2,host.docker.internal,172.22.0.1
       CORS_ALLOWED_ORIGINS: http://localhost:3000,http://localhost:5173
       ENABLE_PROXY_HEADERS: "0"
     command: ["uvicorn", "app.runtime:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
@@ -51,7 +51,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/readyz"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz', timeout=2).read()"]
       interval: 10s
       timeout: 3s
       retries: 10
@@ -76,7 +76,7 @@ services:
       UPLOADS_DIR: /app/uploads
       RUN_MIGRATIONS: "0"
       ALLOW_RUNTIME_SCHEMA_BOOTSTRAP: "0"
-      TRUSTED_HOSTS: localhost,127.0.0.1,::1
+      TRUSTED_HOSTS: localhost,127.0.0.1,::1,10.0.2.2,10.0.3.2,host.docker.internal,172.22.0.1
       ADMIN_CORS_ALLOWED_ORIGINS: http://localhost:3000,http://localhost:5173
       ENABLE_PROXY_HEADERS: "0"
       ADMIN_SESSION_COOKIE_SECURE: "0"
@@ -89,7 +89,7 @@ services:
       backend:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8001/readyz"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/readyz', timeout=2).read()"]
       interval: 10s
       timeout: 3s
       retries: 10
