@@ -597,7 +597,7 @@ CREATE TABLE chat_messages (
   edited_at                 TIMESTAMPTZ NULL,
   deleted_at                TIMESTAMPTZ NULL,
   CONSTRAINT chk_chat_messages_type
-    CHECK (type IN ('text', 'system')),
+    CHECK (type IN ('text', 'system', 'image')),
   CONSTRAINT chk_chat_messages_text_len
     CHECK (char_length(text) <= 10000),
   CONSTRAINT chk_chat_messages_sender_type

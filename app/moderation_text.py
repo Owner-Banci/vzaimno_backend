@@ -7,7 +7,7 @@ import urllib.request
 from functools import lru_cache
 from typing import Any, Dict, Optional
 
-from app.config import get_env, get_float, get_int
+from app.config import get_bool, get_env, get_float, get_int
 from app.external import call_external_sync
 
 
@@ -15,6 +15,7 @@ OLLAMA_URL = get_env("OLLAMA_URL", "http://localhost:11434/api/generate") or "ht
 OLLAMA_MODEL = get_env("OLLAMA_MODEL", "shieldgemma:2b") or "shieldgemma:2b"
 OLLAMA_TIMEOUT = max(0.5, get_float("OLLAMA_TIMEOUT_S", get_float("OLLAMA_TIMEOUT", 15.0)))
 OLLAMA_RETRIES = max(0, get_int("OLLAMA_RETRIES", 1))
+OLLAMA_ENABLED = get_bool("OLLAMA_ENABLED", True)
 
 SYSTEM = (
     "You are a legality classification model. "
@@ -52,6 +53,8 @@ def classify_text(text: str) -> Dict[str, Any]:
     normalized = _normalize_text(text)
     if not normalized:
         return {"label": "LEGAL", "reason": "empty"}
+    if not OLLAMA_ENABLED:
+        return {"label": "LEGAL", "reason": "text moderation disabled"}
 
     prompt = f"{SYSTEM}\nText: {normalized}\n"
     payload = {

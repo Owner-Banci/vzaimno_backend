@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -32,6 +32,7 @@ from app.chat import (
     get_or_create_offer_thread,
     list_thread_messages,
     list_user_threads,
+    post_thread_image_message,
     post_system_thread_message,
     post_thread_message,
 )
@@ -232,6 +233,57 @@ UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", "uploads"))
 NSFW_REVIEW = float(os.getenv("NSFW_REVIEW", "0.30"))
 NSFW_HARD_BLOCK = float(os.getenv("NSFW_HARD_BLOCK", "0.85"))
 
+
+def _local_upload_exists(path_value: Any) -> bool:
+    if not isinstance(path_value, str):
+        return True
+
+    path = path_value.strip()
+    if not path.startswith("/uploads/"):
+        return True
+
+    relative = path.removeprefix("/uploads/").lstrip("/")
+    if not relative or ".." in relative:
+        return False
+
+    uploads_root = UPLOADS_DIR.resolve()
+    file_path = (uploads_root / relative).resolve()
+    try:
+        file_path.relative_to(uploads_root)
+    except ValueError:
+        return False
+    return file_path.is_file()
+
+
+def _media_item_has_file(item: Any) -> bool:
+    if isinstance(item, str):
+        return _local_upload_exists(item)
+    if not isinstance(item, dict):
+        return True
+
+    for key in ("path", "url", "media_url", "image_url", "uri"):
+        if key in item:
+            return _local_upload_exists(item.get(key))
+    return True
+
+
+def _drop_missing_media_refs(data: Dict[str, Any]) -> None:
+    for key in ("media", "images", "photos"):
+        value = data.get(key)
+        if isinstance(value, list):
+            data[key] = [item for item in value if _media_item_has_file(item)]
+        elif value is not None and not _media_item_has_file(value):
+            data.pop(key, None)
+
+    moderation = data.get("moderation")
+    if isinstance(moderation, dict):
+        image = moderation.get("image")
+        if isinstance(image, dict) and isinstance(image.get("items"), list):
+            image["items"] = [item for item in image["items"] if _media_item_has_file(item)]
+            if not image["items"]:
+                image["max_nsfw"] = None
+
+
 @app.get("/uploads/{ann_id}/{filename}")
 def download_announcement_media(
     ann_id: str,
@@ -263,6 +315,31 @@ def download_announcement_media(
     ann = _fetch_announcement_or_404(ann_id)
     if not _user_can_fetch_announcement(ann_id, user.id, ann.user_id):
         raise HTTPException(status_code=403, detail="Access denied")
+
+    return FileResponse(str(file_path))
+
+
+@app.get("/uploads/chat/{thread_id}/{filename}")
+def download_chat_media(
+    thread_id: str,
+    filename: str,
+    user: UserPrincipal = Depends(get_current_user),
+) -> FileResponse:
+    for part_name, part_value in (("thread_id", thread_id), ("filename", filename)):
+        if "/" in part_value or "\\" in part_value or ".." in part_value:
+            raise HTTPException(status_code=400, detail=f"Invalid {part_name}")
+
+    assert_thread_access(thread_id, user.id)
+
+    uploads_root = UPLOADS_DIR.resolve()
+    file_path = (uploads_root / "chat" / thread_id / filename).resolve()
+    try:
+        file_path.relative_to(uploads_root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid path")
+
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
 
     return FileResponse(str(file_path))
 
@@ -1108,6 +1185,7 @@ def _default_category_slug(extra: Dict[str, Any]) -> str:
 
 def _task_row_to_announcement(row) -> AnnouncementOut:
     extra = _normalize_json_object(row[5])
+    _drop_missing_media_refs(extra)
     payload = {
         "id": row[0],
         "customer_id": row[1],
@@ -1731,6 +1809,15 @@ def _save_upload(ann_id: str, file: UploadFile, content: bytes) -> str:
     out = folder / f"{uuid.uuid4().hex}_{safe_name}"
     out.write_bytes(content)
     return "/" + out.as_posix().lstrip("/")
+
+
+def _save_chat_upload(thread_id: str, filename: Optional[str], content: bytes) -> str:
+    safe_name = (filename or "image").replace("/", "_").replace("\\", "_")
+    folder = UPLOADS_DIR / "chat" / thread_id
+    folder.mkdir(parents=True, exist_ok=True)
+    out = folder / f"{uuid.uuid4().hex}_{safe_name}"
+    out.write_bytes(content)
+    return f"/uploads/chat/{thread_id}/{out.name}"
 
 
 def _utc_iso_now() -> str:
@@ -2948,6 +3035,7 @@ def accept_announcement_offer(
     )
 
     if did_accept_now:
+        post_system_thread_message(thread_id, "Задание согласовано. Чат открыт для заказчика и исполнителя.")
         create_notification(
             user_id=performer_id,
             notif_type="offer_accepted",
@@ -3266,6 +3354,62 @@ async def send_chat_message(
     return ChatMessageOut(**message)
 
 
+@app.post("/chats/{thread_id}/messages/media", response_model=ChatMessageOut, status_code=201)
+async def send_chat_media_message(
+    thread_id: str,
+    file: UploadFile = File(...),
+    text: str = Form(default=""),
+    user: UserOut = Depends(get_current_user),
+) -> ChatMessageOut:
+    if user.id == "dev":
+        raise HTTPException(status_code=400, detail="DEV chat is not available")
+
+    await run_in_threadpool(assert_thread_access, thread_id, user.id)
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Фото пустое или не прочиталось")
+
+    try:
+        detector = await run_in_threadpool(get_nsfw_detector)
+        result = await run_in_threadpool(detector.predict_bytes, content)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Модель проверки фото временно недоступна. Попробуйте отправить фото позже.",
+        ) from exc
+
+    nsfw = float(result.nsfw)
+    if nsfw >= NSFW_HARD_BLOCK:
+        raise HTTPException(status_code=400, detail="Фото содержит запрещённый контент.")
+    if nsfw >= NSFW_REVIEW:
+        raise HTTPException(status_code=400, detail="Фото выглядит небезопасным. Выберите другое фото.")
+
+    media_url = await run_in_threadpool(_save_chat_upload, thread_id, file.filename, content)
+    message = await run_in_threadpool(
+        post_thread_image_message,
+        thread_id,
+        user.id,
+        text=text,
+        media_url=media_url,
+        media_metadata={
+            "filename": file.filename,
+            "content_type": file.content_type,
+            "nsfw": nsfw,
+            "sfw": float(result.sfw),
+            "top_label": result.top_label,
+            "top_prob": float(result.top_prob),
+            "infer_s": float(result.infer_seconds),
+            "review_thr": NSFW_REVIEW,
+            "hard_block_thr": NSFW_HARD_BLOCK,
+        },
+    )
+    await broadcast_chat_message(thread_id=thread_id, message=message)
+    await _capture_dispute_answer_if_needed(message, user.id)
+    return ChatMessageOut(**message)
+
+
 @app.get("/chats/{thread_id}/disputes/active", response_model=Optional[DisputeStateOut])
 def get_active_chat_dispute(
     thread_id: str,
@@ -3526,11 +3670,17 @@ def my_announcements(user: UserOut = Depends(get_current_user)) -> List[Announce
     rows = fetch_all(
         f"""
         {TASK_ANNOUNCEMENT_SELECT}
-        WHERE t.customer_id::text = %s
+        WHERE (
+                t.customer_id::text = %s
+                OR ta.performer_id::text = %s
+              )
           AND t.deleted_at IS NULL
-        ORDER BY t.created_at DESC
+        ORDER BY
+            CASE WHEN ta.performer_id::text = %s THEN 0 ELSE 1 END,
+            COALESCE(ta.updated_at, t.updated_at, t.created_at) DESC,
+            t.created_at DESC
         """,
-        (user.id,),
+        (user.id, user.id, user.id),
     )
     rows = [_repair_announcement_row_if_needed(row) for row in rows]
     return [_task_row_to_announcement(r) for r in rows]

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import uuid
+from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, Request, UploadFile
@@ -40,9 +42,24 @@ def _normalize_upload_filename(filename: str | None) -> str:
     return safe_name or "image"
 
 
+def _writable_uploads_root() -> Path:
+    candidates = [uploads_root()]
+    if os.getenv("ALLOW_TMP_UPLOADS_FALLBACK", "").strip().lower() in {"1", "true", "yes", "on"}:
+        candidates.append(Path("/tmp/vzaimno_uploads"))
+    for root in candidates:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            probe = root / ".write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return root
+        except OSError:
+            continue
+    raise RuntimeError("No writable uploads directory")
+
+
 def _patch_upload_storage_behavior() -> None:
-    root = uploads_root()
-    root.mkdir(parents=True, exist_ok=True)
+    root = _writable_uploads_root()
     main_module.UPLOADS_DIR = root
 
     def _save_upload_portable(ann_id: str, file: UploadFile, content: bytes) -> str:
@@ -53,7 +70,15 @@ def _patch_upload_storage_behavior() -> None:
         out.write_bytes(content)
         return f"/uploads/{ann_id}/{out.name}"
 
+    def _save_chat_upload_portable(thread_id: str, filename: str | None, content: bytes) -> str:
+        folder = root / "chat" / thread_id
+        folder.mkdir(parents=True, exist_ok=True)
+        out = folder / f"{uuid.uuid4().hex}_{_normalize_upload_filename(filename)}"
+        out.write_bytes(content)
+        return f"/uploads/chat/{thread_id}/{out.name}"
+
     main_module._save_upload = _save_upload_portable
+    main_module._save_chat_upload = _save_chat_upload_portable
 
 
 def _request_identity(request: Request) -> str:

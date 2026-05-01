@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import anyio
 import asyncio
+import json
 import uuid
 from datetime import datetime
 from functools import lru_cache
@@ -154,6 +155,17 @@ def _message_row_to_dict(row) -> Dict[str, Any]:
     sender_admin_account_id = str(row[8]) if len(row) > 8 and row[8] is not None else None
     sender_display_name = str(row[9]) if len(row) > 9 and row[9] is not None else None
     sender_label = str(row[10]) if len(row) > 10 and row[10] is not None else None
+    metadata_raw = row[11] if len(row) > 11 else None
+    if isinstance(metadata_raw, dict):
+        metadata = metadata_raw
+    elif isinstance(metadata_raw, str):
+        try:
+            parsed_metadata = json.loads(metadata_raw)
+            metadata = parsed_metadata if isinstance(parsed_metadata, dict) else {}
+        except Exception:
+            metadata = {}
+    else:
+        metadata = {}
     sender_value = SYSTEM_CHAT_SENDER_ID
     if sender_type == "user":
         sender_value = sender_user_account_id or (str(row[2]) if row[2] is not None else None)
@@ -169,6 +181,7 @@ def _message_row_to_dict(row) -> Dict[str, Any]:
         "sender_display_name": sender_display_name,
         "sender_label": sender_label,
         "text": row[3],
+        "media_url": metadata.get("media_url"),
         "created_at": row[4],
         "type": message_type,
     }
@@ -256,6 +269,76 @@ def _offer_thread_kind_value() -> str:
     return "offer"
 
 
+def _chat_thread_kind_check_labels() -> set[str]:
+    rows = fetch_all(
+        """
+        SELECT pg_get_constraintdef(c.oid)
+        FROM pg_constraint c
+        JOIN pg_class rel
+          ON rel.oid = c.conrelid
+        JOIN pg_namespace nsp
+          ON nsp.oid = rel.relnamespace
+        WHERE nsp.nspname = 'public'
+          AND rel.relname = 'chat_threads'
+          AND c.contype = 'c'
+        """
+    )
+    definitions = " ".join(str(row[0] or "").lower() for row in rows)
+    labels = set()
+    for label in ("assignment", "task", "offer", "support", "system"):
+        if f"'{label}'" in definitions:
+            labels.add(label)
+    return labels
+
+
+@lru_cache(maxsize=1)
+def _assignment_thread_kind_value() -> str:
+    row = fetch_one(
+        """
+        SELECT data_type, udt_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'chat_threads'
+          AND column_name = 'kind'
+        """,
+    )
+    if not row:
+        return "assignment"
+
+    data_type = str(row[0] or "").lower()
+    udt_name = str(row[1] or "").lower()
+    if data_type != "user-defined" or udt_name != "chat_thread_kind":
+        labels = _chat_thread_kind_check_labels()
+        if "assignment" in labels or not labels:
+            return "assignment"
+        if "task" in labels:
+            return "task"
+        if "offer" in labels:
+            return "offer"
+        return "assignment"
+
+    labels = {
+        str(item[0]).lower()
+        for item in fetch_all(
+            """
+            SELECT enumlabel
+            FROM pg_type t
+            JOIN pg_enum e
+              ON t.oid = e.enumtypid
+            WHERE t.typname = 'chat_thread_kind'
+            ORDER BY e.enumsortorder
+            """
+        )
+    }
+    if "assignment" in labels:
+        return "assignment"
+    if "task" in labels:
+        return "task"
+    if "offer" in labels:
+        return "offer"
+    return "assignment"
+
+
 def ensure_chat_participant(thread_id: str, user_id: str, role: str) -> None:
     if table_has_column("chat_participants", "role"):
         execute(
@@ -302,19 +385,33 @@ def get_or_create_offer_thread(
     assignment_id: str | None,
     owner_id: str,
     performer_id: str,
+    publish_preview: bool = True,
 ) -> str:
-    existing = fetch_one(
-        """
-        SELECT id::text
-        FROM chat_threads
-        WHERE (%s::uuid IS NOT NULL AND assignment_id = %s::uuid)
-           OR offer_id::text = %s
-           OR (task_id::text = %s AND kind = %s)
-        ORDER BY created_at DESC
-        LIMIT 1
-        """,
-        (assignment_id, assignment_id, offer_id, task_id, _offer_thread_kind_value()),
-    )
+    desired_kind = _assignment_thread_kind_value() if assignment_id else _offer_thread_kind_value()
+    if assignment_id:
+        existing = fetch_one(
+            """
+            SELECT id::text
+            FROM chat_threads
+            WHERE assignment_id = %s::uuid
+               OR offer_id::text = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (assignment_id, offer_id),
+        )
+    else:
+        existing = fetch_one(
+            """
+            SELECT id::text
+            FROM chat_threads
+            WHERE offer_id::text = %s
+               OR (task_id::text = %s AND kind = %s)
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (offer_id, task_id, desired_kind),
+        )
     if existing:
         thread_id = str(existing[0])
         ensure_chat_participant(thread_id, owner_id, "owner")
@@ -322,18 +419,20 @@ def get_or_create_offer_thread(
         execute(
             """
             UPDATE chat_threads
-            SET task_id = %s,
+            SET kind = %s,
+                task_id = %s,
                 offer_id = %s,
                 assignment_id = %s
             WHERE id::text = %s
             """,
-            (task_id, offer_id, assignment_id, thread_id),
+            (desired_kind, task_id, offer_id, assignment_id, thread_id),
         )
         if table_has_column("task_offers", "chat_thread_id"):
             execute("UPDATE task_offers SET chat_thread_id = %s WHERE id::text = %s", (thread_id, offer_id))
         if assignment_id:
             execute("UPDATE task_assignments SET chat_thread_id = %s WHERE id::text = %s", (thread_id, assignment_id))
-        publish_thread_preview_sync(thread_id)
+        if publish_preview:
+            publish_thread_preview_sync(thread_id)
         return thread_id
 
     thread_id = str(uuid.uuid4())
@@ -342,7 +441,7 @@ def get_or_create_offer_thread(
         INSERT INTO chat_threads (id, kind, task_id, offer_id, last_message_at, assignment_id)
         VALUES (%s, %s, %s, %s, NULL, %s)
         """,
-        (thread_id, _offer_thread_kind_value(), task_id, offer_id, assignment_id),
+        (thread_id, desired_kind, task_id, offer_id, assignment_id),
     )
     ensure_chat_participant(thread_id, owner_id, "owner")
     ensure_chat_participant(thread_id, performer_id, "performer")
@@ -358,7 +457,8 @@ def get_or_create_offer_thread(
             """,
             (thread_id, assignment_id),
         )
-    publish_thread_preview_sync(thread_id)
+    if publish_preview:
+        publish_thread_preview_sync(thread_id)
     return thread_id
 
 
@@ -368,7 +468,8 @@ def _thread_preview_rows(user_id: str, thread_id: str | None = None) -> List[Dic
         profile_alias="pup",
         fallback="Собеседник",
     )
-    params: List[Any] = [user_id, *partner_name_params, user_id, user_id]
+    assignment_kind = _assignment_thread_kind_value()
+    params: List[Any] = [assignment_kind, user_id, *partner_name_params, user_id, user_id]
     extra_filter = ""
     if thread_id is not None:
         extra_filter = " AND ct.id::text = %s"
@@ -378,7 +479,12 @@ def _thread_preview_rows(user_id: str, thread_id: str | None = None) -> List[Dic
         f"""
         SELECT
             ct.id::text,
-            ct.kind::text,
+            CASE
+                WHEN ct.kind <> 'support'
+                 AND (ct.assignment_id IS NOT NULL OR ta.id IS NOT NULL)
+                THEN %s
+                ELSE ct.kind::text
+            END AS kind,
             partner.partner_id,
             CASE
                 WHEN ct.kind = 'support' THEN 'Поддержка Vzaimno'
@@ -517,6 +623,42 @@ def _thread_preview_rows(user_id: str, thread_id: str | None = None) -> List[Dic
     ]
 
 
+def ensure_user_assignment_threads(user_id: str) -> None:
+    rows = fetch_all(
+        """
+        SELECT
+            ta.id::text,
+            ta.task_id::text,
+            ta.offer_id::text,
+            ta.customer_id::text,
+            ta.performer_id::text
+        FROM task_assignments ta
+        WHERE ta.assignment_status IN ('assigned', 'in_progress')
+          AND (
+                ta.customer_id::text = %s
+                OR ta.performer_id::text = %s
+              )
+        ORDER BY ta.updated_at DESC
+        LIMIT 50
+        """,
+        (user_id, user_id),
+    )
+    for row in rows:
+        assignment_id = str(row[0])
+        task_id = str(row[1])
+        offer_id = str(row[2])
+        owner_id = str(row[3])
+        performer_id = str(row[4])
+        get_or_create_offer_thread(
+            task_id=task_id,
+            offer_id=offer_id,
+            assignment_id=assignment_id,
+            owner_id=owner_id,
+            performer_id=performer_id,
+            publish_preview=False,
+        )
+
+
 async def broadcast_thread_preview_update(thread_id: str) -> None:
     participants = fetch_all(
         """
@@ -543,6 +685,7 @@ async def broadcast_thread_preview_to_user(thread_id: str, user_id: str) -> None
 
 
 def list_user_threads(user_id: str) -> List[Dict[str, Any]]:
+    ensure_user_assignment_threads(user_id)
     return _thread_preview_rows(user_id=user_id)
 
 
@@ -568,7 +711,8 @@ def list_thread_messages(
             sender_user_account_id,
             sender_admin_account_id,
             sender_display_name,
-            sender_label
+            sender_label,
+            metadata
         FROM chat_messages
         WHERE thread_id = %s
           AND deleted_at IS NULL
@@ -612,7 +756,8 @@ def _fetch_chat_message_row(message_id: str):
             sender_user_account_id,
             sender_admin_account_id,
             sender_display_name,
-            sender_label
+            sender_label,
+            metadata
         FROM chat_messages
         WHERE id = %s
         """,
@@ -686,6 +831,97 @@ def post_thread_message(thread_id: str, sender_id: str, text: str) -> Dict[str, 
     row = _fetch_chat_message_row(message_id)
     if not row:
         raise HTTPException(status_code=500, detail="Message was not saved")
+
+    message = _message_row_to_dict(row)
+    publish_thread_preview_sync(thread_id)
+    return message
+
+
+def post_thread_image_message(
+    thread_id: str,
+    sender_id: str,
+    *,
+    text: str,
+    media_url: str,
+    media_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    assert_thread_access(thread_id, sender_id)
+
+    clean_text = _normalize_text(text) or "Фото"
+    if not media_url:
+        raise HTTPException(status_code=400, detail="Media URL is required")
+
+    metadata = dict(media_metadata or {})
+    metadata["media_url"] = media_url
+    sender_display_name, sender_label = _user_sender_identity(sender_id)
+    message_id = str(uuid.uuid4())
+    execute(
+        """
+        INSERT INTO chat_messages (
+            id,
+            thread_id,
+            sender_id,
+            type,
+            text,
+            sender_type,
+            sender_user_account_id,
+            sender_admin_account_id,
+            sender_display_name,
+            sender_label,
+            metadata
+        )
+        VALUES (%s, %s, %s, 'image', %s, 'user', %s, NULL, %s, %s, %s::jsonb)
+        """,
+        (
+            message_id,
+            thread_id,
+            sender_id,
+            clean_text,
+            sender_id,
+            sender_display_name,
+            sender_label,
+            json.dumps(metadata, ensure_ascii=False),
+        ),
+    )
+    execute(
+        """
+        UPDATE chat_threads
+        SET last_message_at = now()
+        WHERE id = %s
+        """,
+        (thread_id,),
+    )
+    execute(
+        """
+        UPDATE chat_participants
+        SET last_read_message_id = %s
+        WHERE thread_id = %s
+          AND user_id = %s
+        """,
+        (message_id, thread_id, sender_id),
+    )
+
+    recipients = fetch_all(
+        """
+        SELECT user_id
+        FROM chat_participants
+        WHERE thread_id = %s
+          AND user_id <> %s
+          AND left_at IS NULL
+        """,
+        (thread_id, sender_id),
+    )
+    for row in recipients:
+        create_notification(
+            user_id=row[0],
+            notif_type="chat",
+            body=clean_text,
+            payload={"thread_id": thread_id, "message_id": message_id},
+        )
+
+    row = _fetch_chat_message_row(message_id)
+    if not row:
+        raise HTTPException(status_code=500, detail="Image message was not saved")
 
     message = _message_row_to_dict(row)
     publish_thread_preview_sync(thread_id)

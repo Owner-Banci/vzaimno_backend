@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from app.bootstrap import ensure_all_tables
 from app.chat import _offer_thread_kind_value, ensure_chat_participant
 from app.db import execute
-from app.main import app as public_app
+from app.main import _insert_task, app as public_app
 from app.security import hash_password
 
 
@@ -23,6 +23,7 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         self.user_ids: list[str] = []
         self.thread_ids: list[str] = []
         self.dispute_ids: list[str] = []
+        self.task_ids: list[str] = []
 
     def tearDown(self) -> None:
         for dispute_id in self.dispute_ids:
@@ -38,6 +39,15 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
             execute("DELETE FROM chat_messages WHERE thread_id = %s::uuid", (thread_id,))
             execute("DELETE FROM support_threads WHERE id = %s::uuid", (thread_id,))
             execute("DELETE FROM chat_threads WHERE id = %s::uuid", (thread_id,))
+
+        for task_id in self.task_ids:
+            execute("DELETE FROM task_assignment_events WHERE task_id = %s::uuid", (task_id,))
+            execute("DELETE FROM task_status_events WHERE task_id = %s::uuid", (task_id,))
+            execute("DELETE FROM task_route_points WHERE task_id = %s::uuid", (task_id,))
+            execute("DELETE FROM task_assignments WHERE task_id = %s::uuid", (task_id,))
+            execute("DELETE FROM task_offers WHERE task_id = %s::uuid", (task_id,))
+            execute("DELETE FROM announcements WHERE id::text = %s", (task_id,))
+            execute("DELETE FROM tasks WHERE id = %s::uuid", (task_id,))
 
         for user_id in self.user_ids:
             execute("DELETE FROM notifications WHERE user_id = %s::uuid", (user_id,))
@@ -134,6 +144,92 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         payload = response.json()
         self.assertIn("chat_websocket_enabled", payload)
         self.assertIn("websocket_path", payload)
+
+    def test_accepting_offer_exposes_same_assignment_chat_to_owner_and_performer(self) -> None:
+        owner = self._create_user("accept-owner")
+        performer = self._create_user("accept-performer")
+        owner_token = self._login_user(owner)
+        performer_token = self._login_user(performer)
+        task_id = str(uuid.uuid4())
+        self.task_ids.append(task_id)
+
+        _insert_task(
+            task_id,
+            owner["id"],
+            "delivery",
+            "Забрать документы",
+            "active",
+            {
+                "pickup_address": "Москва, Тверская 1",
+                "dropoff_address": "Москва, Арбат 10",
+                "address_text": "Москва, Тверская 1",
+                "pickup_point": {"lat": 55.7558, "lon": 37.6173},
+                "dropoff_point": {"lat": 55.7522, "lon": 37.5931},
+                "point": {"lat": 55.7558, "lon": 37.6173},
+                "notes": "Нужна аккуратная доставка документов",
+            },
+        )
+
+        offer_response = self.client.post(
+            f"/announcements/{task_id}/offers",
+            headers={"Authorization": f"Bearer {performer_token}"},
+            json={"message": "Готов выполнить", "proposed_price": 1000},
+        )
+        self.assertEqual(offer_response.status_code, 201, offer_response.text)
+        offer_id = offer_response.json()["id"]
+
+        accept_response = self.client.post(
+            f"/announcements/{task_id}/offers/{offer_id}/accept",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(accept_response.status_code, 200, accept_response.text)
+        thread_id = accept_response.json()["thread_id"]
+        self.thread_ids.append(thread_id)
+
+        owner_chats = self.client.get("/chats", headers={"Authorization": f"Bearer {owner_token}"})
+        self.assertEqual(owner_chats.status_code, 200, owner_chats.text)
+        performer_chats = self.client.get("/chats", headers={"Authorization": f"Bearer {performer_token}"})
+        self.assertEqual(performer_chats.status_code, 200, performer_chats.text)
+
+        owner_thread = next((item for item in owner_chats.json() if item["thread_id"] == thread_id), None)
+        performer_thread = next((item for item in performer_chats.json() if item["thread_id"] == thread_id), None)
+        self.assertIsNotNone(owner_thread)
+        self.assertIsNotNone(performer_thread)
+        self.assertNotEqual(owner_thread["kind"], "support")
+        self.assertNotEqual(performer_thread["kind"], "support")
+        self.assertEqual(owner_thread["announcement_id"], task_id)
+        self.assertEqual(performer_thread["announcement_id"], task_id)
+
+        performer_tasks = self.client.get(
+            "/announcements/me",
+            headers={"Authorization": f"Bearer {performer_token}"},
+        )
+        self.assertEqual(performer_tasks.status_code, 200, performer_tasks.text)
+        performer_task = next((item for item in performer_tasks.json() if item["id"] == task_id), None)
+        self.assertIsNotNone(performer_task)
+        self.assertEqual(performer_task["data"]["task"]["assignment"]["performer_user_id"], performer["id"])
+        self.assertEqual(performer_task["data"]["task"]["assignment"]["chat_thread_id"], thread_id)
+
+        route_context = self.client.get(
+            "/routes/me/current/context",
+            headers={"Authorization": f"Bearer {performer_token}"},
+        )
+        self.assertEqual(route_context.status_code, 200, route_context.text)
+        self.assertEqual(route_context.json()["entity_id"], task_id)
+
+        performer_message = self.client.post(
+            f"/chats/{thread_id}/messages",
+            headers={"Authorization": f"Bearer {performer_token}"},
+            json={"text": "Привет, я на связи"},
+        )
+        self.assertEqual(performer_message.status_code, 201, performer_message.text)
+
+        owner_messages = self.client.get(
+            f"/chats/{thread_id}/messages",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(owner_messages.status_code, 200, owner_messages.text)
+        self.assertTrue(any(message["text"] == "Привет, я на связи" for message in owner_messages.json()))
 
     def test_dispute_open_active_accept_flow(self) -> None:
         owner = self._create_user("dispute-owner")

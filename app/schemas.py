@@ -327,6 +327,7 @@ class ChatMessageOut(BaseModel):
     sender_display_name: Optional[str] = None
     sender_label: Optional[str] = None
     text: str
+    media_url: Optional[str] = None
     created_at: datetime
     type: str = "text"
 

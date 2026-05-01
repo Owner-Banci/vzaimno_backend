@@ -28,6 +28,15 @@ services:
     volumes:
       - redis_data:/data
 
+  uploads-init:
+    image: redis:7.2-alpine
+    user: "0:0"
+    entrypoint: ["sh", "-c"]
+    command: ["mkdir -p /app/uploads && chown -R 10001:10001 /app/uploads"]
+    restart: "no"
+    volumes:
+      - uploads_data:/app/uploads
+
   backend:
     build:
       context: .
@@ -44,6 +53,8 @@ services:
       ALLOW_RUNTIME_SCHEMA_BOOTSTRAP: "0"
       ENABLE_PROXY_HEADERS: "1"
     depends_on:
+      uploads-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -77,6 +88,8 @@ services:
       ADMIN_SESSION_COOKIE_SECURE: "1"
       ADMIN_SESSION_COOKIE_SAMESITE: lax
     depends_on:
+      uploads-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:

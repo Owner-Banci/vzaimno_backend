@@ -1,9 +1,11 @@
 # app/moderation_image.py
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from app.config import get_env
@@ -11,6 +13,7 @@ from app.config import get_env
 
 NSFW_MODEL_ID = get_env("NSFW_MODEL_ID", "hf_hub:Marqo/nsfw-image-detection-384") or "hf_hub:Marqo/nsfw-image-detection-384"
 NSFW_DEVICE = get_env("NSFW_DEVICE", "cpu") or "cpu"  # cpu / mps (если есть)
+NSFW_CACHE_DIR = get_env("NSFW_CACHE_DIR", "") or ""
 
 _detector = None  # singleton
 
@@ -33,8 +36,52 @@ def _pick_device(requested: str) -> str:
             pass
     return "cpu"
 
+
+def _cache_root() -> Path:
+    raw = NSFW_CACHE_DIR or get_env("MODEL_CACHE_DIR", "") or ""
+    candidates: list[Path] = []
+    if raw:
+        candidates.append(Path(raw).expanduser())
+    else:
+        candidates.append(Path("/tmp/vzaimno_model_cache"))
+        uploads_dir = get_env("UPLOADS_DIR", "uploads") or "uploads"
+        candidates.append(Path(uploads_dir).expanduser() / "model_cache")
+
+    for candidate in candidates:
+        root = candidate
+        if not root.is_absolute():
+            root = (Path.cwd() / root).resolve()
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            probe = root / ".write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return root
+        except OSError:
+            continue
+
+    raise RuntimeError("No writable cache directory for NSFW model")
+
+
+def _prepare_model_cache_env() -> Path:
+    root = _cache_root()
+    hf_home = root / "huggingface"
+    torch_home = root / "torch"
+    xdg_cache = root / "xdg"
+    for path in (hf_home, torch_home, xdg_cache):
+        path.mkdir(parents=True, exist_ok=True)
+
+    os.environ.setdefault("HF_HOME", str(hf_home))
+    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(hf_home / "hub"))
+    os.environ.setdefault("TORCH_HOME", str(torch_home))
+    os.environ.setdefault("XDG_CACHE_HOME", str(xdg_cache))
+    return hf_home / "hub"
+
+
 class NsfwTimmDetector:
     def __init__(self, model_id: str, device: str = "cpu"):
+        cache_dir = _prepare_model_cache_env()
+
         import timm
         import torch
 
@@ -42,7 +89,7 @@ class NsfwTimmDetector:
         self.device = _pick_device(device)
 
         t0 = time.perf_counter()
-        self.model = timm.create_model(self.model_id, pretrained=True)
+        self.model = timm.create_model(self.model_id, pretrained=True, cache_dir=str(cache_dir))
         self.model.eval()
         if self.device != "cpu":
             self.model.to(self.device)
