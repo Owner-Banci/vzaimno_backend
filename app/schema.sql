@@ -689,7 +689,7 @@ CREATE TABLE disputes (
   resolution_summary       TEXT NULL,
   selected_option_id       TEXT NULL,
   moderator_hook           JSONB NOT NULL DEFAULT '{}'::jsonb,
-  model_provider           TEXT NOT NULL DEFAULT 'gemini-2.5-flash',
+  model_provider           TEXT NOT NULL DEFAULT 'groq:llama-3.1-8b-instant',
   last_model_error         TEXT NULL,
   model_attempts           INTEGER NOT NULL DEFAULT 0,
   created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),

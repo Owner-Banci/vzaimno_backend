@@ -83,7 +83,15 @@ def extract_point(value: Any) -> Optional[tuple[float, float]]:
         return None
 
     lat = parse_float(value.get("lat"))
+    if lat is None:
+        lat = parse_float(value.get("latitude"))
+
     lon = parse_float(value.get("lon"))
+    if lon is None:
+        lon = parse_float(value.get("lng"))
+    if lon is None:
+        lon = parse_float(value.get("longitude"))
+
     if lat is None or lon is None:
         return None
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):

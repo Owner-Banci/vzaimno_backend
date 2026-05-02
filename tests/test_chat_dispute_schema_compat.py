@@ -200,15 +200,22 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         self.assertEqual(owner_thread["announcement_id"], task_id)
         self.assertEqual(performer_thread["announcement_id"], task_id)
 
+        owner_tasks = self.client.get(
+            "/announcements/me",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(owner_tasks.status_code, 200, owner_tasks.text)
+        owner_task = next((item for item in owner_tasks.json() if item["id"] == task_id), None)
+        self.assertIsNotNone(owner_task)
+        self.assertEqual(owner_task["data"]["task"]["assignment"]["performer_user_id"], performer["id"])
+        self.assertEqual(owner_task["data"]["task"]["assignment"]["chat_thread_id"], thread_id)
+
         performer_tasks = self.client.get(
             "/announcements/me",
             headers={"Authorization": f"Bearer {performer_token}"},
         )
         self.assertEqual(performer_tasks.status_code, 200, performer_tasks.text)
-        performer_task = next((item for item in performer_tasks.json() if item["id"] == task_id), None)
-        self.assertIsNotNone(performer_task)
-        self.assertEqual(performer_task["data"]["task"]["assignment"]["performer_user_id"], performer["id"])
-        self.assertEqual(performer_task["data"]["task"]["assignment"]["chat_thread_id"], thread_id)
+        self.assertFalse(any(item["id"] == task_id for item in performer_tasks.json()))
 
         route_context = self.client.get(
             "/routes/me/current/context",
@@ -230,6 +237,93 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(owner_messages.status_code, 200, owner_messages.text)
         self.assertTrue(any(message["text"] == "Привет, я на связи" for message in owner_messages.json()))
+
+    def test_accepted_offer_current_route_uses_stored_route_points_for_performer(self) -> None:
+        owner = self._create_user("route-owner")
+        performer = self._create_user("route-performer")
+        owner_token = self._login_user(owner)
+        performer_token = self._login_user(performer)
+        task_id = str(uuid.uuid4())
+        self.task_ids.append(task_id)
+
+        _insert_task(
+            task_id,
+            owner["id"],
+            "delivery",
+            "Помощь от профи",
+            "active",
+            {
+                "pickup_address": "Москва, Тверская 1",
+                "dropoff_address": "Москва, Арбат 10",
+                "notes": "Маршрутные точки уже сохранены отдельно",
+            },
+        )
+        execute(
+            """
+            UPDATE tasks
+            SET extra = extra - 'pickup_point' - 'dropoff_point' - 'point',
+                location_point = NULL
+            WHERE id = %s::uuid
+            """,
+            (task_id,),
+        )
+        execute("DELETE FROM task_route_points WHERE task_id = %s::uuid", (task_id,))
+        execute(
+            """
+            INSERT INTO task_route_points (
+                id, task_id, point_order, title, address_text, point, point_kind, created_at
+            )
+            VALUES
+                (%s::uuid, %s::uuid, 0, 'Старт', 'Москва, Тверская 1',
+                 ST_SetSRID(ST_MakePoint(37.6173, 55.7558), 4326)::geography, 'source', now()),
+                (%s::uuid, %s::uuid, 1, 'Финиш', 'Москва, Арбат 10',
+                 ST_SetSRID(ST_MakePoint(37.5931, 55.7522), 4326)::geography, 'destination', now())
+            """,
+            (str(uuid.uuid4()), task_id, str(uuid.uuid4()), task_id),
+        )
+
+        offer_response = self.client.post(
+            f"/announcements/{task_id}/offers",
+            headers={"Authorization": f"Bearer {performer_token}"},
+            json={"message": "Готов выполнить", "proposed_price": 1000},
+        )
+        self.assertEqual(offer_response.status_code, 201, offer_response.text)
+        offer_id = offer_response.json()["id"]
+        execute(
+            """
+            UPDATE task_offers
+            SET status = 'accepted_by_customer',
+                accepted_at = now()
+            WHERE id = %s::uuid
+            """,
+            (offer_id,),
+        )
+
+        accept_response = self.client.post(
+            f"/announcements/{task_id}/offers/{offer_id}/accept",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(accept_response.status_code, 200, accept_response.text)
+        self.thread_ids.append(accept_response.json()["thread_id"])
+
+        performer_tasks = self.client.get(
+            "/announcements/me",
+            headers={"Authorization": f"Bearer {performer_token}"},
+        )
+        self.assertEqual(performer_tasks.status_code, 200, performer_tasks.text)
+        self.assertFalse(any(item["id"] == task_id for item in performer_tasks.json()))
+
+        route_context = self.client.get(
+            "/routes/me/current/context",
+            headers={"Authorization": f"Bearer {performer_token}"},
+        )
+        self.assertEqual(route_context.status_code, 200, route_context.text)
+        payload = route_context.json()
+        self.assertEqual(payload["entity_id"], task_id)
+        self.assertEqual(payload["start_address"], "Москва, Тверская 1")
+        self.assertEqual(payload["end_address"], "Москва, Арбат 10")
+        self.assertAlmostEqual(payload["start"]["lat"], 55.7558, places=4)
+        self.assertAlmostEqual(payload["end"]["lon"], 37.5931, places=4)
 
     def test_dispute_open_active_accept_flow(self) -> None:
         owner = self._create_user("dispute-owner")

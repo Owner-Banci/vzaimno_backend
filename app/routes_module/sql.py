@@ -7,6 +7,9 @@ SELECT
     COALESCE(c.slug, 'help') AS category_slug,
     t.title,
     t.extra,
+    t.address_text,
+    CASE WHEN t.location_point IS NULL THEN NULL ELSE ST_Y(t.location_point::geometry) END AS location_lat,
+    CASE WHEN t.location_point IS NULL THEN NULL ELSE ST_X(t.location_point::geometry) END AS location_lon,
     ta.performer_id::text,
     ta.assignment_status::text,
     ta.execution_stage::text,
@@ -24,6 +27,89 @@ LEFT JOIN LATERAL (
 ) ta ON TRUE
 WHERE t.id::text = %s
   AND t.deleted_at IS NULL
+LIMIT 1
+"""
+
+FIND_TASK_ROUTE_POINTS_SQL = """
+SELECT
+    trp.point_order,
+    trp.address_text,
+    trp.point_kind,
+    ST_Y(trp.point::geometry) AS latitude,
+    ST_X(trp.point::geometry) AS longitude
+FROM task_route_points trp
+WHERE trp.task_id::text = %s
+ORDER BY trp.point_order ASC, trp.created_at ASC
+"""
+
+FIND_KNOWN_ROUTE_POINT_BY_ADDRESS_SQL = """
+WITH target AS (
+    SELECT lower(regexp_replace(trim(%s), '[[:space:]]+', ' ', 'g')) AS address
+),
+candidates AS (
+    SELECT
+        trp.address_text AS address,
+        ST_Y(trp.point::geometry) AS latitude,
+        ST_X(trp.point::geometry) AS longitude,
+        trp.created_at AS created_at
+    FROM task_route_points trp
+    WHERE trp.address_text IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        t.extra->>'pickup_address' AS address,
+        (t.extra->'pickup_point'->>'lat')::double precision AS latitude,
+        (t.extra->'pickup_point'->>'lon')::double precision AS longitude,
+        t.updated_at AS created_at
+    FROM tasks t
+    WHERE jsonb_typeof(t.extra->'pickup_point') = 'object'
+      AND COALESCE(t.extra->'pickup_point'->>'lat', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+      AND COALESCE(t.extra->'pickup_point'->>'lon', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+
+    UNION ALL
+
+    SELECT
+        t.extra->>'dropoff_address' AS address,
+        (t.extra->'dropoff_point'->>'lat')::double precision AS latitude,
+        (t.extra->'dropoff_point'->>'lon')::double precision AS longitude,
+        t.updated_at AS created_at
+    FROM tasks t
+    WHERE jsonb_typeof(t.extra->'dropoff_point') = 'object'
+      AND COALESCE(t.extra->'dropoff_point'->>'lat', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+      AND COALESCE(t.extra->'dropoff_point'->>'lon', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+
+    UNION ALL
+
+    SELECT
+        t.extra#>>'{task,route,source,address}' AS address,
+        (t.extra#>>'{task,route,source,point,lat}')::double precision AS latitude,
+        (t.extra#>>'{task,route,source,point,lon}')::double precision AS longitude,
+        t.updated_at AS created_at
+    FROM tasks t
+    WHERE jsonb_typeof(t.extra#>'{task,route,source,point}') = 'object'
+      AND COALESCE(t.extra#>>'{task,route,source,point,lat}', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+      AND COALESCE(t.extra#>>'{task,route,source,point,lon}', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+
+    UNION ALL
+
+    SELECT
+        t.extra#>>'{task,route,destination,address}' AS address,
+        (t.extra#>>'{task,route,destination,point,lat}')::double precision AS latitude,
+        (t.extra#>>'{task,route,destination,point,lon}')::double precision AS longitude,
+        t.updated_at AS created_at
+    FROM tasks t
+    WHERE jsonb_typeof(t.extra#>'{task,route,destination,point}') = 'object'
+      AND COALESCE(t.extra#>>'{task,route,destination,point,lat}', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+      AND COALESCE(t.extra#>>'{task,route,destination,point,lon}', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+)
+SELECT latitude, longitude
+FROM candidates, target
+WHERE candidates.address IS NOT NULL
+  AND lower(regexp_replace(trim(candidates.address), '[[:space:]]+', ' ', 'g')) = target.address
+  AND latitude BETWEEN -90 AND 90
+  AND longitude BETWEEN -180 AND 180
+ORDER BY created_at DESC NULLS LAST
 LIMIT 1
 """
 

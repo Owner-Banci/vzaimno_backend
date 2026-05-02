@@ -1584,7 +1584,15 @@ def _extract_point(value: Any) -> Optional[Tuple[float, float]]:
     if not isinstance(value, dict):
         return None
     lat = _parse_float(value.get("lat"))
+    if lat is None:
+        lat = _parse_float(value.get("latitude"))
+
     lon = _parse_float(value.get("lon"))
+    if lon is None:
+        lon = _parse_float(value.get("lng"))
+    if lon is None:
+        lon = _parse_float(value.get("longitude"))
+
     if lat is None or lon is None:
         return None
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
@@ -3023,8 +3031,7 @@ def accept_announcement_offer(
         assignment_id = _create_or_update_assignment(ann_id, offer_id, ann.user_id, performer_id)
         did_accept_now = True
     else:
-        existing_assignment = _active_assignment_for_task(ann_id)
-        assignment_id = str(existing_assignment[0]) if existing_assignment else None
+        assignment_id = _create_or_update_assignment(ann_id, offer_id, ann.user_id, performer_id)
 
     thread_id = get_or_create_offer_thread(
         task_id=ann_id,
@@ -3670,17 +3677,13 @@ def my_announcements(user: UserOut = Depends(get_current_user)) -> List[Announce
     rows = fetch_all(
         f"""
         {TASK_ANNOUNCEMENT_SELECT}
-        WHERE (
-                t.customer_id::text = %s
-                OR ta.performer_id::text = %s
-              )
+        WHERE t.customer_id::text = %s
           AND t.deleted_at IS NULL
         ORDER BY
-            CASE WHEN ta.performer_id::text = %s THEN 0 ELSE 1 END,
             COALESCE(ta.updated_at, t.updated_at, t.created_at) DESC,
             t.created_at DESC
         """,
-        (user.id, user.id, user.id),
+        (user.id,),
     )
     rows = [_repair_announcement_row_if_needed(row) for row in rows]
     return [_task_row_to_announcement(r) for r in rows]

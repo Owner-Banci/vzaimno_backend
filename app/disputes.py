@@ -4,7 +4,6 @@ import json
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -20,15 +19,17 @@ from app.logging_utils import logger
 from app.user_identity import user_display_name_sql
 
 
-DISPUTE_MODEL_PROVIDER = "gemini-2.5-flash"
-DISPUTE_RESPONSE_TIMEOUT_SECONDS = max(3.0, get_float("DISPUTE_GEMINI_TIMEOUT_S", 25.0))
-DISPUTE_GEMINI_RETRIES = max(0, get_int("DISPUTE_GEMINI_RETRIES", 2))
-DISPUTE_GEMINI_MODEL = get_env("DISPUTE_GEMINI_MODEL", "gemini-2.5-flash") or "gemini-2.5-flash"
-DISPUTE_GEMINI_BASE_URL = (
-    get_env("DISPUTE_GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/models")
-    or "https://generativelanguage.googleapis.com/v1beta/models"
+DEFAULT_DISPUTE_GROQ_MODEL = "llama-3.1-8b-instant"
+DEFAULT_DISPUTE_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+DISPUTE_GROQ_MODEL = get_env("DISPUTE_GROQ_MODEL", DEFAULT_DISPUTE_GROQ_MODEL) or DEFAULT_DISPUTE_GROQ_MODEL
+DISPUTE_MODEL_PROVIDER = f"groq:{DISPUTE_GROQ_MODEL}"
+DISPUTE_RESPONSE_TIMEOUT_SECONDS = max(3.0, get_float("DISPUTE_GROQ_TIMEOUT_S", 25.0))
+DISPUTE_GROQ_RETRIES = max(0, get_int("DISPUTE_GROQ_RETRIES", 2))
+DISPUTE_GROQ_BASE_URL = (
+    get_env("DISPUTE_GROQ_BASE_URL", DEFAULT_DISPUTE_GROQ_BASE_URL)
+    or DEFAULT_DISPUTE_GROQ_BASE_URL
 )
-DISPUTE_GEMINI_API_KEY = get_env("DISPUTE_GEMINI_API_KEY", "") or ""
+DISPUTE_GROQ_API_KEY = get_env("DISPUTE_GROQ_API_KEY", "") or ""
 
 DISPUTE_STATUS_WAITING_COUNTERPARTY = "open_waiting_counterparty"
 DISPUTE_STATUS_MODEL_THINKING = "model_thinking"
@@ -1227,9 +1228,9 @@ def _normalize_llm_response(
     }
 
 
-def _gemini_endpoint(model_name: str) -> str:
-    base = DISPUTE_GEMINI_BASE_URL.rstrip("/")
-    return f"{base}/{model_name}:generateContent"
+def _groq_chat_completions_endpoint() -> str:
+    base = DISPUTE_GROQ_BASE_URL.rstrip("/")
+    return f"{base}/chat/completions"
 
 
 def _build_announcement_context(thread_id: str) -> Dict[str, Any]:
@@ -1380,38 +1381,37 @@ def _build_model_input(dispute: Dict[str, Any], round_number: int) -> Dict[str, 
     }
 
 
-def _call_gemini(model_input: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not DISPUTE_GEMINI_API_KEY:
-        logger.warning("dispute_gemini_key_missing", extra={"status_code": 0})
+def _call_groq(model_input: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not DISPUTE_GROQ_API_KEY:
+        logger.warning("dispute_groq_key_missing", extra={"status_code": 0})
         return None
 
-    system_prompt = get_env("DISPUTE_GEMINI_PROMPT", SYSTEM_PROMPT_FALLBACK) or SYSTEM_PROMPT_FALLBACK
-    model_name = get_env("DISPUTE_GEMINI_MODEL", DISPUTE_GEMINI_MODEL) or DISPUTE_GEMINI_MODEL
-    endpoint = _gemini_endpoint(model_name)
+    system_prompt = get_env("DISPUTE_GROQ_PROMPT", SYSTEM_PROMPT_FALLBACK) or SYSTEM_PROMPT_FALLBACK
+    model_name = get_env("DISPUTE_GROQ_MODEL", DEFAULT_DISPUTE_GROQ_MODEL) or DEFAULT_DISPUTE_GROQ_MODEL
+    endpoint = _groq_chat_completions_endpoint()
 
     payload = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": json.dumps(model_input, ensure_ascii=False)}],
-            }
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(model_input, ensure_ascii=False)},
         ],
-        "generationConfig": {
-            "temperature": 0.1,
-            "topP": 0.8,
-            "responseMimeType": "application/json",
-        },
+        "temperature": 0.1,
+        "top_p": 0.8,
+        "response_format": {"type": "json_object"},
     }
 
     def _invoke() -> Optional[Dict[str, Any]]:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        url = endpoint + "?" + urllib.parse.urlencode({"key": DISPUTE_GEMINI_API_KEY})
 
         req = urllib.request.Request(
-            url,
+            endpoint,
             data=body,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {DISPUTE_GROQ_API_KEY}",
+            },
             method="POST",
         )
 
@@ -1421,40 +1421,44 @@ def _call_gemini(model_input: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
-            raise RuntimeError(f"Gemini HTTP {exc.code}: {detail[:500]}") from exc
+            raise RuntimeError(f"Groq HTTP {exc.code}: {detail[:500]}") from exc
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"Gemini transport error: {exc}") from exc
+            raise RuntimeError(f"Groq transport error: {exc}") from exc
 
         parsed = json.loads(raw)
         text_parts: List[str] = []
-        for candidate in parsed.get("candidates", []) or []:
-            content = candidate.get("content") or {}
-            for part in content.get("parts", []) or []:
-                if isinstance(part, dict) and isinstance(part.get("text"), str):
-                    text_parts.append(part["text"])
+        for choice in parsed.get("choices", []) or []:
+            message = choice.get("message") or {}
+            content = message.get("content")
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        text_parts.append(part["text"])
 
         model_text = _strip_markdown_fences("\n".join(text_parts))
         if not model_text:
-            raise RuntimeError("Gemini returned empty body")
+            raise RuntimeError("Groq returned empty body")
 
         try:
             obj = json.loads(model_text)
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"Gemini returned invalid JSON: {model_text[:400]}") from exc
+            raise RuntimeError(f"Groq returned invalid JSON: {model_text[:400]}") from exc
 
         elapsed_ms = int(round((time.perf_counter() - started) * 1000))
         logger.info(
-            "dispute_gemini_success",
+            "dispute_groq_success",
             extra={"elapsed_ms": elapsed_ms, "model": model_name, "status_code": 0},
         )
         if isinstance(obj, dict):
             return obj
-        raise RuntimeError("Gemini JSON root must be object")
+        raise RuntimeError("Groq JSON root must be object")
 
     result = call_external_sync(
-        "gemini_dispute",
+        "groq_dispute",
         _invoke,
-        retries=DISPUTE_GEMINI_RETRIES,
+        retries=DISPUTE_GROQ_RETRIES,
         fallback=None,
     )
     if isinstance(result, dict):
@@ -1509,7 +1513,7 @@ def process_dispute_model_turn(dispute_id: str) -> None:
             (dispute_id,),
         )
 
-        llm_obj = _call_gemini(model_input)
+        llm_obj = _call_groq(model_input)
         normalized = _normalize_llm_response(
             response_obj=llm_obj,
             dispute=dispute_dict,

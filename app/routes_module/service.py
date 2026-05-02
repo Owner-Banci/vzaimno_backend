@@ -15,6 +15,8 @@ from app.task_compat import ensure_task_payload
 from .schemas import CoordinateOut, RouteContextOut, RouteDetailsOut, RouteTaskByPathOut
 from .sql import (
     FIND_CURRENT_ROUTE_TASK_SQL,
+    FIND_KNOWN_ROUTE_POINT_BY_ADDRESS_SQL,
+    FIND_TASK_ROUTE_POINTS_SQL,
     FIND_TASK_ROUTE_CONTEXT_SQL,
     NEARBY_TASKS_BY_ROUTE_SQL,
 )
@@ -175,12 +177,17 @@ def _load_route_context(*, announcement_id: str, user_id: str) -> dict[str, Any]
     ann_owner_id = str(row[1])
     category = str(row[2] or "")
     title = str(row[3] or "")
-    performer_id = str(row[5]) if row[5] else None
-    assignment_status = str(row[6] or "")
-    execution_stage = str(row[7] or "")
-    route_visibility = str(row[8] or "")
+    raw_data = _coerce_data(row[4])
+    if row[5] and "address_text" not in raw_data:
+        raw_data["address_text"] = str(row[5])
+    if row[6] is not None and row[7] is not None and "point" not in raw_data:
+        raw_data["point"] = {"lat": float(row[6]), "lon": float(row[7])}
+    performer_id = str(row[8]) if row[8] else None
+    assignment_status = str(row[9] or "")
+    execution_stage = str(row[10] or "")
+    route_visibility = str(row[11] or "")
     data = ensure_task_payload(
-        _coerce_data(row[4]),
+        raw_data,
         title=title,
         announcement_status=_route_announcement_status(
             assignment_status=assignment_status,
@@ -205,6 +212,9 @@ def _load_route_context(*, announcement_id: str, user_id: str) -> dict[str, Any]
         raise HTTPException(status_code=409, detail="Маршрут появится после принятия активного задания")
 
     route_points = _extract_route_points(data, category)
+    stored_route_points = _load_stored_route_points(ann_id)
+    if not route_points:
+        route_points = _route_points_from_stored(stored_route_points)
     if not route_points:
         raise HTTPException(
             status_code=422,
@@ -212,7 +222,13 @@ def _load_route_context(*, announcement_id: str, user_id: str) -> dict[str, Any]
         )
 
     start_point, end_point = route_points
-    start_address, end_address = _resolve_route_addresses(data, category, start_point, end_point)
+    start_address, end_address = _resolve_route_addresses(
+        data,
+        category,
+        start_point,
+        end_point,
+        stored_route_points=stored_route_points,
+    )
 
     return {
         "announcement_id": ann_id,
@@ -291,8 +307,8 @@ def _parse_float(value: Any) -> float | None:
 def _extract_point(value: Any) -> tuple[float, float] | None:
     if not isinstance(value, dict):
         return None
-    lat = _parse_float(value.get("lat"))
-    lon = _parse_float(value.get("lon"))
+    lat = _first_float(value.get("lat"), value.get("latitude"))
+    lon = _first_float(value.get("lon"), value.get("lng"), value.get("longitude"))
     if lat is None or lon is None:
         return None
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
@@ -300,11 +316,34 @@ def _extract_point(value: Any) -> tuple[float, float] | None:
     return lat, lon
 
 
+def _extract_flat_point(data: dict[str, Any], prefixes: tuple[str, ...]) -> tuple[float, float] | None:
+    for prefix in prefixes:
+        lat = _first_float(data.get(f"{prefix}_lat"), data.get(f"{prefix}_latitude"))
+        lon = _first_float(
+            data.get(f"{prefix}_lon"),
+            data.get(f"{prefix}_lng"),
+            data.get(f"{prefix}_longitude"),
+        )
+        if lat is None or lon is None:
+            continue
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            return lat, lon
+    return None
+
+
 def _normalize_address(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     normalized = " ".join(value.strip().split())
     return normalized or None
+
+
+def _first_float(*values: Any) -> float | None:
+    for value in values:
+        parsed = _parse_float(value)
+        if parsed is not None:
+            return parsed
+    return None
 
 
 def _extract_route_points(
@@ -321,15 +360,21 @@ def _extract_route_points(
         _extract_point(data.get("pickup_point"))
         or _extract_point(data.get("help_point"))
         or _extract_point(data.get("start_point"))
+        or _extract_point(data.get("source_point"))
+        or _extract_point(data.get("from_point"))
+        or _extract_point(data.get("origin_point"))
         or _extract_point(data.get("point"))
         or _extract_point(route_source.get("point"))
+        or _extract_flat_point(data, ("pickup", "help", "start", "source", "from", "origin"))
     )
     end = (
         _extract_point(data.get("dropoff_point"))
         or _extract_point(data.get("end_point"))
         or _extract_point(data.get("destination_point"))
         or _extract_point(data.get("to_point"))
+        or _extract_point(data.get("delivery_point"))
         or _extract_point(route_destination.get("point"))
+        or _extract_flat_point(data, ("dropoff", "end", "destination", "to", "delivery"))
     )
 
     start_address = (
@@ -349,18 +394,78 @@ def _extract_route_points(
 
     if normalized_category == "delivery":
         if start is None and start_address:
-            start = geocode_address(start_address)
+            start = _resolve_address_point(start_address)
         if end is None and end_address:
-            end = geocode_address(end_address)
+            end = _resolve_address_point(end_address)
     else:
         if start is None and start_address:
-            start = geocode_address(start_address)
+            start = _resolve_address_point(start_address)
         if end is None and end_address:
-            end = geocode_address(end_address)
+            end = _resolve_address_point(end_address)
+
+    if start is not None and end is None:
+        end = start
+    elif end is not None and start is None:
+        start = end
 
     if start is None or end is None:
         return None
     return start, end
+
+
+def _resolve_address_point(address: str) -> tuple[float, float] | None:
+    known_point = _lookup_known_address_point(address)
+    if known_point is not None:
+        return known_point
+    return geocode_address(address)
+
+
+def _lookup_known_address_point(address: str) -> tuple[float, float] | None:
+    normalized = _normalize_address(address)
+    if not normalized:
+        return None
+    row = fetch_one(FIND_KNOWN_ROUTE_POINT_BY_ADDRESS_SQL, (normalized,))
+    if not row:
+        return None
+    lat = _parse_float(row[0])
+    lon = _parse_float(row[1])
+    if lat is None or lon is None:
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    return lat, lon
+
+
+def _load_stored_route_points(announcement_id: str) -> list[dict[str, Any]]:
+    rows = fetch_all(FIND_TASK_ROUTE_POINTS_SQL, (announcement_id,))
+    points: list[dict[str, Any]] = []
+    for row in rows:
+        lat = _parse_float(row[3])
+        lon = _parse_float(row[4])
+        if lat is None or lon is None:
+            continue
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+        points.append(
+            {
+                "order": int(row[0] or 0),
+                "address": _normalize_address(row[1]),
+                "kind": _normalize_address(row[2]),
+                "point": (lat, lon),
+            }
+        )
+    return points
+
+
+def _route_points_from_stored(
+    stored_route_points: list[dict[str, Any]],
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    if not stored_route_points:
+        return None
+    if len(stored_route_points) == 1:
+        point = stored_route_points[0]["point"]
+        return point, point
+    return stored_route_points[0]["point"], stored_route_points[-1]["point"]
 
 
 def _resolve_route_addresses(
@@ -368,6 +473,8 @@ def _resolve_route_addresses(
     category: str,
     start_point: tuple[float, float],
     end_point: tuple[float, float],
+    *,
+    stored_route_points: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str]:
     category_key = category.strip().lower()
     task = data.get("task") if isinstance(data.get("task"), dict) else {}
@@ -392,11 +499,23 @@ def _resolve_route_addresses(
         )
 
     if not start_address:
+        start_address = _stored_route_address(stored_route_points, first=True)
+    if not end_address:
+        end_address = _stored_route_address(stored_route_points, first=False)
+
+    if not start_address:
         start_address = _format_point(start_point)
     if not end_address:
         end_address = _format_point(end_point)
 
     return start_address, end_address
+
+
+def _stored_route_address(stored_route_points: list[dict[str, Any]] | None, *, first: bool) -> str | None:
+    if not stored_route_points:
+        return None
+    point = stored_route_points[0] if first else stored_route_points[-1]
+    return _normalize_address(point.get("address"))
 
 
 def _format_point(point: tuple[float, float]) -> str:
