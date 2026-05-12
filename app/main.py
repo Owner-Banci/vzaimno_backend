@@ -1473,6 +1473,7 @@ def _repair_announcement_row_if_needed(row):
         deleted_at=row[9],
         assignment={
             "id": row[14],
+            "customer_id": row[1],
             "assignment_status": row[15],
             "execution_stage": row[16],
             "performer_id": row[17],
@@ -2668,6 +2669,24 @@ def _active_assignment_for_task(task_id: str):
 
 
 def _create_or_update_assignment(task_id: str, offer_id: str, customer_id: str, performer_id: str) -> str:
+    if str(customer_id) == str(performer_id):
+        raise HTTPException(status_code=409, detail="Исполнитель не может совпадать с заказчиком")
+
+    offer_row = fetch_one(
+        """
+        SELECT performer_id::text
+        FROM task_offers
+        WHERE id::text = %s
+          AND task_id::text = %s
+        LIMIT 1
+        """,
+        (offer_id, task_id),
+    )
+    if not offer_row:
+        raise HTTPException(status_code=404, detail="Offer not found")
+    if str(offer_row[0]) != str(performer_id):
+        raise HTTPException(status_code=409, detail="Отклик принадлежит другому исполнителю")
+
     existing = _active_assignment_for_task(task_id)
     if existing and str(existing[1]) == offer_id:
         return str(existing[0])
@@ -3300,6 +3319,8 @@ def accept_announcement_offer(
             raise HTTPException(status_code=404, detail="Offer not found")
 
         performer_id, status = row
+        if str(performer_id) == str(ann.user_id):
+            raise HTTPException(status_code=409, detail="Исполнитель не может совпадать с заказчиком")
         if status == "rejected_by_customer":
             raise HTTPException(status_code=409, detail="Отклик уже отклонён")
 
@@ -3446,7 +3467,9 @@ def update_announcement_execution_stage(
         raise HTTPException(status_code=409, detail="Для задания пока нет активного исполнителя")
 
     assignment_id, accepted_offer_id, performer_id, assignment_status, current_stage, chat_thread_id = assignment
-    if user.id != performer_id and user.id != ann.user_id:
+    if user.id != performer_id:
+        if user.id == ann.user_id:
+            raise HTTPException(status_code=403, detail="Заказчик может только наблюдать за выполнением задания")
         raise HTTPException(status_code=403, detail="Недостаточно прав для смены этапа")
 
     new_stage = _canonical_execution_stage(payload.stage)
@@ -3486,6 +3509,7 @@ def update_announcement_execution_stage(
         next_task_status = "cancelled"
 
     accepted_confirmed = new_stage != "cancelled"
+    next_route_visibility = route_visibility_for_execution(new_stage)
     data_obj: Dict[str, Any] = dict(ann.data or {})
     task_obj = _ensure_obj(data_obj.get("task"))
     task_execution = _ensure_obj(task_obj.get("execution"))
@@ -3493,8 +3517,18 @@ def update_announcement_execution_stage(
     legacy_execution = _ensure_obj(data_obj.get("execution"))
 
     task_execution["status"] = new_stage
+    task_execution["assignment_id"] = assignment_id
+    task_execution["customer_user_id"] = ann.user_id
+    task_execution["performer_user_id"] = performer_id
+    task_execution["chat_thread_id"] = chat_thread_id
     task_execution["accepted_confirmed"] = accepted_confirmed
+    task_execution["route_visibility"] = next_route_visibility
+    task_assignment["assignment_status"] = next_assignment_status
     task_assignment["execution_status"] = new_stage
+    task_assignment["customer_user_id"] = ann.user_id
+    task_assignment["performer_user_id"] = performer_id
+    task_assignment["chat_thread_id"] = chat_thread_id
+    task_assignment["route_visibility"] = next_route_visibility
     task_assignment["accepted_confirmed"] = accepted_confirmed
     task_obj["execution"] = task_execution
     task_obj["assignment"] = task_assignment
@@ -3506,7 +3540,6 @@ def update_announcement_execution_stage(
     data_obj["execution_status"] = new_stage
     data_obj["execution_status_confirmed"] = accepted_confirmed
 
-    next_route_visibility = route_visibility_for_execution(new_stage)
     execute(
         """
         UPDATE task_assignments

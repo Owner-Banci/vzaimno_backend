@@ -105,6 +105,13 @@ def build_route_context_for_announcement(
         end=CoordinateOut(lat=end_point[0], lon=end_point[1]),
         radius_m=max(50, int(radius_m)),
         travel_mode=context["travel_mode"],
+        customer_user_id=context["customer_user_id"],
+        performer_user_id=context["performer_user_id"],
+        viewer_role=context["viewer_role"],
+        can_update_execution=context["can_update_execution"],
+        assignment_status=context["assignment_status"] or None,
+        execution_stage=context["execution_stage"] or None,
+        route_visibility=context["route_visibility"] or None,
     )
 
 
@@ -160,6 +167,13 @@ def build_route_from_polyline(
         duration_text=_format_duration(effective_duration),
         polyline=normalized_polyline,
         tasks_by_route=tasks_by_route,
+        customer_user_id=context["customer_user_id"],
+        performer_user_id=context["performer_user_id"],
+        viewer_role=context["viewer_role"],
+        can_update_execution=context["can_update_execution"],
+        assignment_status=context["assignment_status"] or None,
+        execution_stage=context["execution_stage"] or None,
+        route_visibility=context["route_visibility"] or None,
     )
 
 
@@ -192,6 +206,11 @@ def _load_route_context(*, announcement_id: str, user_id: str) -> dict[str, Any]
     assignment_status = str(row[9] or "")
     execution_stage = str(row[10] or "")
     route_visibility = str(row[11] or "")
+    viewer_role = _route_viewer_role(
+        owner_id=ann_owner_id,
+        performer_id=performer_id,
+        user_id=user_id,
+    )
     data = ensure_task_payload(
         raw_data,
         title=title,
@@ -200,6 +219,7 @@ def _load_route_context(*, announcement_id: str, user_id: str) -> dict[str, Any]
             execution_stage=execution_stage,
         ),
         assignment={
+            "customer_id": ann_owner_id,
             "performer_id": performer_id,
             "assignment_status": assignment_status,
             "execution_stage": execution_stage,
@@ -245,7 +265,22 @@ def _load_route_context(*, announcement_id: str, user_id: str) -> dict[str, Any]
         "start_address": start_address,
         "end_address": end_address,
         "travel_mode": _task_travel_mode(data),
+        "customer_user_id": ann_owner_id,
+        "performer_user_id": performer_id,
+        "viewer_role": viewer_role,
+        "can_update_execution": viewer_role == "performer" and assignment_status in {"assigned", "in_progress"},
+        "assignment_status": assignment_status,
+        "execution_stage": execution_stage,
+        "route_visibility": route_visibility,
     }
+
+
+def _route_viewer_role(*, owner_id: str, performer_id: str | None, user_id: str) -> str | None:
+    if owner_id == user_id:
+        return "customer"
+    if performer_id == user_id:
+        return "performer"
+    return None
 
 
 def _assert_route_access(

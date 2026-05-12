@@ -142,7 +142,7 @@ FROM (
     FROM tasks t
     WHERE t.customer_id::text = %s
       AND t.deleted_at IS NULL
-      AND t.status IN ('published', 'in_responses', 'agreed')
+      AND t.status IN ('published', 'in_responses', 'agreed', 'in_progress')
       AND t.moderation_status = 'published'
 ) candidate
 ORDER BY candidate.priority ASC, candidate.sort_at DESC NULLS LAST

@@ -34,6 +34,13 @@ class RouteContextOut(BaseModel):
     end: CoordinateOut
     radius_m: int = Field(default=500)
     travel_mode: str = Field(default="driving")
+    customer_user_id: Optional[str] = None
+    performer_user_id: Optional[str] = None
+    viewer_role: Optional[str] = None
+    can_update_execution: bool = False
+    assignment_status: Optional[str] = None
+    execution_stage: Optional[str] = None
+    route_visibility: Optional[str] = None
 
 
 class RouteTaskByPathOut(BaseModel):
@@ -59,3 +66,10 @@ class RouteDetailsOut(BaseModel):
     duration_text: str
     polyline: List[List[float]] = Field(default_factory=list)
     tasks_by_route: List[RouteTaskByPathOut] = Field(default_factory=list)
+    customer_user_id: Optional[str] = None
+    performer_user_id: Optional[str] = None
+    viewer_role: Optional[str] = None
+    can_update_execution: bool = False
+    assignment_status: Optional[str] = None
+    execution_stage: Optional[str] = None
+    route_visibility: Optional[str] = None

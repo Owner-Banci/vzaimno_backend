@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.bootstrap import ensure_all_tables
 from app.chat import _offer_thread_kind_value, ensure_chat_participant
-from app.db import execute
+from app.db import execute, fetch_one
 from app.main import _insert_task, app as public_app
 from app.security import hash_password
 
@@ -186,6 +186,22 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         thread_id = accept_response.json()["thread_id"]
         self.thread_ids.append(thread_id)
 
+        assignment_row = fetch_one(
+            """
+            SELECT customer_id::text, performer_id::text, assignment_status, execution_stage
+            FROM task_assignments
+            WHERE task_id = %s::uuid
+            LIMIT 1
+            """,
+            (task_id,),
+        )
+        self.assertIsNotNone(assignment_row)
+        self.assertEqual(assignment_row[0], owner["id"])
+        self.assertEqual(assignment_row[1], performer["id"])
+        self.assertNotEqual(assignment_row[0], assignment_row[1])
+        self.assertEqual(assignment_row[2], "assigned")
+        self.assertEqual(assignment_row[3], "accepted")
+
         owner_chats = self.client.get("/chats", headers={"Authorization": f"Bearer {owner_token}"})
         self.assertEqual(owner_chats.status_code, 200, owner_chats.text)
         performer_chats = self.client.get("/chats", headers={"Authorization": f"Bearer {performer_token}"})
@@ -208,6 +224,7 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         owner_task = next((item for item in owner_tasks.json() if item["id"] == task_id), None)
         self.assertIsNotNone(owner_task)
         self.assertEqual(owner_task["data"]["task"]["assignment"]["performer_user_id"], performer["id"])
+        self.assertEqual(owner_task["data"]["task"]["assignment"]["customer_user_id"], owner["id"])
         self.assertEqual(owner_task["data"]["task"]["assignment"]["chat_thread_id"], thread_id)
 
         performer_tasks = self.client.get(
@@ -223,6 +240,49 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(route_context.status_code, 200, route_context.text)
         self.assertEqual(route_context.json()["entity_id"], task_id)
+        self.assertEqual(route_context.json()["customer_user_id"], owner["id"])
+        self.assertEqual(route_context.json()["performer_user_id"], performer["id"])
+        self.assertEqual(route_context.json()["viewer_role"], "performer")
+        self.assertTrue(route_context.json()["can_update_execution"])
+
+        owner_route_context = self.client.get(
+            "/routes/me/current/context",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(owner_route_context.status_code, 200, owner_route_context.text)
+        self.assertEqual(owner_route_context.json()["entity_id"], task_id)
+        self.assertEqual(owner_route_context.json()["viewer_role"], "customer")
+        self.assertFalse(owner_route_context.json()["can_update_execution"])
+
+        owner_stage_response = self.client.post(
+            f"/announcements/{task_id}/execution-stage",
+            headers={"Authorization": f"Bearer {owner_token}"},
+            json={"stage": "en_route"},
+        )
+        self.assertEqual(owner_stage_response.status_code, 403, owner_stage_response.text)
+
+        performer_stage_response = self.client.post(
+            f"/announcements/{task_id}/execution-stage",
+            headers={"Authorization": f"Bearer {performer_token}"},
+            json={"stage": "en_route"},
+        )
+        self.assertEqual(performer_stage_response.status_code, 200, performer_stage_response.text)
+        self.assertEqual(
+            performer_stage_response.json()["data"]["task"]["assignment"]["performer_user_id"],
+            performer["id"],
+        )
+        self.assertEqual(
+            performer_stage_response.json()["data"]["task"]["assignment"]["customer_user_id"],
+            owner["id"],
+        )
+
+        owner_route_after_progress = self.client.get(
+            "/routes/me/current/context",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(owner_route_after_progress.status_code, 200, owner_route_after_progress.text)
+        self.assertEqual(owner_route_after_progress.json()["entity_id"], task_id)
+        self.assertEqual(owner_route_after_progress.json()["execution_stage"], "en_route")
 
         performer_message = self.client.post(
             f"/chats/{thread_id}/messages",
@@ -324,6 +384,55 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["end_address"], "Москва, Арбат 10")
         self.assertAlmostEqual(payload["start"]["lat"], 55.7558, places=4)
         self.assertAlmostEqual(payload["end"]["lon"], 37.5931, places=4)
+
+    def test_accept_offer_refuses_assignment_where_customer_is_performer(self) -> None:
+        owner = self._create_user("self-assignment-owner")
+        owner_token = self._login_user(owner)
+        task_id = str(uuid.uuid4())
+        offer_id = str(uuid.uuid4())
+        self.task_ids.append(task_id)
+
+        _insert_task(
+            task_id,
+            owner["id"],
+            "delivery",
+            "Забрать документы",
+            "active",
+            {
+                "pickup_address": "Москва, Тверская 1",
+                "dropoff_address": "Москва, Арбат 10",
+                "pickup_point": {"lat": 55.7558, "lon": 37.6173},
+                "dropoff_point": {"lat": 55.7522, "lon": 37.5931},
+                "notes": "Тест некорректного отклика",
+            },
+        )
+        execute(
+            """
+            INSERT INTO task_offers (
+                id, task_id, performer_id, message, proposed_price, currency, status,
+                created_at, updated_at, pricing_mode, agreed_price, minimum_price_accepted,
+                can_reoffer, reoffer_block_reason
+            )
+            VALUES (
+                %s::uuid, %s::uuid, %s::uuid, 'bad self-offer', 1000, 'RUB', 'sent',
+                now(), now(), 'counter_price', 1000, FALSE, TRUE, NULL
+            )
+            """,
+            (offer_id, task_id, owner["id"]),
+        )
+
+        accept_response = self.client.post(
+            f"/announcements/{task_id}/offers/{offer_id}/accept",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(accept_response.status_code, 409, accept_response.text)
+        self.assertIn("Исполнитель не может совпадать", accept_response.text)
+
+        assignment_row = fetch_one(
+            "SELECT 1 FROM task_assignments WHERE task_id = %s::uuid",
+            (task_id,),
+        )
+        self.assertIsNone(assignment_row)
 
     def test_dispute_open_active_accept_flow(self) -> None:
         owner = self._create_user("dispute-owner")

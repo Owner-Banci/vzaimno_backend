@@ -476,6 +476,7 @@ def ensure_task_payload(
 
     execution["status"] = execution_status
     execution["assignment_id"] = assignment_info.get("id")
+    execution["customer_user_id"] = assignment_info.get("customer_id")
     execution["performer_user_id"] = assignment_info.get("performer_id")
     if assignment_info.get("chat_thread_id"):
         execution["chat_thread_id"] = assignment_info.get("chat_thread_id")
@@ -498,6 +499,7 @@ def ensure_task_payload(
     task["assignment"] = {
         "assignment_status": assignment_info.get("assignment_status"),
         "execution_status": execution_status,
+        "customer_user_id": assignment_info.get("customer_id"),
         "performer_user_id": assignment_info.get("performer_id"),
         "chat_thread_id": assignment_info.get("chat_thread_id"),
         "route_visibility": assignment_info.get("route_visibility"),
@@ -532,6 +534,7 @@ def ensure_task_payload(
 def task_row_to_announcement_dict(row: Dict[str, Any]) -> Dict[str, Any]:
     assignment = {
         "id": row.get("assignment_id"),
+        "customer_id": row.get("customer_id"),
         "assignment_status": row.get("assignment_status"),
         "execution_stage": row.get("execution_stage"),
         "performer_id": row.get("assignment_performer_id"),
