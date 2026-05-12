@@ -16,9 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
 COPY services/admin_panel/requirements.txt /app/services/admin_panel/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt -r /app/services/admin_panel/requirements.txt
+RUN pip install --no-cache-dir -r /app/services/admin_panel/requirements.txt
 
 COPY . /app
 RUN chmod +x /app/scripts/*.sh \
