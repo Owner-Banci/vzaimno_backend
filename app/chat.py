@@ -16,6 +16,7 @@ from app.ops import create_notification
 from app.schema_compat import table_has_column
 from app.task_compat import normalize_optional_text
 from app.user_identity import user_display_name_sql
+from app.user_restrictions import assert_user_action_allowed
 
 
 class ChatWebSocketHub:
@@ -767,6 +768,7 @@ def _fetch_chat_message_row(message_id: str):
 
 def post_thread_message(thread_id: str, sender_id: str, text: str) -> Dict[str, Any]:
     assert_thread_access(thread_id, sender_id)
+    assert_user_action_allowed(sender_id, "chat")
 
     clean_text = _normalize_text(text)
     if not clean_text:
@@ -846,6 +848,7 @@ def post_thread_image_message(
     media_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     assert_thread_access(thread_id, sender_id)
+    assert_user_action_allowed(sender_id, "chat")
 
     clean_text = _normalize_text(text) or "Фото"
     if not media_url:

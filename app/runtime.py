@@ -1,23 +1,20 @@
 from __future__ import annotations
 
 import os
-import uuid
 from pathlib import Path
-from typing import Any
-
-from fastapi import HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import HTTPException
 
 import app.main as main_module
 from app.db import fetch_one
 from app.main import app
-from app.rate_limit import LimitRule, check_redis_ready, enforce_rate_limit, redis_url
+from app.rate_limit import check_redis_ready, redis_url
 from app.runtime_hardening import (
     apply_http_hardening,
     is_production_env,
     require_production_env_values,
     uploads_root,
 )
+from app.storage import storage_backend
 
 
 _PROD_REQUIRED_ENV = (
@@ -37,11 +34,6 @@ def _apply_runtime_validations() -> None:
     require_production_env_values("backend", _PROD_REQUIRED_ENV)
 
 
-def _normalize_upload_filename(filename: str | None) -> str:
-    safe_name = (filename or "image").replace("/", "_").replace("\\", "_").strip()
-    return safe_name or "image"
-
-
 def _writable_uploads_root() -> Path:
     candidates = [uploads_root()]
     if os.getenv("ALLOW_TMP_UPLOADS_FALLBACK", "").strip().lower() in {"1", "true", "yes", "on"}:
@@ -59,53 +51,9 @@ def _writable_uploads_root() -> Path:
 
 
 def _patch_upload_storage_behavior() -> None:
-    root = _writable_uploads_root()
-    main_module.UPLOADS_DIR = root
-
-    def _save_upload_portable(ann_id: str, file: UploadFile, content: bytes) -> str:
-        folder = root / ann_id
-        folder.mkdir(parents=True, exist_ok=True)
-        filename = _normalize_upload_filename(file.filename)
-        out = folder / f"{uuid.uuid4().hex}_{filename}"
-        out.write_bytes(content)
-        return f"/uploads/{ann_id}/{out.name}"
-
-    def _save_chat_upload_portable(thread_id: str, filename: str | None, content: bytes) -> str:
-        folder = root / "chat" / thread_id
-        folder.mkdir(parents=True, exist_ok=True)
-        out = folder / f"{uuid.uuid4().hex}_{_normalize_upload_filename(filename)}"
-        out.write_bytes(content)
-        return f"/uploads/chat/{thread_id}/{out.name}"
-
-    main_module._save_upload = _save_upload_portable
-    main_module._save_chat_upload = _save_chat_upload_portable
-
-
-def _request_identity(request: Request) -> str:
-    if request.client and request.client.host:
-        return request.client.host
-    forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded.strip():
-        return forwarded.split(",", 1)[0].strip() or "unknown"
-    return "unknown"
-
-
-def _auth_scope_and_limits(path: str) -> tuple[str, tuple[LimitRule, ...]] | None:
-    normalized = path.rstrip("/") or "/"
-    if normalized == "/auth/login":
-        return "user_login_ip", (LimitRule(6, 60), LimitRule(30, 3600))
-    if normalized == "/auth/register":
-        return "user_register_ip", (LimitRule(4, 300), LimitRule(20, 3600))
-    return None
-
-
-def _json_http_error(exc: HTTPException) -> JSONResponse:
-    payload: dict[str, Any] = {"detail": exc.detail}
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=payload,
-        headers=exc.headers or None,
-    )
+    if storage_backend() != "local":
+        return
+    main_module.UPLOADS_DIR = _writable_uploads_root()
 
 
 def _db_ready() -> bool:
@@ -119,19 +67,6 @@ def _db_ready() -> bool:
 _apply_runtime_validations()
 _patch_upload_storage_behavior()
 apply_http_hardening(app, service_name="backend", cors_origins_env="CORS_ALLOWED_ORIGINS")
-
-
-@app.middleware("http")
-async def user_auth_rate_limit(request: Request, call_next):
-    if request.method.upper() == "POST":
-        scope = _auth_scope_and_limits(request.url.path)
-        if scope is not None:
-            rl_scope, rules = scope
-            try:
-                await enforce_rate_limit(rl_scope, _request_identity(request), rules)
-            except HTTPException as exc:
-                return _json_http_error(exc)
-    return await call_next(request)
 
 
 @app.get("/healthz")

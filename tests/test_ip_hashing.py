@@ -3,13 +3,16 @@ from __future__ import annotations
 import os
 import unittest
 
-from app.config import get_secret
+from app.config import get_env, get_secret
+import app.pii as pii_module
 from app.pii import hash_ip, ip_hash_key
 
 
 class IpHashingTests(unittest.TestCase):
     def setUp(self) -> None:
         self._old_key = os.environ.get("IP_HASH_KEY")
+        pii_module._warned_missing_ip_hash_key = False
+        get_env.cache_clear()
         get_secret.cache_clear()
         ip_hash_key.cache_clear()
 
@@ -18,11 +21,14 @@ class IpHashingTests(unittest.TestCase):
             os.environ.pop("IP_HASH_KEY", None)
         else:
             os.environ["IP_HASH_KEY"] = self._old_key
+        pii_module._warned_missing_ip_hash_key = False
+        get_env.cache_clear()
         get_secret.cache_clear()
         ip_hash_key.cache_clear()
 
     def test_hash_ip_with_key_is_deterministic_hex(self) -> None:
         os.environ["IP_HASH_KEY"] = "test-ip-key"
+        get_env.cache_clear()
         get_secret.cache_clear()
         ip_hash_key.cache_clear()
 
@@ -34,6 +40,7 @@ class IpHashingTests(unittest.TestCase):
 
     def test_hash_ip_without_key_returns_raw(self) -> None:
         os.environ.pop("IP_HASH_KEY", None)
+        get_env.cache_clear()
         get_secret.cache_clear()
         ip_hash_key.cache_clear()
 

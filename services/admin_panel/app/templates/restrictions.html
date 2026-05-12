@@ -5,6 +5,7 @@
     <p class="eyebrow">Manual action</p>
     <h2>Выдать ограничение</h2>
     <form method="post" action="/admin/restrictions/create" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ request.session.get('admin_csrf_token', '') }}">
       <label>ID пользователя
         <input type="text" name="user_id" required placeholder="UUID пользователя">
       </label>
@@ -127,11 +128,13 @@
         <td>
           {% if restriction.status == "active" %}
           <form method="post" action="/admin/restrictions/{{ restriction.id }}/extend" class="inline-form">
+            <input type="hidden" name="csrf_token" value="{{ request.session.get('admin_csrf_token', '') }}">
             <input type="datetime-local" name="ends_at" required>
             <input type="text" name="comment" placeholder="Комментарий к продлению">
             <button type="submit">Продлить</button>
           </form>
           <form method="post" action="/admin/restrictions/{{ restriction.id }}/revoke" class="inline-form">
+            <input type="hidden" name="csrf_token" value="{{ request.session.get('admin_csrf_token', '') }}">
             <input type="text" name="comment" placeholder="Причина снятия">
             <button type="submit" class="danger">Снять</button>
           </form>

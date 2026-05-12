@@ -163,6 +163,7 @@
 <section class="panel">
   <h3>Решение модератора</h3>
   <form method="post" action="/admin/announcements/{{ announcement.id }}/decision" class="stack">
+    <input type="hidden" name="csrf_token" value="{{ request.session.get('admin_csrf_token', '') }}">
     <label>Сообщение пользователю
       <textarea name="message" rows="4" required>{{ summary.get("decision_message") or "" }}</textarea>
     </label>

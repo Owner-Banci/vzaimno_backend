@@ -483,7 +483,254 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
             json={"option_id": selected_option_id},
         )
         self.assertEqual(performer_select.status_code, 200, performer_select.text)
-        self.assertEqual(performer_select.json()["status"], "resolved")
+        self.assertEqual(performer_select.json()["status"], "waiting_final_acceptance")
+        self.assertEqual(performer_select.json()["selected_option_id"], selected_option_id)
+
+        owner_accept = self.client.post(
+            f"/chats/{thread_id}/disputes/{dispute_id}/final-acceptance",
+            headers={"Authorization": f"Bearer {owner_token}"},
+            json={"accepted": True},
+        )
+        self.assertEqual(owner_accept.status_code, 200, owner_accept.text)
+        self.assertEqual(owner_accept.json()["status"], "waiting_final_acceptance")
+        self.assertEqual(owner_accept.json()["my_final_acceptance_decision"], "accepted")
+        self.assertEqual(owner_accept.json()["final_acceptance_votes"]["customer"], "accepted")
+
+        performer_accept = self.client.post(
+            f"/chats/{thread_id}/disputes/{dispute_id}/final-acceptance",
+            headers={"Authorization": f"Bearer {performer_token}"},
+            json={"accepted": True},
+        )
+        self.assertEqual(performer_accept.status_code, 200, performer_accept.text)
+        self.assertEqual(performer_accept.json()["status"], "resolved")
+        self.assertEqual(performer_accept.json()["final_acceptance_votes"]["customer"], "accepted")
+        self.assertEqual(performer_accept.json()["final_acceptance_votes"]["performer"], "accepted")
+
+    def test_dispute_multiselect_resolves_by_shared_compromise(self) -> None:
+        owner = self._create_user("multi-owner")
+        performer = self._create_user("multi-performer")
+        owner_token = self._login_user(owner)
+        performer_token = self._login_user(performer)
+        thread_id = self._create_direct_thread(owner["id"], performer["id"])
+
+        open_response = self.client.post(
+            f"/chats/{thread_id}/disputes/open",
+            headers={"Authorization": f"Bearer {owner_token}"},
+            json={
+                "problem_title": "Мультивыбор",
+                "problem_description": "Проверяем пересечение нескольких вариантов",
+                "requested_compensation_rub": 1000,
+                "desired_resolution": "partial_refund",
+            },
+        )
+        self.assertEqual(open_response.status_code, 201, open_response.text)
+        dispute_id = open_response.json()["id"]
+        self.dispute_ids.append(dispute_id)
+
+        execute(
+            """
+            UPDATE disputes
+            SET status = 'waiting_round_1_votes',
+                active_round = 1,
+                counterparty_form = %s::jsonb,
+                round1_options = %s::jsonb,
+                round1_votes = '{}'::jsonb,
+                updated_at = now()
+            WHERE id = %s::uuid
+            """,
+            (
+                json.dumps(
+                    {
+                        "response_description": "Готов обсуждать средний вариант, но не полный возврат",
+                        "acceptable_refund_percent": 0,
+                        "desired_resolution": "partial_refund",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    [
+                        {
+                            "id": "opt_high",
+                            "lean": "initiator_favor",
+                            "title": "Высокий возврат",
+                            "description": "Больше подходит инициатору",
+                            "customer_action": "Принять",
+                            "performer_action": "Подтвердить",
+                            "compensation_rub": 900,
+                            "refund_percent": 90,
+                            "resolution_kind": "partial_refund",
+                        },
+                        {
+                            "id": "opt_low",
+                            "lean": "counterparty_favor",
+                            "title": "Низкий возврат",
+                            "description": "Больше подходит второй стороне",
+                            "customer_action": "Принять",
+                            "performer_action": "Подтвердить",
+                            "compensation_rub": 100,
+                            "refund_percent": 10,
+                            "resolution_kind": "partial_refund",
+                        },
+                        {
+                            "id": "opt_mid",
+                            "lean": "compromise",
+                            "title": "Средний возврат",
+                            "description": "Серединный вариант",
+                            "customer_action": "Принять",
+                            "performer_action": "Подтвердить",
+                            "compensation_rub": 500,
+                            "refund_percent": 50,
+                            "resolution_kind": "partial_refund",
+                        },
+                        {
+                            "id": "opt_redo",
+                            "lean": "compromise",
+                            "title": "Переделка",
+                            "description": "Альтернативный вариант",
+                            "customer_action": "Принять",
+                            "performer_action": "Подтвердить",
+                            "compensation_rub": 0,
+                            "refund_percent": 0,
+                            "resolution_kind": "redo",
+                        },
+                    ],
+                    ensure_ascii=False,
+                ),
+                dispute_id,
+            ),
+        )
+
+        owner_select = self.client.post(
+            f"/chats/{thread_id}/disputes/{dispute_id}/options/select",
+            headers={"Authorization": f"Bearer {owner_token}"},
+            json={"option_ids": ["opt_high", "opt_mid", "opt_redo"]},
+        )
+        self.assertEqual(owner_select.status_code, 200, owner_select.text)
+        self.assertEqual(owner_select.json()["my_vote_option_ids"], ["opt_high", "opt_mid", "opt_redo"])
+
+        performer_select = self.client.post(
+            f"/chats/{thread_id}/disputes/{dispute_id}/options/select",
+            headers={"Authorization": f"Bearer {performer_token}"},
+            json={"option_ids": ["opt_low", "opt_mid", "opt_redo"]},
+        )
+        self.assertEqual(performer_select.status_code, 200, performer_select.text)
+        payload = performer_select.json()
+        self.assertEqual(payload["status"], "waiting_final_acceptance")
+        self.assertEqual(payload["selected_option_id"], "opt_mid")
+        self.assertEqual(payload["vote_option_ids"]["customer"], ["opt_high", "opt_mid", "opt_redo"])
+        self.assertEqual(payload["vote_option_ids"]["performer"], ["opt_low", "opt_mid", "opt_redo"])
+
+        owner_reject = self.client.post(
+            f"/chats/{thread_id}/disputes/{dispute_id}/final-acceptance",
+            headers={"Authorization": f"Bearer {owner_token}"},
+            json={"accepted": False},
+        )
+        self.assertEqual(owner_reject.status_code, 200, owner_reject.text)
+        self.assertEqual(owner_reject.json()["status"], "awaiting_moderator")
+        self.assertTrue(owner_reject.json()["moderator_required"])
+        self.assertEqual(owner_reject.json()["final_acceptance_votes"]["customer"], "rejected")
+
+    def test_dispute_round2_multiselect_enters_final_acceptance(self) -> None:
+        owner = self._create_user("round2-multi-owner")
+        performer = self._create_user("round2-multi-performer")
+        owner_token = self._login_user(owner)
+        performer_token = self._login_user(performer)
+        thread_id = self._create_direct_thread(owner["id"], performer["id"])
+
+        open_response = self.client.post(
+            f"/chats/{thread_id}/disputes/open",
+            headers={"Authorization": f"Bearer {owner_token}"},
+            json={
+                "problem_title": "Мультивыбор второго раунда",
+                "problem_description": "Проверяем общий выбор во втором раунде",
+                "requested_compensation_rub": 2000,
+                "desired_resolution": "partial_refund",
+            },
+        )
+        self.assertEqual(open_response.status_code, 201, open_response.text)
+        dispute_id = open_response.json()["id"]
+        self.dispute_ids.append(dispute_id)
+
+        execute(
+            """
+            UPDATE disputes
+            SET status = 'waiting_round_2_votes',
+                active_round = 2,
+                counterparty_form = %s::jsonb,
+                round2_options = %s::jsonb,
+                round2_votes = '{}'::jsonb,
+                updated_at = now()
+            WHERE id = %s::uuid
+            """,
+            (
+                json.dumps(
+                    {
+                        "response_description": "Готов обсуждать только более мягкий второй раунд",
+                        "acceptable_refund_percent": 30,
+                        "desired_resolution": "partial_refund",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    [
+                        {
+                            "id": "r2_high",
+                            "lean": "initiator_favor",
+                            "title": "18 000 ₽",
+                            "description": "Высокий вариант второго раунда",
+                            "customer_action": "Принять",
+                            "performer_action": "Подтвердить",
+                            "compensation_rub": 18000,
+                            "refund_percent": 90,
+                            "resolution_kind": "partial_refund",
+                        },
+                        {
+                            "id": "r2_mid",
+                            "lean": "compromise",
+                            "title": "18 500 ₽",
+                            "description": "Общий компромисс второго раунда",
+                            "customer_action": "Принять",
+                            "performer_action": "Подтвердить",
+                            "compensation_rub": 18500,
+                            "refund_percent": 92,
+                            "resolution_kind": "partial_refund",
+                        },
+                        {
+                            "id": "r2_low",
+                            "lean": "counterparty_favor",
+                            "title": "19 000 ₽",
+                            "description": "Нижний вариант второй стороны",
+                            "customer_action": "Принять",
+                            "performer_action": "Подтвердить",
+                            "compensation_rub": 19000,
+                            "refund_percent": 95,
+                            "resolution_kind": "partial_refund",
+                        },
+                    ],
+                    ensure_ascii=False,
+                ),
+                dispute_id,
+            ),
+        )
+
+        owner_select = self.client.post(
+            f"/chats/{thread_id}/disputes/{dispute_id}/options/select",
+            headers={"Authorization": f"Bearer {owner_token}"},
+            json={"option_ids": ["r2_high", "r2_mid"]},
+        )
+        self.assertEqual(owner_select.status_code, 200, owner_select.text)
+
+        performer_select = self.client.post(
+            f"/chats/{thread_id}/disputes/{dispute_id}/options/select",
+            headers={"Authorization": f"Bearer {performer_token}"},
+            json={"option_ids": ["r2_mid", "r2_low"]},
+        )
+        self.assertEqual(performer_select.status_code, 200, performer_select.text)
+        payload = performer_select.json()
+        self.assertEqual(payload["status"], "waiting_final_acceptance")
+        self.assertEqual(payload["selected_option_id"], "r2_mid")
+        self.assertEqual(payload["vote_option_ids"]["customer"], ["r2_high", "r2_mid"])
+        self.assertEqual(payload["vote_option_ids"]["performer"], ["r2_mid", "r2_low"])
 
 
 if __name__ == "__main__":

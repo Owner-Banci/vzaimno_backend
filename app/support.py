@@ -12,6 +12,7 @@ from app.db import execute, fetch_all, fetch_one
 from app.ops import create_notification
 from app.pii import decrypt_phone_expr
 from app.schema_compat import table_has_column
+from app.user_restrictions import assert_user_action_allowed
 
 
 ADMIN_ACCESS_ROLES = ("support", "moderator", "admin")
@@ -525,6 +526,7 @@ def _touch_support_thread(thread_id: str) -> None:
 
 
 def post_user_support_message(thread_id: str, user_id: str, text: str) -> Dict[str, Any]:
+    assert_user_action_allowed(user_id, "support")
     clean_text = _normalize_text(text)
     if not clean_text:
         raise HTTPException(status_code=400, detail="Message text is required")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import uuid
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -18,7 +19,7 @@ class AdminDisputesIntegrationTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         ensure_all_tables()
         cls.public_client = TestClient(public_app)
-        cls.admin_client = TestClient(admin_app)
+        cls.admin_client = TestClient(admin_app, base_url="http://localhost")
 
     def setUp(self) -> None:
         self.user_ids: list[str] = []
@@ -130,10 +131,14 @@ class AdminDisputesIntegrationTests(unittest.TestCase):
         return response.json()["access_token"]
 
     def _login_admin(self, admin: dict[str, str]) -> str:
-        response = self.admin_client.post(
-            "/admin/api/auth/login",
-            json={"login_identifier": admin["login_identifier"], "password": admin["password"]},
-        )
+        async def allow_rate_limit(*_args, **_kwargs) -> None:
+            return None
+
+        with patch("services.admin_panel.app.auth.enforce_rate_limit", new=allow_rate_limit):
+            response = self.admin_client.post(
+                "/admin/api/auth/login",
+                json={"login_identifier": admin["login_identifier"], "password": admin["password"]},
+            )
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
         self.assertEqual(payload["admin_account_id"], admin["id"])

@@ -2,6 +2,7 @@ services:
   postgres:
     image: postgis/postgis:16-3.4
     restart: unless-stopped
+    stop_grace_period: 60s
     env_file:
       - .env.production
     environment:
@@ -13,18 +14,21 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 10s
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
   redis:
     image: redis:7.2-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    stop_grace_period: 30s
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 3s
       retries: 10
+      start_period: 5s
     volumes:
       - redis_data:/data
 
@@ -37,11 +41,32 @@ services:
     volumes:
       - uploads_data:/app/uploads
 
+  migrate:
+    profiles: ["ops"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: "no"
+    init: true
+    env_file:
+      - .env.production
+    environment:
+      ENV: prod
+      DATABASE_URL: ${DATABASE_URL}
+      RUN_MIGRATIONS: "1"
+      ALLOW_RUNTIME_SCHEMA_BOOTSTRAP: "0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["/bin/bash", "/app/scripts/run_migrations.sh"]
+
   backend:
     build:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    init: true
+    stop_grace_period: 45s
     env_file:
       - .env.production
     environment:
@@ -49,7 +74,7 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
       UPLOADS_DIR: /app/uploads
-      RUN_MIGRATIONS: "1"
+      RUN_MIGRATIONS: "0"
       ALLOW_RUNTIME_SCHEMA_BOOTSTRAP: "0"
       ENABLE_PROXY_HEADERS: "1"
     depends_on:
@@ -75,6 +100,8 @@ services:
       context: .
       dockerfile: services/admin_panel/Dockerfile
     restart: unless-stopped
+    init: true
+    stop_grace_period: 45s
     env_file:
       - .env.production
     environment:

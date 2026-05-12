@@ -36,6 +36,7 @@ DISPUTE_STATUS_MODEL_THINKING = "model_thinking"
 DISPUTE_STATUS_WAITING_CLARIFICATIONS = "waiting_clarification_answers"
 DISPUTE_STATUS_WAITING_ROUND_1_VOTES = "waiting_round_1_votes"
 DISPUTE_STATUS_WAITING_ROUND_2_VOTES = "waiting_round_2_votes"
+DISPUTE_STATUS_WAITING_FINAL_ACCEPTANCE = "waiting_final_acceptance"
 DISPUTE_STATUS_CLOSED_BY_ACCEPTANCE = "closed_by_acceptance"
 DISPUTE_STATUS_RESOLVED = "resolved"
 DISPUTE_STATUS_AWAITING_MODERATOR = "awaiting_moderator"
@@ -46,6 +47,7 @@ DISPUTE_ACTIVE_STATUSES = {
     DISPUTE_STATUS_WAITING_CLARIFICATIONS,
     DISPUTE_STATUS_WAITING_ROUND_1_VOTES,
     DISPUTE_STATUS_WAITING_ROUND_2_VOTES,
+    DISPUTE_STATUS_WAITING_FINAL_ACCEPTANCE,
     DISPUTE_STATUS_AWAITING_MODERATOR,
 }
 
@@ -57,7 +59,9 @@ SYSTEM_PROMPT_FALLBACK = """
 2) Перед ответом оцени достаточность данных по критериям: факты выполнения, исходные условия задания, спорные суммы/условия, подтверждения из чата.
 3) Если есть неопределённость по любому критичному пункту — верни response_type="questions" и задай 1..5 вопросов.
 4) Вопросы должны быть максимально предметными и привязанными к конкретному спорному месту из контекста чата или задания.
-5) Если данных достаточно — верни 3 структурированных варианта урегулирования.
+5) Если данных достаточно — верни от 3 до 5 структурированных вариантов урегулирования.
+   Количество выбирай по сложности: 3 для простых/близких позиций, 4 для среднего разброса, 5 для сложного спора или большого разрыва по суммам/условиям.
+   Если запрос одной стороны отличается от готовности второй стороны примерно на 50% и больше — верни 5 вариантов.
 6) Не обсуждай виновность в юридическом смысле. Цель — практическое урегулирование.
 7) Варианты должны быть реалистичными: частичный/полный возврат, возврат с товаром, переделка, частичное урегулирование, предупреждение.
 8) Все поля ответа — только на русском языке.
@@ -73,8 +77,10 @@ SYSTEM_PROMPT_FALLBACK = """
    - (если есть) уточняющие ответы.
 15) Не используй общие фразы вида "это компромисс". Всегда указывай конкретную пользу и риск при отказе.
 16) customer_action и performer_action должны быть разными и персонализированными под роль.
+17) description должен коротко объяснять, почему вариант может быть финальным решением для обеих сторон.
+18) customer_action и performer_action начинай с самой сильной выгоды для соответствующей роли, без длинных вступлений.
 
-JSON contract:
+JSON contract (settlement_options должен содержать 3..5 элементов для вариантов урегулирования):
 {
   "response_type": "questions | settlement_options_round_1 | settlement_options_round_2",
   "summary": "string",
@@ -348,6 +354,14 @@ def _safe_post_system_message(thread_id: str, text: str) -> None:
         )
 
 
+def _ru_variant_word(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        return "вариант"
+    if count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14}:
+        return "варианта"
+    return "вариантов"
+
+
 def _required_answer_roles(dispute: Dict[str, Any]) -> Set[str]:
     questions = dispute.get("clarifying_questions") or []
     required: Set[str] = set()
@@ -378,18 +392,79 @@ def _active_options(dispute: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [item for item in dispute.get("round1_options") or [] if isinstance(item, dict)]
 
 
-def _active_votes(dispute: Dict[str, Any]) -> Dict[str, str]:
+def _final_acceptance_votes(dispute: Dict[str, Any]) -> Dict[str, str]:
+    hook = dispute.get("moderator_hook") or {}
+    raw = hook.get("final_acceptance_votes") if isinstance(hook, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+
+    result: Dict[str, str] = {}
+    for role, value in raw.items():
+        role_key = str(role)
+        decision = _normalize_text(value, max_len=32).lower()
+        if role_key in {"customer", "performer"} and decision in {"accepted", "rejected"}:
+            result[role_key] = decision
+    return result
+
+
+def _coerce_vote_list(value: Any) -> List[str]:
+    if isinstance(value, dict):
+        if isinstance(value.get("option_ids"), list):
+            value = value.get("option_ids")
+        else:
+            value = value.get("option_id")
+    raw_items = value if isinstance(value, list) else [value]
+    result: List[str] = []
+    for item in raw_items:
+        option_id = _normalize_text(item, max_len=64)
+        if option_id and option_id not in result:
+            result.append(option_id)
+    return result[:5]
+
+
+def _active_vote_lists(dispute: Dict[str, Any]) -> Dict[str, List[str]]:
     if dispute["active_round"] == 2:
         raw = dispute.get("round2_votes") or {}
     else:
         raw = dispute.get("round1_votes") or {}
-    result: Dict[str, str] = {}
+    result: Dict[str, List[str]] = {}
     if isinstance(raw, dict):
         for key, value in raw.items():
             k = str(key)
-            v = _normalize_text(value, max_len=128)
+            v = _coerce_vote_list(value)
             if k in {"customer", "performer"} and v:
                 result[k] = v
+    return result
+
+
+def _active_vote_adjustments(dispute: Dict[str, Any]) -> Dict[str, Dict[str, Dict[str, int]]]:
+    if dispute["active_round"] == 2:
+        raw = dispute.get("round2_votes") or {}
+    else:
+        raw = dispute.get("round1_votes") or {}
+
+    result: Dict[str, Dict[str, Dict[str, int]]] = {}
+    if not isinstance(raw, dict):
+        return result
+
+    for role, value in raw.items():
+        role_key = str(role)
+        if role_key not in {"customer", "performer"} or not isinstance(value, dict):
+            continue
+        raw_adjustments = value.get("adjustments")
+        if not isinstance(raw_adjustments, dict):
+            continue
+
+        role_adjustments: Dict[str, Dict[str, int]] = {}
+        for option_id, adjustment in raw_adjustments.items():
+            normalized_id = _normalize_text(option_id, max_len=64)
+            if not normalized_id or not isinstance(adjustment, dict):
+                continue
+            compensation = adjustment.get("compensation_rub")
+            if isinstance(compensation, int) and compensation >= 0:
+                role_adjustments[normalized_id] = {"compensation_rub": compensation}
+        if role_adjustments:
+            result[role_key] = role_adjustments
     return result
 
 
@@ -402,8 +477,14 @@ def _build_dispute_state_out(dispute: Dict[str, Any], viewer_user_id: str) -> Di
     required_roles = sorted(_required_answer_roles(dispute)) if dispute["status"] == DISPUTE_STATUS_WAITING_CLARIFICATIONS else []
 
     options = _active_options(dispute)
-    votes = _active_votes(dispute)
-    my_vote = votes.get(viewer_party_role or "", None)
+    vote_option_ids = _active_vote_lists(dispute)
+    vote_option_adjustments = _active_vote_adjustments(dispute)
+    final_acceptance_votes = _final_acceptance_votes(dispute)
+    votes = {role: option_ids[0] for role, option_ids in vote_option_ids.items() if option_ids}
+    my_vote_ids = vote_option_ids.get(viewer_party_role or "", [])
+    my_vote_adjustments = vote_option_adjustments.get(viewer_party_role or "", {})
+    my_vote = my_vote_ids[0] if my_vote_ids else None
+    my_final_decision = final_acceptance_votes.get(viewer_party_role or "", None)
 
     initiator_terms = {
         "requested_compensation_rub": int(dispute["initiator_form"].get("requested_compensation_rub") or 0),
@@ -427,11 +508,17 @@ def _build_dispute_state_out(dispute: Dict[str, Any], viewer_user_id: str) -> Di
         "resolution_summary": dispute.get("resolution_summary"),
         "selected_option_id": dispute.get("selected_option_id"),
         "moderator_required": dispute["status"] == DISPUTE_STATUS_AWAITING_MODERATOR,
+        "final_acceptance_votes": final_acceptance_votes,
+        "my_final_acceptance_decision": my_final_decision,
         "questions": questions,
         "required_answer_party_roles": required_roles,
         "options": options,
         "votes": votes,
+        "vote_option_ids": vote_option_ids,
+        "vote_option_adjustments": vote_option_adjustments,
         "my_vote_option_id": my_vote,
+        "my_vote_option_ids": my_vote_ids,
+        "my_vote_option_adjustments": my_vote_adjustments,
         "initiator_terms": initiator_terms,
         "last_model_error": dispute.get("last_model_error"),
     }
@@ -779,7 +866,7 @@ def _normalize_options(raw_items: Any, *, order_amount: int) -> List[Dict[str, A
         if not isinstance(item, dict):
             continue
         options.append(_normalize_option(item, fallback_id=f"opt_{index}", order_amount=order_amount))
-    return options[:3]
+    return options[:5]
 
 
 def _fallback_questions() -> List[Dict[str, Any]]:
@@ -912,6 +999,143 @@ def _fallback_options_round_2(dispute: Dict[str, Any], *, summary: str) -> List[
     ]
 
 
+def _target_option_count(
+    *,
+    dispute: Dict[str, Any],
+    model_input: Dict[str, Any],
+    round_number: int,
+) -> int:
+    initiator_form = dispute.get("initiator_form") or {}
+    counterparty_form = dispute.get("counterparty_form") or {}
+    requested = max(0, int(initiator_form.get("requested_compensation_rub") or 0))
+    acceptable_percent = max(0, min(100, int(counterparty_form.get("acceptable_refund_percent") or 0)))
+    acceptable = _compensation_from_percent(max(requested, 1), acceptable_percent)
+
+    if requested > 0:
+        gap_ratio = abs(requested - acceptable) / max(requested, 1)
+        if gap_ratio >= 0.50:
+            return 5
+        if gap_ratio >= 0.25:
+            return 4
+
+    if round_number == 2:
+        round1_options = [item for item in dispute.get("round1_options") or [] if isinstance(item, dict)]
+        values = [
+            _option_effective_compensation(item, requested)
+            for item in round1_options
+        ]
+        values = [item for item in values if item > 0]
+        if len(values) >= 2:
+            spread_ratio = (max(values) - min(values)) / max(max(values), 1)
+            if spread_ratio >= 0.50:
+                return 5
+            if spread_ratio >= 0.25:
+                return 4
+
+    uncertainty_count = len(model_input.get("uncertainty_hints") or [])
+    if uncertainty_count >= 3:
+        return 4
+
+    return 3
+
+
+def _make_amount_option(
+    *,
+    option_id: str,
+    amount: int,
+    lean: str,
+    round_number: int,
+    order_amount: int,
+    summary: str,
+) -> Dict[str, Any]:
+    title = "Компромисс по сумме" if lean == "compromise" else "Дополнительный вариант"
+    return {
+        "id": option_id,
+        "lean": lean,
+        "title": title,
+        "description": f"Дополнительная градация для выбора без лишнего раунда. {summary}",
+        "customer_action": f"Оценить сумму {amount} ₽ как финальное урегулирование.",
+        "performer_action": f"Оценить выплату {amount} ₽ как финальное урегулирование.",
+        "compensation_rub": amount,
+        "refund_percent": int(round((amount / max(order_amount, 1)) * 100)) if order_amount > 0 else None,
+        "resolution_kind": "partial_refund",
+    }
+
+
+def _expand_options_to_target(
+    *,
+    options: List[Dict[str, Any]],
+    target_count: int,
+    dispute: Dict[str, Any],
+    round_number: int,
+    summary: str,
+) -> List[Dict[str, Any]]:
+    if len(options) >= target_count:
+        return options[:target_count]
+
+    order_amount = max(0, int(dispute.get("initiator_form", {}).get("requested_compensation_rub") or 0))
+    amounts = [
+        _option_effective_compensation(item, order_amount)
+        for item in options
+    ]
+    amounts = [item for item in amounts if item > 0]
+
+    if not amounts:
+        fallback = _fallback_options_round_1(dispute, summary=summary) if round_number == 1 else _fallback_options_round_2(dispute, summary=summary)
+        options = options + [item for item in fallback if item not in options]
+        amounts = [
+            _option_effective_compensation(item, order_amount)
+            for item in options
+        ]
+        amounts = [item for item in amounts if item > 0]
+
+    if not amounts:
+        return options[:target_count]
+
+    low = min(amounts)
+    high = max(amounts)
+    if low == high:
+        high = max(high, order_amount, 100)
+        low = 0
+
+    existing_amounts = set(amounts)
+    existing_ids = {_normalize_text(item.get("id"), max_len=64) for item in options}
+    expanded = list(options)
+    midpoint = int(round((low + high) / 2.0))
+    span = max(1, high - low)
+
+    for index in range(target_count):
+        if len(expanded) >= target_count:
+            break
+        amount = int(round(low + ((high - low) * index / max(target_count - 1, 1))))
+        amount = int(round(amount / 50.0) * 50)
+        amount = max(0, amount)
+        if any(abs(amount - existing) < 50 for existing in existing_amounts):
+            continue
+        lean = "compromise"
+        if amount >= midpoint + int(round(span * 0.2)):
+            lean = "initiator_favor"
+        elif amount <= midpoint - int(round(span * 0.2)):
+            lean = "counterparty_favor"
+        option_id = f"r{round_number}_auto_{len(expanded) + 1}"
+        while option_id in existing_ids:
+            option_id = f"r{round_number}_auto_{len(expanded) + len(existing_ids) + 1}"
+        expanded.append(
+            _make_amount_option(
+                option_id=option_id,
+                amount=amount,
+                lean=lean,
+                round_number=round_number,
+                order_amount=max(order_amount, high),
+                summary=summary,
+            )
+        )
+        existing_ids.add(option_id)
+        existing_amounts.add(amount)
+
+    return expanded[:target_count]
+
+
 def _find_option_by_id(options: List[Dict[str, Any]], option_id: str) -> Optional[Dict[str, Any]]:
     for item in options:
         if _normalize_text(item.get("id"), max_len=64) == option_id:
@@ -929,8 +1153,11 @@ def _enforce_round2_compromise(dispute: Dict[str, Any], options: List[Dict[str, 
     initiator_party = dispute["initiator_party_role"]
     counterparty_party = "performer" if initiator_party == "customer" else "customer"
 
-    initiator_choice = _find_option_by_id(round1_options, _normalize_text(round1_votes.get(initiator_party), max_len=64))
-    counterparty_choice = _find_option_by_id(round1_options, _normalize_text(round1_votes.get(counterparty_party), max_len=64))
+    initiator_vote_ids = _coerce_vote_list(round1_votes.get(initiator_party))
+    counterparty_vote_ids = _coerce_vote_list(round1_votes.get(counterparty_party))
+
+    initiator_choice = _find_option_by_id(round1_options, initiator_vote_ids[0] if initiator_vote_ids else "")
+    counterparty_choice = _find_option_by_id(round1_options, counterparty_vote_ids[0] if counterparty_vote_ids else "")
 
     initiator_comp = initiator_choice.get("compensation_rub") if initiator_choice else None
     counterparty_comp = counterparty_choice.get("compensation_rub") if counterparty_choice else None
@@ -1172,7 +1399,20 @@ def _normalize_llm_response(
     if round_number == 2:
         options = _enforce_round2_compromise(dispute, options)
 
-    # Строго 3 опции, с гарантированной разметкой lean.
+    target_count = _target_option_count(
+        dispute=dispute,
+        model_input=model_input,
+        round_number=round_number,
+    )
+    options = _expand_options_to_target(
+        options=options,
+        target_count=target_count,
+        dispute=dispute,
+        round_number=round_number,
+        summary=summary,
+    )
+
+    # 3..5 опций, с гарантированной разметкой lean для базового набора.
     ordered: List[Dict[str, Any]] = []
     by_lean: Dict[str, List[Dict[str, Any]]] = {"initiator_favor": [], "counterparty_favor": [], "compromise": []}
     for item in options:
@@ -1186,7 +1426,7 @@ def _normalize_llm_response(
             ordered.append(by_lean[lean][0])
 
     idx = 0
-    while len(ordered) < 3 and idx < len(options):
+    while len(ordered) < min(target_count, len(options), 5) and idx < len(options):
         candidate = options[idx]
         if candidate not in ordered:
             ordered.append(candidate)
@@ -1195,12 +1435,12 @@ def _normalize_llm_response(
     if len(ordered) < 3:
         fallback = _fallback_options_round_1(dispute, summary=summary) if round_number == 1 else _fallback_options_round_2(dispute, summary=summary)
         for candidate in fallback:
-            if len(ordered) >= 3:
+            if len(ordered) >= target_count:
                 break
             ordered.append(candidate)
 
     ordered = _enrich_options_with_context(
-        options=ordered[:3],
+        options=ordered[:target_count],
         dispute=dispute,
         model_input=model_input,
         summary=summary,
@@ -1569,9 +1809,10 @@ def process_dispute_model_turn(dispute_id: str) -> None:
                 ),
             )
             _insert_dispute_event(dispute_id, "round1_options_ready", None, {"summary": summary})
+            option_count = len(settlement_options)
             _safe_post_system_message(
                 dispute_dict["thread_id"],
-                f"Модель подготовила 3 варианта урегулирования (раунд 1). {summary}",
+                f"Модель подготовила {option_count} {_ru_variant_word(option_count)} урегулирования (раунд 1). {summary}",
             )
             return
 
@@ -1591,9 +1832,10 @@ def process_dispute_model_turn(dispute_id: str) -> None:
             ),
         )
         _insert_dispute_event(dispute_id, "round2_options_ready", None, {"summary": summary})
+        option_count = len(settlement_options)
         _safe_post_system_message(
             dispute_dict["thread_id"],
-            f"Модель подготовила 3 более компромиссных варианта (раунд 2). {summary}",
+            f"Модель подготовила {option_count} {_ru_variant_word(option_count)} для второго раунда. {summary}",
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -1628,12 +1870,262 @@ def process_dispute_model_turn(dispute_id: str) -> None:
         _release_model_slot(dispute_id)
 
 
+def _normalize_selected_option_ids(
+    *,
+    option_id: Optional[str],
+    option_ids: Optional[List[str]],
+) -> List[str]:
+    selected: List[str] = []
+    raw_items: List[Any] = []
+    if isinstance(option_ids, list):
+        raw_items.extend(option_ids)
+    if option_id is not None:
+        raw_items.append(option_id)
+
+    for item in raw_items:
+        normalized = _normalize_text(item, max_len=64)
+        if normalized and normalized not in selected:
+            selected.append(normalized)
+
+    return selected[:5]
+
+
+def _round_to_step(value: int, step: int = 50) -> int:
+    if step <= 0:
+        return value
+    return int(round(value / float(step)) * step)
+
+
+def _adjustment_range(base_amount: int) -> Tuple[int, int]:
+    if base_amount <= 0:
+        return 0, 0
+    delta = max(50, _round_to_step(int(round(base_amount * 0.10)), 50))
+    return max(0, base_amount - delta), base_amount + delta
+
+
+def _normalize_option_adjustments(
+    *,
+    raw_adjustments: Optional[Dict[str, Any]],
+    selected_option_ids: List[str],
+    options: List[Dict[str, Any]],
+    dispute: Dict[str, Any],
+) -> Dict[str, Dict[str, int]]:
+    if not isinstance(raw_adjustments, dict):
+        return {}
+
+    requested_compensation = max(0, int(dispute.get("initiator_form", {}).get("requested_compensation_rub") or 0))
+    option_by_id = {
+        _normalize_text(item.get("id"), max_len=64): item
+        for item in options
+    }
+    selected_set = set(selected_option_ids)
+    normalized: Dict[str, Dict[str, int]] = {}
+
+    for option_id, raw_value in raw_adjustments.items():
+        normalized_id = _normalize_text(option_id, max_len=64)
+        if normalized_id not in selected_set:
+            continue
+        option = option_by_id.get(normalized_id)
+        if not option:
+            continue
+        base_amount = _option_effective_compensation(option, requested_compensation)
+        if base_amount <= 0:
+            continue
+
+        compensation_raw = raw_value.get("compensation_rub") if isinstance(raw_value, dict) else raw_value
+        try:
+            compensation = int(compensation_raw)
+        except Exception:
+            continue
+
+        min_amount, max_amount = _adjustment_range(base_amount)
+        compensation = _round_to_step(compensation, 50)
+        compensation = max(min_amount, min(max_amount, compensation))
+        if compensation != base_amount:
+            normalized[normalized_id] = {"compensation_rub": compensation}
+
+    return normalized
+
+
+def _vote_adjustments_from_votes(votes: Dict[str, Any]) -> Dict[str, Dict[str, Dict[str, int]]]:
+    result: Dict[str, Dict[str, Dict[str, int]]] = {}
+    for role, value in votes.items():
+        role_key = str(role)
+        if role_key not in {"customer", "performer"} or not isinstance(value, dict):
+            continue
+        adjustments = value.get("adjustments")
+        if isinstance(adjustments, dict):
+            clean: Dict[str, Dict[str, int]] = {}
+            for option_id, adjustment in adjustments.items():
+                normalized_id = _normalize_text(option_id, max_len=64)
+                compensation = adjustment.get("compensation_rub") if isinstance(adjustment, dict) else None
+                if normalized_id and isinstance(compensation, int) and compensation >= 0:
+                    clean[normalized_id] = {"compensation_rub": compensation}
+            if clean:
+                result[role_key] = clean
+    return result
+
+
+def _apply_final_compensation_adjustment(
+    *,
+    options: List[Dict[str, Any]],
+    selected_option_id: str,
+    votes: Dict[str, Any],
+    dispute: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    requested_compensation = max(0, int(dispute.get("initiator_form", {}).get("requested_compensation_rub") or 0))
+    selected = _find_option_by_id(options, selected_option_id)
+    if not selected:
+        return options, None
+
+    base_amount = _option_effective_compensation(selected, requested_compensation)
+    if base_amount <= 0:
+        return options, None
+
+    vote_adjustments = _vote_adjustments_from_votes(votes)
+    amounts: List[int] = []
+    for role in ("customer", "performer"):
+        role_value = votes.get(role)
+        if selected_option_id not in _coerce_vote_list(role_value):
+            continue
+        adjustment = vote_adjustments.get(role, {}).get(selected_option_id)
+        amounts.append(int(adjustment["compensation_rub"]) if adjustment else base_amount)
+
+    if len(amounts) < 2 or all(amount == base_amount for amount in amounts):
+        return options, None
+
+    min_amount, max_amount = _adjustment_range(base_amount)
+    final_amount = _round_to_step(int(round(sum(amounts) / len(amounts))), 50)
+    final_amount = max(min_amount, min(max_amount, final_amount))
+
+    updated_options: List[Dict[str, Any]] = []
+    for item in options:
+        option_id = _normalize_text(item.get("id"), max_len=64)
+        if option_id != selected_option_id:
+            updated_options.append(item)
+            continue
+        updated = dict(item)
+        updated["compensation_rub"] = final_amount
+        if requested_compensation > 0:
+            updated["refund_percent"] = int(round((final_amount / max(requested_compensation, 1)) * 100))
+        updated_options.append(updated)
+
+    return updated_options, final_amount
+
+
+def _ordered_intersection(
+    *,
+    options: List[Dict[str, Any]],
+    first: List[str],
+    second: List[str],
+) -> List[str]:
+    first_set = set(first)
+    second_set = set(second)
+    ordered_option_ids = [_normalize_text(item.get("id"), max_len=64) for item in options]
+    return [option_id for option_id in ordered_option_ids if option_id and option_id in first_set and option_id in second_set]
+
+
+def _choose_compromise_option_id(
+    *,
+    dispute: Dict[str, Any],
+    options: List[Dict[str, Any]],
+    candidate_ids: List[str],
+) -> str:
+    requested_compensation = max(0, int(dispute.get("initiator_form", {}).get("requested_compensation_rub") or 0))
+    option_amounts = [
+        _option_effective_compensation(item, requested_compensation)
+        for item in options
+        if _normalize_text(item.get("id"), max_len=64) in set(candidate_ids)
+    ]
+
+    max_option_amount = max(option_amounts) if option_amounts else requested_compensation
+    amount_base = max(requested_compensation, max_option_amount, 1)
+    acceptable_percent = max(0, min(100, int(dispute.get("counterparty_form", {}).get("acceptable_refund_percent") or 0)))
+    acceptable_amount = _compensation_from_percent(amount_base, acceptable_percent)
+
+    if requested_compensation > 0 or acceptable_percent > 0:
+        target_amount = int(round((requested_compensation + acceptable_amount) / 2.0))
+    elif option_amounts:
+        sorted_amounts = sorted(option_amounts)
+        target_amount = sorted_amounts[len(sorted_amounts) // 2]
+    else:
+        target_amount = 0
+
+    median_amount = 0
+    if option_amounts:
+        sorted_amounts = sorted(option_amounts)
+        median_amount = sorted_amounts[len(sorted_amounts) // 2]
+
+    candidate_set = set(candidate_ids)
+    order_index = {
+        _normalize_text(item.get("id"), max_len=64): idx
+        for idx, item in enumerate(options)
+    }
+
+    def score(option: Dict[str, Any]) -> Tuple[int, int, int, int]:
+        option_id = _normalize_text(option.get("id"), max_len=64)
+        amount = _option_effective_compensation(option, requested_compensation)
+        lean = _normalize_text(option.get("lean") or "compromise", max_len=32).lower()
+        lean_penalty = 0 if lean == "compromise" else 1
+        return (
+            abs(amount - target_amount),
+            lean_penalty,
+            abs(amount - median_amount),
+            order_index.get(option_id, 999),
+        )
+
+    candidates = [
+        item
+        for item in options
+        if _normalize_text(item.get("id"), max_len=64) in candidate_set
+    ]
+    if not candidates:
+        return candidate_ids[0]
+
+    best = min(candidates, key=score)
+    return _normalize_text(best.get("id"), max_len=64) or candidate_ids[0]
+
+
+def _party_role_label(role: str) -> str:
+    return "заказчика" if role == "customer" else "исполнителя"
+
+
+def _final_option_prompt_text(
+    *,
+    dispute: Dict[str, Any],
+    option: Optional[Dict[str, Any]],
+    multiple_matches: bool,
+) -> str:
+    intro = (
+        "Совпало несколько вариантов. Выбрано самое компромиссное решение."
+        if multiple_matches
+        else "Выбрано совместимое решение."
+    )
+    lines = [intro]
+    if option:
+        title = _normalize_text(option.get("title"), max_len=180) or "Итоговый вариант"
+        lines.append(f"Вариант: {title}.")
+        amount = _option_effective_compensation(
+            option,
+            max(0, int(dispute.get("initiator_form", {}).get("requested_compensation_rub") or 0)),
+        )
+        if amount > 0:
+            lines.append(f"Итоговая сумма: {amount} ₽.")
+        description = _normalize_long_text(option.get("description"), max_len=700)
+        if description:
+            lines.append(description)
+    lines.append("Подтвердите решение: «Согласиться» или «Не согласиться».")
+    return "\n".join(lines)
+
+
 def select_settlement_option(
     *,
     thread_id: str,
     dispute_id: str,
     actor_user_id: str,
-    option_id: str,
+    option_id: Optional[str] = None,
+    option_ids: Optional[List[str]] = None,
+    option_adjustments: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], bool]:
     dispute = _fetch_dispute_row_by_id(thread_id, dispute_id)
     if not dispute:
@@ -1646,16 +2138,28 @@ def select_settlement_option(
     if actor_party not in {"customer", "performer"}:
         raise HTTPException(status_code=403, detail="Only dispute participants can vote")
 
-    normalized_option_id = _normalize_text(option_id, max_len=64)
-    if not normalized_option_id:
-        raise HTTPException(status_code=400, detail="option_id is required")
+    selected_option_ids = _normalize_selected_option_ids(option_id=option_id, option_ids=option_ids)
+    if not selected_option_ids:
+        raise HTTPException(status_code=400, detail="At least one option_id is required")
 
     options = _active_options(dispute)
-    if not any(_normalize_text(item.get("id"), max_len=64) == normalized_option_id for item in options):
+    known_option_ids = {_normalize_text(item.get("id"), max_len=64) for item in options}
+    unknown_option_ids = [item for item in selected_option_ids if item not in known_option_ids]
+    if unknown_option_ids:
         raise HTTPException(status_code=400, detail="Unknown option_id for current round")
 
-    votes = _active_votes(dispute)
-    votes[actor_party] = normalized_option_id
+    votes_raw = dispute.get("round2_votes") if dispute["active_round"] == 2 else dispute.get("round1_votes")
+    votes: Dict[str, Any] = votes_raw if isinstance(votes_raw, dict) else {}
+    normalized_adjustments = _normalize_option_adjustments(
+        raw_adjustments=option_adjustments,
+        selected_option_ids=selected_option_ids,
+        options=options,
+        dispute=dispute,
+    )
+    votes[actor_party] = {
+        "option_ids": selected_option_ids,
+        "adjustments": normalized_adjustments,
+    }
 
     if dispute["active_round"] == 2:
         execute(
@@ -1682,35 +2186,103 @@ def select_settlement_option(
         dispute_id,
         "vote_submitted",
         actor_user_id,
-        {"party_role": actor_party, "option_id": normalized_option_id, "round": dispute["active_round"]},
+        {
+            "party_role": actor_party,
+            "option_ids": selected_option_ids,
+            "adjustments": normalized_adjustments,
+            "round": dispute["active_round"],
+        },
     )
 
     should_start_model = False
 
     if "customer" in votes and "performer" in votes:
-        customer_choice = votes["customer"]
-        performer_choice = votes["performer"]
+        customer_choices = votes["customer"]
+        performer_choices = votes["performer"]
+        common_option_ids = _ordered_intersection(
+            options=options,
+            first=_coerce_vote_list(customer_choices),
+            second=_coerce_vote_list(performer_choices),
+        )
 
-        if customer_choice == performer_choice:
-            execute(
-                """
-                UPDATE disputes
-                SET status = %s,
-                    selected_option_id = %s,
-                    resolution_summary = %s,
-                    closed_at = now(),
-                    updated_at = now()
-                WHERE id::text = %s
-                """,
-                (
-                    DISPUTE_STATUS_RESOLVED,
-                    customer_choice,
-                    "Обе стороны выбрали один и тот же вариант. Спор закрыт.",
-                    dispute_id,
+        if common_option_ids:
+            selected_resolution_id = common_option_ids[0]
+            if len(common_option_ids) > 1:
+                selected_resolution_id = _choose_compromise_option_id(
+                    dispute=dispute,
+                    options=options,
+                    candidate_ids=common_option_ids,
+                )
+            updated_options, final_adjusted_amount = _apply_final_compensation_adjustment(
+                options=options,
+                selected_option_id=selected_resolution_id,
+                votes=votes,
+                dispute=dispute,
+            )
+            final_amount_text = f" Итоговая сумма: {final_adjusted_amount} ₽." if final_adjusted_amount is not None else ""
+            resolution_summary = f"Выбрано совместимое решение.{final_amount_text} Ожидается подтверждение сторон."
+            if dispute["active_round"] == 2:
+                execute(
+                    """
+                    UPDATE disputes
+                    SET status = %s,
+                        selected_option_id = %s,
+                        round2_options = %s::jsonb,
+                        moderator_hook = %s::jsonb,
+                        resolution_summary = %s,
+                        updated_at = now()
+                    WHERE id::text = %s
+                    """,
+                    (
+                        DISPUTE_STATUS_WAITING_FINAL_ACCEPTANCE,
+                        selected_resolution_id,
+                        json.dumps(updated_options, ensure_ascii=False),
+                        json.dumps({"final_acceptance_votes": {}, "selected_option_id": selected_resolution_id}, ensure_ascii=False),
+                        resolution_summary,
+                        dispute_id,
+                    ),
+                )
+            else:
+                execute(
+                    """
+                    UPDATE disputes
+                    SET status = %s,
+                        selected_option_id = %s,
+                        round1_options = %s::jsonb,
+                        moderator_hook = %s::jsonb,
+                        resolution_summary = %s,
+                        updated_at = now()
+                    WHERE id::text = %s
+                    """,
+                    (
+                        DISPUTE_STATUS_WAITING_FINAL_ACCEPTANCE,
+                        selected_resolution_id,
+                        json.dumps(updated_options, ensure_ascii=False),
+                        json.dumps({"final_acceptance_votes": {}, "selected_option_id": selected_resolution_id}, ensure_ascii=False),
+                        resolution_summary,
+                        dispute_id,
+                    ),
+                )
+            _insert_dispute_event(
+                dispute_id,
+                "final_acceptance_requested",
+                actor_user_id,
+                {
+                    "option_id": selected_resolution_id,
+                    "common_option_ids": common_option_ids,
+                    "customer_option_ids": _coerce_vote_list(customer_choices),
+                    "performer_option_ids": _coerce_vote_list(performer_choices),
+                    "final_adjusted_amount": final_adjusted_amount,
+                },
+            )
+            _safe_post_system_message(
+                thread_id,
+                _final_option_prompt_text(
+                    dispute=dispute,
+                    option=_find_option_by_id(updated_options, selected_resolution_id),
+                    multiple_matches=len(common_option_ids) > 1,
                 ),
             )
-            _insert_dispute_event(dispute_id, "resolved", actor_user_id, {"option_id": customer_choice})
-            _safe_post_system_message(thread_id, "Стороны выбрали одинаковый вариант. Спор закрыт.")
         else:
             if dispute["active_round"] == 1:
                 execute(
@@ -1727,7 +2299,7 @@ def select_settlement_option(
                     dispute_id,
                     "round2_requested",
                     actor_user_id,
-                    {"customer_choice": customer_choice, "performer_choice": performer_choice},
+                    {"customer_option_ids": _coerce_vote_list(customer_choices), "performer_option_ids": _coerce_vote_list(performer_choices)},
                 )
                 _safe_post_system_message(
                     thread_id,
@@ -1756,7 +2328,7 @@ def select_settlement_option(
                     dispute_id,
                     "awaiting_moderator",
                     actor_user_id,
-                    {"customer_choice": customer_choice, "performer_choice": performer_choice},
+                    {"customer_option_ids": _coerce_vote_list(customer_choices), "performer_option_ids": _coerce_vote_list(performer_choices)},
                 )
                 _safe_post_system_message(
                     thread_id,
@@ -1771,6 +2343,128 @@ def select_settlement_option(
         raise HTTPException(status_code=500, detail="Dispute update failed")
 
     return _build_dispute_state_out(updated, actor_user_id), should_start_model
+
+
+def submit_final_acceptance(
+    *,
+    thread_id: str,
+    dispute_id: str,
+    actor_user_id: str,
+    accepted: bool,
+) -> Dict[str, Any]:
+    dispute = _fetch_dispute_row_by_id(thread_id, dispute_id)
+    if not dispute:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+
+    if dispute["status"] != DISPUTE_STATUS_WAITING_FINAL_ACCEPTANCE:
+        raise HTTPException(status_code=409, detail="Dispute is not waiting for final acceptance")
+
+    actor_party = _party_role_for_user(dispute, actor_user_id)
+    if actor_party not in {"customer", "performer"}:
+        raise HTTPException(status_code=403, detail="Only dispute participants can confirm final resolution")
+
+    selected_option_id = _normalize_text(dispute.get("selected_option_id"), max_len=64)
+    if not selected_option_id:
+        raise HTTPException(status_code=409, detail="Final option is not selected")
+
+    hook = dict(dispute.get("moderator_hook") or {})
+    votes = _final_acceptance_votes(dispute)
+    decision = "accepted" if accepted else "rejected"
+    if votes.get(actor_party) == decision:
+        return _build_dispute_state_out(dispute, actor_user_id)
+
+    votes[actor_party] = decision
+    hook["final_acceptance_votes"] = votes
+    hook["selected_option_id"] = selected_option_id
+
+    if not accepted:
+        hook.update(
+            {
+                "status": "pending",
+                "reason": "final_acceptance_rejected",
+                "rejected_party_role": actor_party,
+            }
+        )
+        execute(
+            """
+            UPDATE disputes
+            SET status = %s,
+                moderator_hook = %s::jsonb,
+                resolution_summary = %s,
+                closed_at = now(),
+                updated_at = now()
+            WHERE id::text = %s
+            """,
+            (
+                DISPUTE_STATUS_AWAITING_MODERATOR,
+                json.dumps(hook, ensure_ascii=False),
+                "Одна из сторон не подтвердила выбранное решение. Спор ожидает администратора.",
+                dispute_id,
+            ),
+        )
+        _insert_dispute_event(
+            dispute_id,
+            "final_acceptance_rejected",
+            actor_user_id,
+            {"party_role": actor_party, "option_id": selected_option_id},
+        )
+        _safe_post_system_message(
+            thread_id,
+            f"Финальное решение не подтверждено со стороны {_party_role_label(actor_party)}. Спор ожидает администратора.",
+        )
+    elif votes.get("customer") == "accepted" and votes.get("performer") == "accepted":
+        hook.update({"status": "accepted", "reason": "final_acceptance_completed"})
+        execute(
+            """
+            UPDATE disputes
+            SET status = %s,
+                moderator_hook = %s::jsonb,
+                resolution_summary = %s,
+                closed_at = now(),
+                updated_at = now()
+            WHERE id::text = %s
+            """,
+            (
+                DISPUTE_STATUS_RESOLVED,
+                json.dumps(hook, ensure_ascii=False),
+                "Обе стороны подтвердили выбранное решение. Спор закрыт.",
+                dispute_id,
+            ),
+        )
+        _insert_dispute_event(
+            dispute_id,
+            "final_acceptance_completed",
+            actor_user_id,
+            {"option_id": selected_option_id},
+        )
+        _safe_post_system_message(thread_id, "Обе стороны подтвердили выбранное решение. Спор закрыт.")
+    else:
+        execute(
+            """
+            UPDATE disputes
+            SET moderator_hook = %s::jsonb,
+                updated_at = now()
+            WHERE id::text = %s
+            """,
+            (json.dumps(hook, ensure_ascii=False), dispute_id),
+        )
+        _insert_dispute_event(
+            dispute_id,
+            "final_acceptance_submitted",
+            actor_user_id,
+            {"party_role": actor_party, "option_id": selected_option_id},
+        )
+        missing_role = "performer" if actor_party == "customer" else "customer"
+        _safe_post_system_message(
+            thread_id,
+            f"Подтверждение получено от {_party_role_label(actor_party)}. Ожидаем решение от {_party_role_label(missing_role)}.",
+        )
+
+    updated = _fetch_dispute_row_by_id(thread_id, dispute_id)
+    if not updated:
+        raise HTTPException(status_code=500, detail="Dispute update failed")
+
+    return _build_dispute_state_out(updated, actor_user_id)
 
 
 def capture_clarification_answer_from_chat_message(

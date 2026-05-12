@@ -6,9 +6,9 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from app.config import get_env, get_int
+from app.config import get_bool, get_env, get_int
 from app.db import fetch_all, fetch_one
-from app.geocoding import geocode_address
+from app.geocoding import geocode_address, lookup_local_address_point
 from app.storage import default_presigned_expires_seconds, get_storage
 from app.task_compat import ensure_task_payload
 
@@ -26,6 +26,8 @@ DEFAULT_ROUTE_RADIUS_METERS = max(50, get_int("ROUTE_TASK_RADIUS_METERS", 500))
 DEFAULT_ROUTE_LIMIT = max(1, get_int("ROUTE_TASKS_LIMIT", 50))
 DEFAULT_TRAVEL_MODE = get_env("ROUTE_DEFAULT_TRAVEL_MODE", "driving") or "driving"
 SUPPORTED_TRAVEL_MODES = {"driving", "walking", "truck", "transit", "bicycle", "scooter"}
+ROUTE_EXTERNAL_GEOCODE_ENABLED = get_bool("ROUTE_EXTERNAL_GEOCODE_ENABLED", False)
+ROUTE_GEOCODE_TIMEOUT_SECONDS = max(1, get_int("ROUTE_GEOCODE_TIMEOUT_SECONDS", 2))
 
 
 def build_route_for_current_user(
@@ -162,7 +164,7 @@ def build_route_from_polyline(
 
 
 def _resolve_current_announcement_id(user_id: str) -> str:
-    row = fetch_one(FIND_CURRENT_ROUTE_TASK_SQL, (user_id,))
+    row = fetch_one(FIND_CURRENT_ROUTE_TASK_SQL, (user_id, user_id))
     if not row:
         raise HTTPException(status_code=404, detail="Для вас пока нет активного маршрута")
     return str(row[0])
@@ -178,10 +180,14 @@ def _load_route_context(*, announcement_id: str, user_id: str) -> dict[str, Any]
     category = str(row[2] or "")
     title = str(row[3] or "")
     raw_data = _coerce_data(row[4])
+    legacy_data = _coerce_data(row[12]) if len(row) > 12 else {}
+    raw_data = _merge_route_payload(raw_data, legacy_data)
     if row[5] and "address_text" not in raw_data:
         raw_data["address_text"] = str(row[5])
     if row[6] is not None and row[7] is not None and "point" not in raw_data:
         raw_data["point"] = {"lat": float(row[6]), "lon": float(row[7])}
+    if len(row) > 14 and row[13] is not None and row[14] is not None and "point" not in raw_data:
+        raw_data["point"] = {"lat": float(row[13]), "lon": float(row[14])}
     performer_id = str(row[8]) if row[8] else None
     assignment_status = str(row[9] or "")
     execution_stage = str(row[10] or "")
@@ -208,7 +214,7 @@ def _load_route_context(*, announcement_id: str, user_id: str) -> dict[str, Any]
         user_id=user_id,
     )
 
-    if assignment_status not in {"assigned", "in_progress"}:
+    if assignment_status not in {"assigned", "in_progress"} and ann_owner_id != user_id:
         raise HTTPException(status_code=409, detail="Маршрут появится после принятия активного задания")
 
     route_points = _extract_route_points(data, category)
@@ -217,8 +223,8 @@ def _load_route_context(*, announcement_id: str, user_id: str) -> dict[str, Any]
         route_points = _route_points_from_stored(stored_route_points)
     if not route_points:
         raise HTTPException(
-            status_code=422,
-            detail="Не удалось определить старт и финиш маршрута. Проверьте адреса/координаты объявления.",
+            status_code=404,
+            detail="Маршрут пока недоступен: у задания нет сохранённых координат старта/финиша.",
         )
 
     start_point, end_point = route_points
@@ -274,7 +280,10 @@ def _route_announcement_status(*, assignment_status: str, execution_stage: str) 
 def _task_travel_mode(data: dict[str, Any]) -> str:
     task = data.get("task") if isinstance(data.get("task"), dict) else {}
     route = task.get("route") if isinstance(task.get("route"), dict) else {}
-    return _normalize_travel_mode(route.get("travel_mode") or data.get("travel_mode") or DEFAULT_TRAVEL_MODE)
+    try:
+        return _normalize_travel_mode(route.get("travel_mode") or data.get("travel_mode") or DEFAULT_TRAVEL_MODE)
+    except HTTPException:
+        return DEFAULT_TRAVEL_MODE
 
 
 def _coerce_data(value: Any) -> dict[str, Any]:
@@ -288,6 +297,34 @@ def _coerce_data(value: Any) -> dict[str, Any]:
         except Exception:
             return {}
     return {}
+
+
+def _merge_route_payload(primary: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    """Fill missing route fields from the legacy announcement payload."""
+    merged = dict(primary)
+    for key, value in fallback.items():
+        if key not in merged or merged.get(key) in (None, "", [], {}):
+            merged[key] = value
+
+    primary_task = merged.get("task") if isinstance(merged.get("task"), dict) else None
+    fallback_task = fallback.get("task") if isinstance(fallback.get("task"), dict) else None
+    if fallback_task is not None:
+        if primary_task is None:
+            merged["task"] = dict(fallback_task)
+        else:
+            merged["task"] = _merge_nested_dict(primary_task, fallback_task)
+    return merged
+
+
+def _merge_nested_dict(primary: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(primary)
+    for key, value in fallback.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _merge_nested_dict(current, value)
+        elif key not in merged or current in (None, "", [], {}):
+            merged[key] = value
+    return merged
 
 
 def _parse_float(value: Any) -> float | None:
@@ -417,7 +454,12 @@ def _resolve_address_point(address: str) -> tuple[float, float] | None:
     known_point = _lookup_known_address_point(address)
     if known_point is not None:
         return known_point
-    return geocode_address(address)
+    local_point = lookup_local_address_point(address)
+    if local_point is not None:
+        return local_point
+    if not ROUTE_EXTERNAL_GEOCODE_ENABLED:
+        return None
+    return geocode_address(address, timeout_seconds=ROUTE_GEOCODE_TIMEOUT_SECONDS)
 
 
 def _lookup_known_address_point(address: str) -> tuple[float, float] | None:
@@ -525,9 +567,14 @@ def _format_point(point: tuple[float, float]) -> str:
 def _normalize_travel_mode(value: str | None) -> str:
     normalized = (value or DEFAULT_TRAVEL_MODE).strip().lower()
     aliases = {
+        "auto": "driving",
+        "automobile": "driving",
         "pedestrian": "walking",
         "foot": "walking",
         "car": "driving",
+        "public_transport": "transit",
+        "public-transport": "transit",
+        "publictransport": "transit",
     }
     normalized = aliases.get(normalized, normalized)
     if normalized not in SUPPORTED_TRAVEL_MODES:

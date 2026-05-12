@@ -21,6 +21,7 @@ from .auth import (
     require_staff_user,
     revoke_admin_session,
 )
+from .csrf import AdminCSRFMiddleware, ensure_csrf_token
 from .db import SessionLocal, engine
 from .schemas import (
     AdminAccessCreateIn,
@@ -68,6 +69,7 @@ class StaffAdmin(Admin):
 
 app = FastAPI(title=settings.title)
 require_production_env_values("admin", _PROD_REQUIRED_ENV)
+app.add_middleware(AdminCSRFMiddleware)
 app.add_middleware(
     SessionMiddleware,
     secret_key=settings.session_secret,
@@ -79,6 +81,7 @@ app.add_middleware(
 apply_http_hardening(app, service_name="admin", cors_origins_env="ADMIN_CORS_ALLOWED_ORIGINS")
 app.mount("/static", StaticFiles(directory=str(settings.static_dir)), name="admin-static")
 app.state.templates = Jinja2Templates(directory=str(settings.templates_dir))
+app.state.templates.env.globals["csrf_token"] = ensure_csrf_token
 
 
 @app.on_event("startup")

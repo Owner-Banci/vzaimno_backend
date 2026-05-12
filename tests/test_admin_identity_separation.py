@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import uuid
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -21,7 +22,7 @@ class AdminIdentitySeparationIntegrationTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         ensure_all_tables()
         cls.public_client = TestClient(public_app)
-        cls.admin_client = TestClient(admin_app)
+        cls.admin_client = TestClient(admin_app, base_url="http://localhost")
 
     def setUp(self) -> None:
         self.user_ids: list[str] = []
@@ -155,10 +156,14 @@ class AdminIdentitySeparationIntegrationTests(unittest.TestCase):
         return payload["access_token"]
 
     def _login_admin(self, admin: dict[str, str]) -> str:
-        response = self.admin_client.post(
-            "/admin/api/auth/login",
-            json={"login_identifier": admin["login_identifier"], "password": admin["password"]},
-        )
+        async def allow_rate_limit(*_args, **_kwargs) -> None:
+            return None
+
+        with patch("services.admin_panel.app.auth.enforce_rate_limit", new=allow_rate_limit):
+            response = self.admin_client.post(
+                "/admin/api/auth/login",
+                json={"login_identifier": admin["login_identifier"], "password": admin["password"]},
+            )
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
         self.assertEqual(payload["principal_type"], "admin")
@@ -183,10 +188,14 @@ class AdminIdentitySeparationIntegrationTests(unittest.TestCase):
             "/auth/login",
             json={"email": user["email"], "password": user["password"]},
         )
-        admin_response = self.admin_client.post(
-            "/admin/api/auth/login",
-            json={"login_identifier": admin["login_identifier"], "password": admin["password"]},
-        )
+        async def allow_rate_limit(*_args, **_kwargs) -> None:
+            return None
+
+        with patch("services.admin_panel.app.auth.enforce_rate_limit", new=allow_rate_limit):
+            admin_response = self.admin_client.post(
+                "/admin/api/auth/login",
+                json={"login_identifier": admin["login_identifier"], "password": admin["password"]},
+            )
 
         self.assertEqual(user_response.status_code, 200, user_response.text)
         self.assertEqual(admin_response.status_code, 200, admin_response.text)
@@ -325,10 +334,14 @@ class AdminIdentitySeparationIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["linked_user_account_id"], regular_user["id"])
         self.assertNotEqual(new_admin_id, regular_user["id"])
 
-        admin_login = self.admin_client.post(
-            "/admin/api/auth/login",
-            json={"login_identifier": login_identifier, "password": password},
-        )
+        async def allow_rate_limit(*_args, **_kwargs) -> None:
+            return None
+
+        with patch("services.admin_panel.app.auth.enforce_rate_limit", new=allow_rate_limit):
+            admin_login = self.admin_client.post(
+                "/admin/api/auth/login",
+                json={"login_identifier": login_identifier, "password": password},
+            )
         self.assertEqual(admin_login.status_code, 200, admin_login.text)
         self.assertEqual(admin_login.json()["principal_type"], "admin")
         self.assertEqual(admin_login.json()["admin_account_id"], new_admin_id)

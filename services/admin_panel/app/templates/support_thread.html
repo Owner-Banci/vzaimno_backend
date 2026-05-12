@@ -23,6 +23,7 @@
   <article class="panel">
     <h3>Назначение staff</h3>
     <form method="post" action="/admin/support/{{ thread.id }}/assign" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ request.session.get('admin_csrf_token', '') }}">
       <label>Ответственный admin account
         <select name="assigned_admin_account_id" required>
           {% for account in available_admin_accounts %}
@@ -46,6 +47,7 @@
     {% endif %}
 
     <form method="post" action="/admin/support/{{ thread.id }}/reply" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ request.session.get('admin_csrf_token', '') }}">
       <textarea name="text" rows="4" required {% if reply_blocked %}disabled{% endif %} placeholder="Напишите ответ от имени команды поддержки"></textarea>
       <button type="submit" {% if reply_blocked %}disabled{% endif %}>Отправить</button>
     </form>

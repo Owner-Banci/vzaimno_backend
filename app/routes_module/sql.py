@@ -13,10 +13,15 @@ SELECT
     ta.performer_id::text,
     ta.assignment_status::text,
     ta.execution_stage::text,
-    COALESCE(ta.route_visibility::text, 'performer_only')
+    COALESCE(ta.route_visibility::text, 'performer_only'),
+    a.data AS legacy_data,
+    CASE WHEN a.location_point IS NULL THEN NULL ELSE ST_Y(a.location_point::geometry) END AS legacy_location_lat,
+    CASE WHEN a.location_point IS NULL THEN NULL ELSE ST_X(a.location_point::geometry) END AS legacy_location_lon
 FROM tasks t
 LEFT JOIN categories c
   ON c.id = t.category_id
+LEFT JOIN announcements a
+  ON a.id::text = t.id::text
 LEFT JOIN LATERAL (
     SELECT performer_id, assignment_status, execution_stage, route_visibility
     FROM task_assignments
@@ -114,15 +119,33 @@ LIMIT 1
 """
 
 FIND_CURRENT_ROUTE_TASK_SQL = """
-SELECT ta.task_id::text
-FROM task_assignments ta
-JOIN tasks t
-  ON t.id::text = ta.task_id::text
-WHERE ta.performer_id::text = %s
-  AND ta.assignment_status IN ('assigned', 'in_progress')
-  AND COALESCE(ta.route_visibility::text, 'performer_only') <> 'hidden'
-  AND t.deleted_at IS NULL
-ORDER BY ta.updated_at DESC NULLS LAST, ta.created_at DESC NULLS LAST
+SELECT candidate.task_id::text
+FROM (
+    SELECT
+        ta.task_id,
+        0 AS priority,
+        COALESCE(ta.updated_at, ta.created_at) AS sort_at
+    FROM task_assignments ta
+    JOIN tasks t
+      ON t.id::text = ta.task_id::text
+    WHERE ta.performer_id::text = %s
+      AND ta.assignment_status IN ('assigned', 'in_progress')
+      AND COALESCE(ta.route_visibility::text, 'performer_only') <> 'hidden'
+      AND t.deleted_at IS NULL
+
+    UNION ALL
+
+    SELECT
+        t.id AS task_id,
+        1 AS priority,
+        COALESCE(t.updated_at, t.created_at) AS sort_at
+    FROM tasks t
+    WHERE t.customer_id::text = %s
+      AND t.deleted_at IS NULL
+      AND t.status IN ('published', 'in_responses', 'agreed')
+      AND t.moderation_status = 'published'
+) candidate
+ORDER BY candidate.priority ASC, candidate.sort_at DESC NULLS LAST
 LIMIT 1
 """
 

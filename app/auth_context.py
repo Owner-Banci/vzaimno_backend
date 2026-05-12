@@ -33,6 +33,7 @@ class UserPrincipal:
     id: str
     email: str
     role: str = "user"
+    session_id: Optional[str] = None
 
 
 def _extract_ws_token(websocket: WebSocket) -> Optional[str]:
@@ -63,6 +64,7 @@ def user_from_token(token: str) -> UserPrincipal:
     user_id = str(payload.get("sub") or "").strip()
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token payload")
+    session_id = str(payload.get("sid") or "").strip() or None
 
     row = fetch_one(
         """
@@ -76,9 +78,42 @@ def user_from_token(token: str) -> UserPrincipal:
     if not row:
         raise HTTPException(status_code=401, detail="User not found")
 
-    principal = UserPrincipal(id=str(row[0]), email=str(row[1]), role="user")
+    if session_id:
+        session_row = fetch_one(
+            """
+            SELECT 1
+            FROM user_sessions
+            WHERE id::text = %s
+              AND user_id::text = %s
+              AND revoked_at IS NULL
+              AND expires_at > now()
+            """,
+            (session_id, user_id),
+        )
+        if not session_row:
+            raise HTTPException(status_code=401, detail="User session revoked or expired")
+
+    principal = UserPrincipal(id=str(row[0]), email=str(row[1]), role="user", session_id=session_id)
+    _touch_user_session_last_used(principal.session_id)
     _touch_user_last_seen(principal.id)
     return principal
+
+
+def _touch_user_session_last_used(session_id: Optional[str]) -> None:
+    if not session_id:
+        return
+    try:
+        execute(
+            """
+            UPDATE user_sessions
+            SET last_used_at = now()
+            WHERE id::text = %s
+              AND revoked_at IS NULL
+            """,
+            (session_id,),
+        )
+    except Exception:
+        return
 
 
 def _touch_user_last_seen(user_id: str) -> None:

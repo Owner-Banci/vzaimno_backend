@@ -24,7 +24,8 @@
 --     filesystem / volume / cloud layer + TLS in transit. For true privacy
 --     of chats, E2E encryption (client-side keys) is required — a larger
 --     architecture change tracked as future work.
---   * PII (phone, email) kept as plain TEXT — access controlled at DB role level.
+--   * PII: phone is encrypted in users.phone_enc and searchable only via
+--     HMAC phone_hash. Email remains plaintext because it is a login identifier.
 --   * Audit trail (audit_logs) is append-only by convention; enforce via role
 --     permissions in prod (GRANT INSERT only, no UPDATE/DELETE).
 -- =============================================================================
@@ -42,7 +43,8 @@ CREATE EXTENSION IF NOT EXISTS "citext";     -- case-insensitive unique emails
 CREATE TABLE users (
   id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   email                    TEXT NOT NULL,
-  phone                    TEXT NULL,
+  phone_enc                BYTEA NULL,
+  phone_hash               TEXT NULL,
   password_hash            TEXT NOT NULL,
   role                     TEXT NOT NULL DEFAULT 'user',
   is_email_verified        BOOLEAN NOT NULL DEFAULT FALSE,
@@ -57,15 +59,15 @@ CREATE TABLE users (
     CHECK (role IN ('user', 'admin', 'moderator')),
   CONSTRAINT chk_users_email_shape
     CHECK (char_length(email) BETWEEN 3 AND 320 AND email LIKE '%_@_%.__%'),
-  CONSTRAINT chk_users_phone_len
-    CHECK (phone IS NULL OR char_length(phone) BETWEEN 5 AND 32)
+  CONSTRAINT chk_users_phone_hash_len
+    CHECK (phone_hash IS NULL OR char_length(phone_hash) = 64)
 );
 CREATE UNIQUE INDEX ux_users_email_lower
   ON users ((lower(email)))
   WHERE deleted_at IS NULL;
-CREATE UNIQUE INDEX ux_users_phone
-  ON users (phone)
-  WHERE phone IS NOT NULL AND deleted_at IS NULL;
+CREATE UNIQUE INDEX ux_users_phone_hash
+  ON users (phone_hash)
+  WHERE phone_hash IS NOT NULL AND deleted_at IS NULL;
 CREATE INDEX idx_users_role_deleted
   ON users (role, deleted_at);
 CREATE INDEX idx_users_created_at
@@ -78,7 +80,7 @@ CREATE TABLE user_sessions (
   refresh_token_hash  TEXT NOT NULL,
   device_id           TEXT NULL,
   user_agent          TEXT NULL,
-  ip_address          INET NULL,
+  ip_address          TEXT NULL,
   created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_used_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at          TIMESTAMPTZ NOT NULL,
@@ -94,7 +96,7 @@ CREATE INDEX idx_user_sessions_user_active
 CREATE TABLE login_attempts (
   id              BIGSERIAL PRIMARY KEY,
   email           TEXT NULL,
-  ip_address      INET NULL,
+  ip_address      TEXT NULL,
   success         BOOLEAN NOT NULL,
   user_agent      TEXT NULL,
   failure_reason  TEXT NULL,
@@ -115,7 +117,7 @@ CREATE TABLE password_reset_tokens (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at  TIMESTAMPTZ NOT NULL,
   used_at     TIMESTAMPTZ NULL,
-  ip_address  INET NULL
+  ip_address  TEXT NULL
 );
 CREATE UNIQUE INDEX ux_password_reset_token_hash
   ON password_reset_tokens (token_hash);
@@ -702,6 +704,7 @@ CREATE TABLE disputes (
       'waiting_clarification_answers',
       'waiting_round_1_votes',
       'waiting_round_2_votes',
+      'waiting_final_acceptance',
       'closed_by_acceptance',
       'resolved',
       'awaiting_moderator'
@@ -726,6 +729,7 @@ CREATE UNIQUE INDEX ux_disputes_thread_active
     'waiting_clarification_answers',
     'waiting_round_1_votes',
     'waiting_round_2_votes',
+    'waiting_final_acceptance',
     'awaiting_moderator'
   );
 

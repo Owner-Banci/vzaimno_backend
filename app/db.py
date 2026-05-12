@@ -4,10 +4,15 @@
 import logging
 import os
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Iterator
+
 from dotenv import load_dotenv
 import psycopg
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.rows import tuple_row
+from psycopg_pool import ConnectionPool
 
 load_dotenv()
 
@@ -17,6 +22,10 @@ if not DATABASE_URL:
 
 logger = logging.getLogger("vzaimno")
 DB_CONNECT_TIMEOUT_SECONDS = max(1, int(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "5")))
+DB_POOL_MIN_SIZE = max(0, int(os.getenv("DB_POOL_MIN_SIZE", "1")))
+DB_POOL_MAX_SIZE = max(1, int(os.getenv("DB_POOL_MAX_SIZE", "10")))
+DB_POOL_TIMEOUT_SECONDS = max(1, int(os.getenv("DB_POOL_TIMEOUT_SECONDS", "10")))
+DB_POOL_MAX_IDLE_SECONDS = max(1, int(os.getenv("DB_POOL_MAX_IDLE_SECONDS", "300")))
 
 
 def _connect_with_local_fallback(database_url: str) -> tuple[psycopg.Connection, str]:
@@ -42,33 +51,52 @@ def _connect_with_local_fallback(database_url: str) -> tuple[psycopg.Connection,
 
 
 _conn_lock = threading.RLock()
-conn: psycopg.Connection | None
+_transaction_conn: ContextVar[psycopg.Connection | None] = ContextVar("transaction_conn", default=None)
+pool: ConnectionPool | None = None
+conn: psycopg.Connection | None = None
 
 
-def _open_connection() -> tuple[psycopg.Connection, str]:
-    db_conn, effective_url = _connect_with_local_fallback(DATABASE_URL)
-    db_conn.autocommit = True
-    return db_conn, effective_url
+def _resolve_database_url(database_url: str) -> str:
+    db_conn, effective_url = _connect_with_local_fallback(database_url)
+    try:
+        db_conn.close()
+    except Exception:
+        pass
+    return make_conninfo(effective_url, connect_timeout=DB_CONNECT_TIMEOUT_SECONDS)
 
 
-def _reset_connection() -> psycopg.Connection:
-    global conn, DATABASE_URL
+def _open_pool() -> tuple[ConnectionPool, str]:
+    effective_url = _resolve_database_url(DATABASE_URL)
+    db_pool = ConnectionPool(
+        conninfo=effective_url,
+        min_size=DB_POOL_MIN_SIZE,
+        max_size=DB_POOL_MAX_SIZE,
+        timeout=DB_POOL_TIMEOUT_SECONDS,
+        max_idle=DB_POOL_MAX_IDLE_SECONDS,
+        kwargs={"row_factory": tuple_row, "autocommit": True},
+        open=True,
+    )
+    return db_pool, effective_url
+
+
+def _reset_pool() -> ConnectionPool:
+    global pool, DATABASE_URL
     with _conn_lock:
-        if conn is not None and not bool(getattr(conn, "closed", False)):
+        if pool is not None:
             try:
-                conn.close()
+                pool.close()
             except Exception:
                 pass
-        conn, DATABASE_URL = _open_connection()
-        return conn
+        pool, DATABASE_URL = _open_pool()
+        return pool
 
 
-def _get_connection() -> psycopg.Connection:
-    global conn
+def _get_pool() -> ConnectionPool:
+    global pool
     with _conn_lock:
-        if conn is None or bool(getattr(conn, "closed", False)):
-            conn = _reset_connection()
-        return conn
+        if pool is None or bool(getattr(pool, "closed", False)):
+            pool = _reset_pool()
+        return pool
 
 
 def _is_recoverable_disconnect(exc: Exception) -> bool:
@@ -76,26 +104,37 @@ def _is_recoverable_disconnect(exc: Exception) -> bool:
     return "connection is closed" in message or "server closed the connection" in message
 
 
-# global connection with lazy self-heal
-conn, DATABASE_URL = _open_connection()
+# global pool with lazy self-heal
+pool, DATABASE_URL = _open_pool()
 
 
 def _run_query(method: str, query: str, params: tuple = ()):
+    active_tx_conn = _transaction_conn.get()
+    if active_tx_conn is not None:
+        with active_tx_conn.cursor() as cur:
+            cur.execute(query, params)
+            if method == "one":
+                return cur.fetchone()
+            if method == "all":
+                return cur.fetchall()
+            return True
+
     last_exc: Exception | None = None
     for attempt in range(2):
-        active_conn = _get_connection()
+        db_pool = _get_pool()
         try:
-            with active_conn.cursor() as cur:
-                cur.execute(query, params)
-                if method == "one":
-                    return cur.fetchone()
-                if method == "all":
-                    return cur.fetchall()
-                return True
+            with db_pool.connection() as active_conn:
+                with active_conn.cursor() as cur:
+                    cur.execute(query, params)
+                    if method == "one":
+                        return cur.fetchone()
+                    if method == "all":
+                        return cur.fetchall()
+                    return True
         except psycopg.OperationalError as exc:
             last_exc = exc
-            if attempt == 0 and (_is_recoverable_disconnect(exc) or bool(getattr(active_conn, "closed", False))):
-                _reset_connection()
+            if attempt == 0 and _is_recoverable_disconnect(exc):
+                _reset_pool()
                 continue
             raise
     if last_exc is not None:
@@ -115,25 +154,56 @@ def execute(query: str, params: tuple = ()):
     return _run_query("execute", query, params)
 
 
-def pool_stats() -> dict[str, dict[str, int]]:
+@contextmanager
+def transaction() -> Iterator[psycopg.Connection]:
     """
-    Compatibility shim for metrics module.
+    Run existing fetch/execute helpers on one pooled connection inside a DB
+    transaction. Nested calls reuse the same connection and open a savepoint.
+    """
+    active_conn = _transaction_conn.get()
+    if active_conn is not None:
+        with active_conn.transaction():
+            yield active_conn
+        return
 
-    This project currently uses a single psycopg connection (no psycopg_pool),
-    but app.metrics expects pool-like stats for "write" and "read" pools.
-    """
-    closed = int(bool(getattr(conn, "closed", False)))
-    max_size = 1
-    in_use = 0 if closed else 1
+    db_pool = _get_pool()
+    with db_pool.connection() as active_conn:
+        token = _transaction_conn.set(active_conn)
+        try:
+            with active_conn.transaction():
+                yield active_conn
+        finally:
+            _transaction_conn.reset(token)
+
+
+def close_pool() -> None:
+    global pool
+    with _conn_lock:
+        if pool is not None:
+            pool.close()
+            pool = None
+
+
+def pool_stats() -> dict[str, dict[str, int]]:
+    db_pool = _get_pool()
+    try:
+        raw_stats = db_pool.get_stats()
+    except Exception:
+        raw_stats = {}
+    pool_size = int(raw_stats.get("pool_size", 0) or 0)
+    available = int(raw_stats.get("pool_available", 0) or 0)
+    max_size = int(getattr(db_pool, "max_size", DB_POOL_MAX_SIZE) or DB_POOL_MAX_SIZE)
+    in_use = max(0, pool_size - available)
+    waiting = int(raw_stats.get("requests_waiting", 0) or 0)
     return {
         "write": {
             "pool_in_use": in_use,
             "pool_max": max_size,
-            "requests_waiting": 0,
+            "requests_waiting": waiting,
         },
         "read": {
             "pool_in_use": in_use,
             "pool_max": max_size,
-            "requests_waiting": 0,
+            "requests_waiting": waiting,
         },
     }

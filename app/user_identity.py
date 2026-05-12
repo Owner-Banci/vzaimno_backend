@@ -48,27 +48,18 @@ def user_display_name_sql(
     if profile_alias:
         parts.append(f"NULLIF(BTRIM({profile_alias}.display_name), '')")
 
-    phone_expr, phone_params = _phone_like_expr(user_alias)
-    if phone_expr:
-        parts.append(f"NULLIF(BTRIM({phone_expr}), '')")
-        params.extend(phone_params)
-
-    parts.append(f"NULLIF(BTRIM({user_alias}.email), '')")
     parts.append("%s")
     params.append(fallback)
 
     return f"COALESCE({', '.join(parts)})", tuple(params)
 
 
-def user_contact_sql(*, user_alias: str) -> tuple[str, tuple]:
-    parts: list[str] = []
-    params: list[object] = []
-
+def user_phone_sql(*, user_alias: str) -> tuple[str, tuple]:
     phone_expr, phone_params = _phone_like_expr(user_alias)
     if phone_expr:
-        parts.append(f"NULLIF(BTRIM({phone_expr}), '')")
-        params.extend(phone_params)
+        return f"NULLIF(BTRIM({phone_expr}), '')", tuple(phone_params)
+    return "NULL::text", ()
 
-    parts.append(f"NULLIF(BTRIM({user_alias}.email), '')")
-    return f"COALESCE({', '.join(parts)})", tuple(params)
 
+def user_contact_sql(*, user_alias: str) -> tuple[str, tuple]:
+    return user_phone_sql(user_alias=user_alias)

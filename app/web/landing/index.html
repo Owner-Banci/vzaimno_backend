@@ -1,0 +1,536 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Vzaimno — мобильное приложение для локальной помощи, бытовых поручений и заработка по пути.">
+    <title>Vzaimno — помощь рядом</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <svg class="icon-sprite" aria-hidden="true">
+      <symbol id="icon-map" viewBox="0 0 24 24">
+        <path d="M9 18 3 21V6l6-3 6 3 6-3v15l-6 3-6-3Z"></path>
+        <path d="M9 3v15"></path>
+        <path d="M15 6v15"></path>
+      </symbol>
+      <symbol id="icon-route" viewBox="0 0 24 24">
+        <path d="M6 19a3 3 0 1 1 0-6c2.6 0 3.4-2 5.2-5.1C12.6 5.5 14.1 4 18 4"></path>
+        <path d="M18 4h-3.2"></path>
+        <path d="M18 4v3.2"></path>
+        <path d="M18 19a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"></path>
+      </symbol>
+      <symbol id="icon-chat" viewBox="0 0 24 24">
+        <path d="M4 5h16v11H8l-4 4V5Z"></path>
+      </symbol>
+      <symbol id="icon-user" viewBox="0 0 24 24">
+        <path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z"></path>
+        <path d="M4 21a8 8 0 0 1 16 0"></path>
+      </symbol>
+      <symbol id="icon-box" viewBox="0 0 24 24">
+        <path d="M4 7h16v13H4V7Z"></path>
+        <path d="M4 11h16"></path>
+        <path d="M8 4h8l2 3H6l2-3Z"></path>
+      </symbol>
+      <symbol id="icon-cart" viewBox="0 0 24 24">
+        <path d="M4 5h2l2.3 10.2h9.8L21 8H8"></path>
+        <path d="M10 20a1.6 1.6 0 1 0 0-3.2A1.6 1.6 0 0 0 10 20Z"></path>
+        <path d="M18 20a1.6 1.6 0 1 0 0-3.2A1.6 1.6 0 0 0 18 20Z"></path>
+      </symbol>
+      <symbol id="icon-car" viewBox="0 0 24 24">
+        <path d="M5 16h14l-1.4-5.1A3 3 0 0 0 14.7 9H9.3a3 3 0 0 0-2.9 1.9L5 16Z"></path>
+        <path d="M6 16v3"></path>
+        <path d="M18 16v3"></path>
+        <path d="M8 19h.1"></path>
+        <path d="M16 19h.1"></path>
+      </symbol>
+      <symbol id="icon-shield" viewBox="0 0 24 24">
+        <path d="M12 3 5 6v5.5c0 4.4 2.8 7.7 7 9.5 4.2-1.8 7-5.1 7-9.5V6l-7-3Z"></path>
+        <path d="m9 12 2 2 4-4"></path>
+      </symbol>
+      <symbol id="icon-star" viewBox="0 0 24 24">
+        <path d="m12 3 2.6 5.5 6 .8-4.3 4.2 1 6-5.3-2.8-5.3 2.8 1-6-4.3-4.2 6-.8L12 3Z"></path>
+      </symbol>
+      <symbol id="icon-send" viewBox="0 0 24 24">
+        <path d="M21 3 10 14"></path>
+        <path d="m21 3-7 18-4-7-7-4 18-7Z"></path>
+      </symbol>
+      <symbol id="icon-filter" viewBox="0 0 24 24">
+        <path d="M4 6h16"></path>
+        <path d="M7 12h10"></path>
+        <path d="M10 18h4"></path>
+      </symbol>
+      <symbol id="icon-heart" viewBox="0 0 24 24">
+        <path d="M20.5 8.7c0 5.3-8.5 10.3-8.5 10.3S3.5 14 3.5 8.7A4.5 4.5 0 0 1 12 6.6a4.5 4.5 0 0 1 8.5 2.1Z"></path>
+      </symbol>
+      <symbol id="icon-phone" viewBox="0 0 24 24">
+        <path d="M8 3h8a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z"></path>
+        <path d="M10 18h4"></path>
+      </symbol>
+    </svg>
+
+    <header class="site-header" data-header>
+      <a class="brand" href="#top" aria-label="Vzaimno">
+        <span class="brand-mark">V</span>
+        <span>Vzaimno</span>
+      </a>
+      <nav class="nav" aria-label="Навигация">
+        <a href="#idea">Идея</a>
+        <a href="#how">Как работает</a>
+        <a href="#scenarios">Сценарии</a>
+        <a href="#safety">Безопасность</a>
+      </nav>
+      <a class="header-cta" href="#download" data-placeholder>
+        <svg><use href="#icon-phone"></use></svg>
+        Скачать
+      </a>
+    </header>
+
+    <main id="top">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-map" aria-hidden="true">
+          <img src="assets/screen-map.png" alt="">
+          <div class="map-wash"></div>
+          <svg class="hero-route" viewBox="0 0 1000 760" preserveAspectRatio="none">
+            <path class="route-shadow" d="M88 585 C180 510, 240 462, 355 462 S515 394, 588 304 S735 214, 885 174"></path>
+            <path class="route-line" d="M88 585 C180 510, 240 462, 355 462 S515 394, 588 304 S735 214, 885 174"></path>
+          </svg>
+          <span class="map-pin pin-a"></span>
+          <span class="map-pin pin-b"></span>
+          <span class="map-pin pin-c"></span>
+        </div>
+
+        <div class="hero-copy reveal">
+          <p class="eyebrow">Локальная помощь в городе</p>
+          <h1 id="hero-title">Vzaimno</h1>
+          <p class="hero-slogan">Помощь рядом. Заработок по пути</p>
+          <p class="hero-text">
+            Vzaimno помогает быстро находить людей рядом для повседневных задач:
+            забрать, купить, доставить, перенести или помочь на месте
+          </p>
+          <div class="store-row" id="download">
+            <a class="store-button store-dark" href="#" data-placeholder>
+              <span class="store-icon">
+                <svg><use href="#icon-phone"></use></svg>
+              </span>
+              <span>
+                <small>Скачать в</small>
+                App Store
+              </span>
+            </a>
+            <a class="store-button" href="#" data-placeholder>
+              <span class="store-icon play"></span>
+              <span>
+                <small>Доступно в</small>
+                Google Play
+              </span>
+            </a>
+          </div>
+          <div class="hero-pills" aria-label="Ключевые возможности">
+            <span>Задачи рядом</span>
+            <span>Отклики</span>
+            <span>Маршруты</span>
+            <span>Чат</span>
+          </div>
+        </div>
+
+        <div class="hero-product" aria-label="Интерфейс приложения Vzaimno">
+          <div class="phone-mockup phone-main android-phone" data-tilt>
+            <div class="android-camera"></div>
+            <img src="assets/screen-map.png" alt="Карта задач в приложении Vzaimno">
+          </div>
+          <div class="phone-mockup phone-secondary" data-tilt>
+            <div class="phone-speaker"></div>
+            <img src="assets/screen-route.png" alt="Маршрут с задачами в приложении Vzaimno">
+          </div>
+          <div class="floating-task task-one">
+            <span class="task-dot"></span>
+            <strong>Купить продукты</strong>
+            <span>до 700 ₽ · сейчас</span>
+          </div>
+          <div class="floating-task task-two">
+            <svg><use href="#icon-route"></use></svg>
+            <strong>По пути</strong>
+            <span>22 км · 9 задач</span>
+          </div>
+        </div>
+
+        <div class="hero-next-peek" aria-hidden="true">
+          <div>
+            <strong>Создать задачу</strong>
+            <span>2 минуты</span>
+          </div>
+          <div>
+            <strong>Получить отклики</strong>
+            <span>люди рядом</span>
+          </div>
+          <div>
+            <strong>Выполнить</strong>
+            <span>отзыв и статус</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="section idea-section" id="idea" aria-labelledby="idea-title">
+        <div class="section-head reveal">
+          <p class="eyebrow">Идея Vzaimno</p>
+          <h2 id="idea-title">Город уже движется. Поручения находят тех, кто рядом</h2>
+        </div>
+
+        <div class="idea-grid">
+          <div class="person-panel creator-panel reveal">
+            <div class="avatar avatar-teal">A</div>
+            <div>
+              <span class="panel-label">Заказчик</span>
+              <h3>Создаёт поручение</h3>
+              <p>Нужно забрать, купить, передать или помочь на месте</p>
+            </div>
+          </div>
+
+          <div class="city-connection reveal">
+            <div class="mini-map">
+              <svg viewBox="0 0 680 430" preserveAspectRatio="none">
+                <path class="map-road muted-road" d="M20 120 C145 70 214 96 310 155 S486 245 660 190"></path>
+                <path class="map-road muted-road" d="M44 356 C160 284 244 324 340 264 S530 112 652 84"></path>
+                <path class="map-road active-road" d="M64 292 C150 248 205 252 286 214 S419 135 606 132"></path>
+              </svg>
+              <span class="city-point point-home">Нужна помощь</span>
+              <span class="city-point point-helper">Едет рядом</span>
+              <span class="city-point point-task">Задача</span>
+              <div class="task-preview-card">
+                <span>Забрать заказ</span>
+                <strong>700–900 ₽</strong>
+              </div>
+            </div>
+          </div>
+
+          <div class="person-panel performer-panel reveal">
+            <div class="avatar avatar-warm">И</div>
+            <div>
+              <span class="panel-label">Исполнитель</span>
+              <h3>Видит задачу рядом</h3>
+              <p>Откликается, обсуждает детали и зарабатывает по пути</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="value-strip reveal">
+          <div>
+            <svg><use href="#icon-user"></use></svg>
+            <span>Не нужно искать знакомых</span>
+          </div>
+          <div>
+            <svg><use href="#icon-route"></use></svg>
+            <span>Не нужно тратить лишнее время</span>
+          </div>
+          <div>
+            <svg><use href="#icon-map"></use></svg>
+            <span>Помощь находится рядом</span>
+          </div>
+          <div>
+            <svg><use href="#icon-star"></use></svg>
+            <span>Маршрут превращается в заработок</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="section how-section" id="how" aria-labelledby="how-title">
+        <div class="section-head compact reveal">
+          <p class="eyebrow">Как это работает</p>
+          <h2 id="how-title">От задачи до отзыва — четыре понятных шага</h2>
+        </div>
+        <div class="steps">
+          <article class="step-card reveal">
+            <span class="step-number">1</span>
+            <svg><use href="#icon-send"></use></svg>
+            <h3>Создайте задачу</h3>
+            <p>Выберите сценарий, адреса, время и бюджет</p>
+          </article>
+          <article class="step-card reveal">
+            <span class="step-number">2</span>
+            <svg><use href="#icon-map"></use></svg>
+            <h3>Получите отклики</h3>
+            <p>Задачу увидят люди рядом или на маршруте</p>
+          </article>
+          <article class="step-card reveal">
+            <span class="step-number">3</span>
+            <svg><use href="#icon-chat"></use></svg>
+            <h3>Обсудите детали</h3>
+            <p>Выберите исполнителя и уточните всё в чате</p>
+          </article>
+          <article class="step-card reveal">
+            <span class="step-number">4</span>
+            <svg><use href="#icon-star"></use></svg>
+            <h3>Оставьте отзыв</h3>
+            <p>Статус закрыт, у сторон появляется история</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section scenarios-section" id="scenarios" aria-labelledby="scenarios-title">
+        <div class="section-head reveal">
+          <p class="eyebrow">Сценарии</p>
+          <h2 id="scenarios-title">Что можно поручить через Vzaimno</h2>
+        </div>
+        <div class="scenario-layout">
+          <div class="scenario-lead reveal">
+            <div class="route-card">
+              <div class="route-card-map">
+                <span class="route-pin start">C</span>
+                <span class="route-pin finish">A</span>
+                <svg viewBox="0 0 420 240" preserveAspectRatio="none">
+                  <path d="M52 172 C130 96 190 120 250 88 S330 76 380 42"></path>
+                </svg>
+              </div>
+              <div class="route-stats">
+                <span><strong>9</strong> задач</span>
+                <span><strong>22.0</strong> км</span>
+                <span><strong>43</strong> мин</span>
+              </div>
+            </div>
+          </div>
+          <div class="scenario-grid">
+            <article class="scenario-card reveal">
+              <svg><use href="#icon-box"></use></svg>
+              <h3>Забрать заказ</h3>
+              <p>Пункт выдачи, кафе, магазин, ресепшен</p>
+            </article>
+            <article class="scenario-card reveal">
+              <svg><use href="#icon-cart"></use></svg>
+              <h3>Купить продукты или лекарства</h3>
+              <p>Когда самому неудобно выходить или ехать</p>
+            </article>
+            <article class="scenario-card reveal">
+              <svg><use href="#icon-send"></use></svg>
+              <h3>Передать документы</h3>
+              <p>Небольшая передача по городу</p>
+            </article>
+            <article class="scenario-card reveal">
+              <svg><use href="#icon-route"></use></svg>
+              <h3>Доставить небольшую вещь</h3>
+              <p>По пути, без лишних кругов</p>
+            </article>
+            <article class="scenario-card reveal">
+              <svg><use href="#icon-user"></use></svg>
+              <h3>Помочь с переносом</h3>
+              <p>Поднять, донести, перенести рядом</p>
+            </article>
+            <article class="scenario-card reveal">
+              <svg><use href="#icon-car"></use></svg>
+              <h3>Подвезти или заехать</h3>
+              <p>Маршрут становится полезнее</p>
+            </article>
+            <article class="scenario-card wide reveal">
+              <svg><use href="#icon-heart"></use></svg>
+              <h3>Выполнить небольшую бытовую задачу</h3>
+              <p>То, что сложно оформить как доставку, но легко решить через человека рядом</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section sides-section" aria-labelledby="sides-title">
+        <div class="section-head compact reveal">
+          <p class="eyebrow">Две стороны</p>
+          <h2 id="sides-title">Одинаково полезно для заказчика и исполнителя</h2>
+        </div>
+        <div class="sides-grid">
+          <article class="side-card customer reveal">
+            <span class="side-kicker">Для заказчика</span>
+            <h3>Быстро найти помощь и контролировать задачу</h3>
+            <ul>
+              <li>Найти помощь рядом</li>
+              <li>Выбрать исполнителя из откликов</li>
+              <li>Обсудить детали в чате</li>
+              <li>Следить за статусом задачи</li>
+              <li>Экономить время</li>
+            </ul>
+          </article>
+          <article class="side-card performer reveal">
+            <span class="side-kicker">Для исполнителя</span>
+            <h3>Зарабатывать на простых задачах по пути</h3>
+            <ul>
+              <li>Выполнять задачи рядом</li>
+              <li>Зарабатывать по пути</li>
+              <li>Выбирать подходящие заказы</li>
+              <li>Работать в удобное время</li>
+              <li>Использовать маршруты с пользой</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="section app-section" aria-labelledby="app-title">
+        <div class="app-showcase">
+          <div class="app-copy reveal">
+            <p class="eyebrow">Возможности приложения</p>
+            <h2 id="app-title">Не технический список, а рабочий поток внутри одного приложения</h2>
+            <p>
+              Карта, объявления, маршрут, чаты, статусы, отзывы, поддержка и модерация
+              собираются в один понятный сценарий
+            </p>
+            <div class="screen-tabs" role="tablist" aria-label="Экраны приложения">
+              <button class="active" type="button" data-screen="map">Карта</button>
+              <button type="button" data-screen="new-task">Создание</button>
+              <button type="button" data-screen="preview">Предпросмотр</button>
+              <button type="button" data-screen="route">Маршрут</button>
+              <button type="button" data-screen="ads">Объявления</button>
+              <button type="button" data-screen="chats">Чаты</button>
+              <button type="button" data-screen="profile">Профиль</button>
+            </div>
+          </div>
+          <div class="screen-phone reveal">
+            <div class="phone-mockup app-phone">
+              <div class="phone-speaker"></div>
+              <img data-screen-image src="assets/screen-map.png" alt="Экран приложения Vzaimno">
+            </div>
+          </div>
+        </div>
+
+        <div class="feature-grid">
+          <article class="feature-card reveal">
+            <svg><use href="#icon-send"></use></svg>
+            <h3>Создание объявлений</h3>
+            <p>Сценарии подстраивают поля задачи</p>
+          </article>
+          <article class="feature-card reveal">
+            <svg><use href="#icon-map"></use></svg>
+            <h3>Карта и список задач</h3>
+            <p>Видно, что находится рядом</p>
+          </article>
+          <article class="feature-card reveal">
+            <svg><use href="#icon-filter"></use></svg>
+            <h3>Фильтры</h3>
+            <p>Категория, срочность и бюджет</p>
+          </article>
+          <article class="feature-card reveal">
+            <svg><use href="#icon-user"></use></svg>
+            <h3>Отклики исполнителей</h3>
+            <p>Заказчик выбирает подходящего человека</p>
+          </article>
+          <article class="feature-card reveal">
+            <svg><use href="#icon-chat"></use></svg>
+            <h3>Чат</h3>
+            <p>Детали обсуждаются внутри задачи</p>
+          </article>
+          <article class="feature-card reveal">
+            <svg><use href="#icon-route"></use></svg>
+            <h3>Статусы выполнения</h3>
+            <p>Понятно, где сейчас задача</p>
+          </article>
+          <article class="feature-card reveal">
+            <svg><use href="#icon-star"></use></svg>
+            <h3>Отзывы</h3>
+            <p>История помогает выбирать людей</p>
+          </article>
+          <article class="feature-card reveal">
+            <svg><use href="#icon-shield"></use></svg>
+            <h3>Поддержка и жалобы</h3>
+            <p>Можно сообщить о проблеме</p>
+          </article>
+          <article class="feature-card reveal">
+            <svg><use href="#icon-heart"></use></svg>
+            <h3>Модерация</h3>
+            <p>Объявления проходят проверку</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section safety-section" id="safety" aria-labelledby="safety-title">
+        <div class="safety-copy reveal">
+          <p class="eyebrow">Доверие и безопасность</p>
+          <h2 id="safety-title">Комфортная и безопасная среда для взаимопомощи</h2>
+          <p>
+            Vzaimno строится вокруг выбора, общения и понятной истории действий:
+            пользователь видит отклики, уточняет детали в чате, оставляет отзыв и может обратиться в поддержку
+          </p>
+        </div>
+        <div class="safety-items">
+          <div class="safety-item reveal">
+            <svg><use href="#icon-user"></use></svg>
+            <span>Выбор через отклики</span>
+          </div>
+          <div class="safety-item reveal">
+            <svg><use href="#icon-chat"></use></svg>
+            <span>Чат для деталей</span>
+          </div>
+          <div class="safety-item reveal">
+            <svg><use href="#icon-star"></use></svg>
+            <span>Отзывы после задач</span>
+          </div>
+          <div class="safety-item reveal">
+            <svg><use href="#icon-shield"></use></svg>
+            <span>Жалобы и поддержка</span>
+          </div>
+          <div class="safety-item reveal">
+            <svg><use href="#icon-filter"></use></svg>
+            <span>Модерация объявлений</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="section founder-section" aria-labelledby="founder-title">
+        <div class="founder-card reveal">
+          <figure class="founder-photo">
+            <img src="assets/founder-avazbek.png" alt="Авазбек Муртазаев, создатель Vzaimno">
+          </figure>
+          <div class="founder-copy">
+            <p class="eyebrow">Создатель проекта</p>
+            <h2 id="founder-title">Vzaimno — не просто список заказов, а платформа, удобная и для заказчиков, и для исполнителей</h2>
+            <p>
+              Я создал Vzaimno, чтобы сделать повседневную помощь между людьми проще,
+              быстрее и понятнее. Идея проекта — соединить тех, кому нужна помощь,
+              с теми, кто уже находится рядом или едет по подходящему маршруту
+            </p>
+            <div class="social-row">
+              <a href="https://t.me/Murtazaev_Av" target="_blank" rel="noopener">Telegram</a>
+              <a href="mailto:murtazaevavazbek20@gmail.com">murtazaevavazbek20@gmail.com</a>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="final-cta" aria-labelledby="cta-title">
+        <div class="cta-map" aria-hidden="true">
+          <svg viewBox="0 0 900 420" preserveAspectRatio="none">
+            <path d="M52 310 C175 195 260 270 365 172 S616 74 842 132"></path>
+            <path d="M35 92 C150 160 272 72 395 116 S612 270 865 238"></path>
+          </svg>
+          <span class="cta-pin one"></span>
+          <span class="cta-pin two"></span>
+          <span class="cta-pin three"></span>
+        </div>
+        <div class="cta-content reveal">
+          <p class="eyebrow">Vzaimno</p>
+          <h2 id="cta-title">Скачайте Vzaimno и находите помощь рядом</h2>
+          <p>Создавайте задачи, находите исполнителей или зарабатывайте на поручениях по пути</p>
+          <div class="store-row center">
+            <a class="store-button store-dark" href="#" data-placeholder>
+              <span class="store-icon"><svg><use href="#icon-phone"></use></svg></span>
+              <span><small>Скачать в</small>App Store</span>
+            </a>
+            <a class="store-button" href="#" data-placeholder>
+              <span class="store-icon play"></span>
+              <span><small>Доступно в</small>Google Play</span>
+            </a>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div>
+        <strong>Vzaimno</strong>
+        <span>Помощь рядом. Заработок по пути</span>
+      </div>
+      <div class="footer-links">
+        <a href="mailto:murtazaevavazbek20@gmail.com">murtazaevavazbek20@gmail.com</a>
+        <a href="#" data-placeholder>Политика</a>
+        <a href="#" data-placeholder>Поддержка</a>
+      </div>
+    </footer>
+
+    <div class="toast" role="status" aria-live="polite" data-toast></div>
+    <script src="script.js"></script>
+  </body>
+</html>

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import importlib.util
 import json
 import os
+import re
 import uuid
+import warnings
 import itsdangerous
 import anyio
 from datetime import datetime, timezone
@@ -13,8 +16,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -36,7 +41,7 @@ from app.chat import (
     post_system_thread_message,
     post_thread_message,
 )
-from app.db import execute, fetch_all, fetch_one
+from app.db import execute, fetch_all, fetch_one, transaction
 from app.disputes import (
     capture_clarification_answer_from_chat_message,
     counterparty_accept as dispute_counterparty_accept,
@@ -45,13 +50,17 @@ from app.disputes import (
     open_dispute as dispute_open_case,
     process_dispute_model_turn,
     select_settlement_option as dispute_select_settlement_option,
+    submit_final_acceptance as dispute_submit_final_acceptance,
 )
-from app.geocoding import geocode_address
+from app.geocoding import geocode_address, lookup_local_address_point
 from app.moderation_image import get_nsfw_detector
 from app.moderation_text import classify_text
 from app.ops import create_notification, create_report, ensure_appeal_report, report_status_select_sql
+from app.rate_limit import LimitRule, enforce_rate_limit
 from app.routes_module.router import router as routes_router
+from app.routes_module.sql import FIND_KNOWN_ROUTE_POINT_BY_ADDRESS_SQL
 from app.schema_compat import table_has_column
+from app.security import decode_user_access_token
 from app.schemas import (
     AcceptOfferOut,
     AnnouncementOut,
@@ -63,6 +72,7 @@ from app.schemas import (
     CreateAnnouncementIn,
     CreateOfferIn,
     DisputeCounterpartyResponseIn,
+    DisputeFinalAcceptanceIn,
     DisputeOpenIn,
     DisputeSelectOptionIn,
     DisputeStateOut,
@@ -73,10 +83,15 @@ from app.schemas import (
     LoginIn,
     MeProfileOut,
     OKOut,
+    PasswordResetConfirmIn,
+    PasswordResetRequestIn,
+    PasswordResetRequestOut,
     RegisterIn,
     ReportCreateIn,
     ReportOut,
     ReportReasonOptionOut,
+    RefreshTokenIn,
+    RevokeSessionIn,
     SupportMessageIn,
     SupportMessageOut,
     SupportThreadOut,
@@ -90,8 +105,18 @@ from app.schemas import (
     UserStatsOut,
     UserOut,
 )
-from app.security import create_user_access_token, hash_password, verify_password
+from app.storage import get_storage
 from app.support import get_or_create_support_thread, list_support_messages, post_support_message
+from app.user_auth import (
+    authenticate_user,
+    confirm_password_reset,
+    refresh_user_credentials,
+    register_user,
+    request_password_reset,
+    revoke_all_user_sessions,
+    revoke_user_refresh_token,
+    revoke_user_session,
+)
 from app.logging_utils import logger
 from app.task_compat import (
     announcement_status_to_task_fields,
@@ -114,10 +139,99 @@ from app.task_compat import (
     task_row_to_announcement_dict,
     task_to_announcement_status,
 )
-from app.user_identity import user_contact_sql, user_display_name_sql
+from app.user_identity import user_display_name_sql, user_phone_sql
+from app.user_restrictions import assert_user_action_allowed
 
 app = FastAPI(title="Slayma Backend (MVP)")
 app.include_router(routes_router)
+
+LANDING_DIR = Path(__file__).resolve().parent / "web" / "landing"
+LANDING_INDEX_PATH = LANDING_DIR / "index.html"
+LANDING_STYLES_PATH = LANDING_DIR / "styles.css"
+LANDING_SCRIPT_PATH = LANDING_DIR / "script.js"
+
+if (LANDING_DIR / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=str(LANDING_DIR / "assets")), name="landing-assets")
+
+
+@app.get("/", include_in_schema=False)
+def landing_page() -> FileResponse:
+    return FileResponse(LANDING_INDEX_PATH)
+
+
+@app.get("/styles.css", include_in_schema=False)
+def landing_styles() -> FileResponse:
+    return FileResponse(LANDING_STYLES_PATH, media_type="text/css")
+
+
+@app.get("/script.js", include_in_schema=False)
+def landing_script() -> FileResponse:
+    return FileResponse(LANDING_SCRIPT_PATH, media_type="application/javascript")
+
+
+def _request_rate_limit_identity(request: Request) -> str:
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+        if token:
+            try:
+                payload = decode_user_access_token(token)
+                subject = str(payload.get("sub") or "").strip()
+                if subject:
+                    return f"user:{subject}"
+            except Exception:
+                pass
+
+    if request.client and request.client.host:
+        return f"ip:{request.client.host}"
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded.strip():
+        return f"ip:{forwarded.split(',', 1)[0].strip() or 'unknown'}"
+    return "ip:unknown"
+
+
+def _rate_limit_scope_and_rules(method: str, path: str) -> tuple[str, tuple[LimitRule, ...]] | None:
+    if method.upper() != "POST":
+        return None
+
+    normalized = path.rstrip("/") or "/"
+    if normalized == "/auth/login":
+        return "user_login", (LimitRule(120, 60), LimitRule(1000, 3600))
+    if normalized == "/auth/register":
+        return "user_register", (LimitRule(4, 300), LimitRule(20, 3600))
+    if normalized == "/auth/password-reset/request":
+        return "password_reset_request", (LimitRule(3, 300), LimitRule(10, 3600))
+    if normalized == "/auth/password-reset/confirm":
+        return "password_reset_confirm", (LimitRule(6, 300), LimitRule(20, 3600))
+    if normalized == "/reports":
+        return "reports", (LimitRule(5, 60), LimitRule(30, 3600))
+
+    if re.fullmatch(r"/support/thread/[^/]+/messages", normalized):
+        return "support_messages", (LimitRule(20, 60), LimitRule(200, 3600))
+    if re.fullmatch(r"/chats/[^/]+/messages", normalized):
+        return "chat_messages", (LimitRule(60, 60), LimitRule(600, 3600))
+    if re.fullmatch(r"/chats/[^/]+/messages/media", normalized):
+        return "chat_uploads", (LimitRule(10, 60), LimitRule(100, 3600))
+    if re.fullmatch(r"/announcements/[^/]+/media", normalized):
+        return "announcement_uploads", (LimitRule(10, 60), LimitRule(100, 3600))
+
+    return None
+
+
+@app.middleware("http")
+async def app_rate_limit_middleware(request: Request, call_next):
+    scope = _rate_limit_scope_and_rules(request.method, request.url.path)
+    if scope is not None:
+        rate_scope, rules = scope
+        try:
+            await enforce_rate_limit(rate_scope, _request_rate_limit_identity(request), rules)
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+                headers=exc.headers or None,
+            )
+    return await call_next(request)
 
 # ----------------------------
 # Statuses (string enum in DB)
@@ -232,6 +346,101 @@ class SubmitReviewIn(BaseModel):
 UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", "uploads"))
 NSFW_REVIEW = float(os.getenv("NSFW_REVIEW", "0.30"))
 NSFW_HARD_BLOCK = float(os.getenv("NSFW_HARD_BLOCK", "0.85"))
+UPLOAD_MAX_FILE_SIZE_BYTES = max(1024, int(os.getenv("UPLOAD_MAX_FILE_SIZE_BYTES", str(8 * 1024 * 1024))))
+UPLOAD_MAX_FILE_COUNT = max(1, int(os.getenv("UPLOAD_MAX_FILE_COUNT", "6")))
+UPLOAD_MAX_IMAGE_PIXELS = max(1_000_000, int(os.getenv("UPLOAD_MAX_IMAGE_PIXELS", "20000000")))
+ALLOWED_UPLOAD_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
+ALLOWED_UPLOAD_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+_MIME_TO_EXTENSION = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+Image.MAX_IMAGE_PIXELS = UPLOAD_MAX_IMAGE_PIXELS
+
+
+def _create_external_geocoding_enabled() -> bool:
+    return os.getenv("GEOCODE_ON_CREATE", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _create_geocode_timeout_seconds() -> float:
+    try:
+        return max(0.5, float(os.getenv("GEOCODE_ON_CREATE_TIMEOUT_SECONDS", "2.0")))
+    except ValueError:
+        return 2.0
+
+
+def _safe_upload_filename(filename: str | None, *, content_type: str) -> str:
+    raw_name = Path(str(filename or "")).name.strip()
+    if not raw_name:
+        raw_name = f"image{_MIME_TO_EXTENSION.get(content_type, '.jpg')}"
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._")
+    if not cleaned:
+        cleaned = f"image{_MIME_TO_EXTENSION.get(content_type, '.jpg')}"
+    ext = Path(cleaned).suffix.lower()
+    if ext not in ALLOWED_UPLOAD_EXTENSIONS:
+        inferred_ext = _MIME_TO_EXTENSION.get(content_type)
+        if not inferred_ext:
+            raise HTTPException(status_code=400, detail="Unsupported image extension")
+        cleaned = f"{Path(cleaned).stem or 'image'}{inferred_ext}"
+    return cleaned[:160]
+
+
+def _storage_segment(value: str, fallback: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value or "").strip()).strip("_")
+    return cleaned or fallback
+
+
+def _sniff_image_content_type(content: bytes) -> str:
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp"
+    raise HTTPException(status_code=400, detail="Unsupported or invalid image type")
+
+
+def _verify_image_upload(file: UploadFile, content: bytes) -> tuple[str, str]:
+    sniffed_type = _sniff_image_content_type(content)
+    declared_type = (file.content_type or "").split(";", 1)[0].strip().lower()
+    if declared_type == "image/jpg":
+        declared_type = "image/jpeg"
+    if declared_type and declared_type not in ALLOWED_UPLOAD_MIME_TYPES and declared_type != "application/octet-stream":
+        raise HTTPException(status_code=400, detail="Unsupported image content type")
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(content)) as image:
+                image.verify()
+                image_type = f"image/{str(image.format or '').lower()}"
+                if image_type == "image/jpg":
+                    image_type = "image/jpeg"
+                if image_type not in ALLOWED_UPLOAD_MIME_TYPES or image_type != sniffed_type:
+                    raise HTTPException(status_code=400, detail="Image type mismatch")
+    except HTTPException:
+        raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise HTTPException(status_code=413, detail="Image is too large") from exc
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid image file") from exc
+
+    return _safe_upload_filename(file.filename, content_type=sniffed_type), sniffed_type
+
+
+def _read_upload_content_sync(file: UploadFile) -> bytes:
+    content = file.file.read(UPLOAD_MAX_FILE_SIZE_BYTES + 1)
+    if len(content) > UPLOAD_MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="Image is too large")
+    return content
+
+
+async def _read_upload_content_async(file: UploadFile) -> bytes:
+    content = await file.read(UPLOAD_MAX_FILE_SIZE_BYTES + 1)
+    if len(content) > UPLOAD_MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="Image is too large")
+    return content
 
 
 def _local_upload_exists(path_value: Any) -> bool:
@@ -313,7 +522,7 @@ def download_announcement_media(
         raise HTTPException(status_code=404, detail="File not found")
 
     ann = _fetch_announcement_or_404(ann_id)
-    if not _user_can_fetch_announcement(ann_id, user.id, ann.user_id):
+    if not _user_can_fetch_announcement_upload(ann_id, user.id, ann.user_id):
         raise HTTPException(status_code=403, detail="Access denied")
 
     return FileResponse(str(file_path))
@@ -358,36 +567,53 @@ def health() -> Dict[str, str]:
 # Auth
 # ----------------------------
 @app.post("/auth/register", response_model=TokenOut)
-def register(data: RegisterIn) -> TokenOut:
-    existing = fetch_one("SELECT 1 FROM users WHERE email=%s", (data.email,))
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
-
-    user_id = str(uuid.uuid4())
-    pwd_hash = hash_password(data.password)
-
-    execute(
-        "INSERT INTO users (id, email, password_hash, role) VALUES (%s,%s,%s,%s)",
-        (user_id, data.email, pwd_hash, "user"),
-    )
-    _ensure_profile_and_stats(user_id)
-
-    token = create_user_access_token(user_id, role="user")
-    return TokenOut(access_token=token)
+def register(data: RegisterIn, request: Request) -> TokenOut:
+    with transaction():
+        credentials = register_user(str(data.email), data.password, request)
+        _ensure_profile_and_stats(credentials.user_id)
+    return TokenOut(access_token=credentials.access_token, refresh_token=credentials.refresh_token)
 
 
 @app.post("/auth/login", response_model=TokenOut)
-def login(data: LoginIn) -> TokenOut:
-    row = fetch_one("SELECT id::text, password_hash FROM users WHERE email=%s", (data.email,))
-    if not row:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+def login(data: LoginIn, request: Request) -> TokenOut:
+    credentials = authenticate_user(str(data.email), data.password, request)
+    return TokenOut(access_token=credentials.access_token, refresh_token=credentials.refresh_token)
 
-    user_id, pwd_hash = row
-    if not verify_password(data.password, pwd_hash):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    token = create_user_access_token(str(user_id), role="user")
-    return TokenOut(access_token=token)
+@app.post("/auth/refresh", response_model=TokenOut)
+def refresh_token(data: RefreshTokenIn, request: Request) -> TokenOut:
+    credentials = refresh_user_credentials(data.refresh_token, request)
+    return TokenOut(access_token=credentials.access_token, refresh_token=credentials.refresh_token)
+
+
+@app.post("/auth/logout", response_model=OKOut)
+def logout(data: RefreshTokenIn) -> OKOut:
+    revoke_user_refresh_token(data.refresh_token)
+    return OKOut()
+
+
+@app.post("/auth/sessions/revoke", response_model=OKOut)
+def revoke_session(data: RevokeSessionIn, user: UserPrincipal = Depends(get_current_user)) -> OKOut:
+    revoke_user_session(user.id, data.session_id)
+    return OKOut()
+
+
+@app.post("/auth/sessions/revoke-all", response_model=OKOut)
+def revoke_all_sessions(user: UserPrincipal = Depends(get_current_user)) -> OKOut:
+    revoke_all_user_sessions(user.id)
+    return OKOut()
+
+
+@app.post("/auth/password-reset/request", response_model=PasswordResetRequestOut)
+def password_reset_request(data: PasswordResetRequestIn, request: Request) -> PasswordResetRequestOut:
+    result = request_password_reset(str(data.email), request)
+    return PasswordResetRequestOut(reset_token=result.reset_token)
+
+
+@app.post("/auth/password-reset/confirm", response_model=OKOut)
+def password_reset_confirm(data: PasswordResetConfirmIn) -> OKOut:
+    confirm_password_reset(data.token, data.new_password)
+    return OKOut()
 
 
 @app.get("/me", response_model=UserOut)
@@ -605,7 +831,7 @@ def _fetch_me_profile(user_id: str) -> MeProfileOut:
 
     _ensure_profile_and_stats(user_id)
 
-    phone_sql, phone_params = user_contact_sql(user_alias="u")
+    phone_sql, phone_params = user_phone_sql(user_alias="u")
     row = fetch_one(
         f"""
         SELECT
@@ -938,7 +1164,7 @@ def my_reviews(
         f"""
         SELECT
             COALESCE(r.id::text, r.from_user_id::text || '|' || COALESCE(r.created_at::text, '') || '|' || COALESCE(r.text, '')),
-            COALESCE(NULLIF(up.display_name, ''), u.email, 'Пользователь') AS from_user_display_name,
+            COALESCE(NULLIF(up.display_name, ''), 'Пользователь') AS from_user_display_name,
             r.stars,
             r.text,
             r.created_at,
@@ -1373,6 +1599,54 @@ def _ensure_list(x: Any) -> List[Any]:
     return x if isinstance(x, list) else []
 
 
+CLIENT_DATA_FORBIDDEN_KEYS = {
+    "admin",
+    "audit",
+    "closed_at",
+    "created_at",
+    "customer_id",
+    "deleted_at",
+    "is_admin",
+    "media",
+    "media_url",
+    "moderation",
+    "moderation_status",
+    "moderator",
+    "object_key",
+    "owner_id",
+    "penalty_stub",
+    "performer_id",
+    "photos",
+    "published_at",
+    "report",
+    "reports",
+    "storage_key",
+    "updated_at",
+    "uploaded_by_user_id",
+    "user_id",
+}
+
+CLIENT_TASK_FORBIDDEN_KEYS = {"assignment", "execution", "moderation"}
+
+
+def _sanitize_announcement_client_data(value: Any, *, parent_key: str | None = None) -> Any:
+    if isinstance(value, list):
+        return [_sanitize_announcement_client_data(item, parent_key=parent_key) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    cleaned: Dict[str, Any] = {}
+    for raw_key, raw_value in value.items():
+        key = str(raw_key)
+        normalized_key = key.strip().lower()
+        if normalized_key in CLIENT_DATA_FORBIDDEN_KEYS:
+            continue
+        if parent_key == "task" and normalized_key in CLIENT_TASK_FORBIDDEN_KEYS:
+            continue
+        cleaned[key] = _sanitize_announcement_client_data(raw_value, parent_key=normalized_key)
+    return cleaned
+
+
 def _get_mod(data: Dict[str, Any]) -> Dict[str, Any]:
     return _ensure_obj(data.get("moderation"))
 
@@ -1657,6 +1931,34 @@ def _destination_point_from_payload(data: Dict[str, Any]) -> Optional[Tuple[floa
     return destination_point(data) or _extract_point(route_destination.get("point"))
 
 
+def _lookup_known_address_point(address: Optional[str]) -> Optional[Tuple[float, float]]:
+    normalized = _normalize_address(address)
+    if not normalized:
+        return None
+    row = fetch_one(FIND_KNOWN_ROUTE_POINT_BY_ADDRESS_SQL, (normalized,))
+    if not row:
+        return None
+    lat = _parse_float(row[0])
+    lon = _parse_float(row[1])
+    if lat is None or lon is None:
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    return lat, lon
+
+
+def _resolve_address_point_for_create(address: Optional[str]) -> Optional[Tuple[float, float]]:
+    known_point = _lookup_known_address_point(address)
+    if known_point is not None:
+        return known_point
+    local_point = lookup_local_address_point(address)
+    if local_point is not None:
+        return local_point
+    if not address or not _create_external_geocoding_enabled():
+        return None
+    return geocode_address(address, timeout_seconds=_create_geocode_timeout_seconds())
+
+
 def _store_source_point(category: str, data: Dict[str, Any], point: Tuple[float, float]) -> None:
     normalized_category = (category or "").strip().lower()
     point_obj = _point_obj(point)
@@ -1689,7 +1991,7 @@ def _ensure_payload_points(category: str, data: Dict[str, Any]) -> Optional[Tupl
     if source_point is None:
         source_address = primary_source_address(data)
         if source_address:
-            source_point = geocode_address(source_address)
+            source_point = _resolve_address_point_for_create(source_address)
     if source_point is not None:
         _store_source_point(category, data, source_point)
 
@@ -1697,7 +1999,7 @@ def _ensure_payload_points(category: str, data: Dict[str, Any]) -> Optional[Tupl
     if destination_fallback_point is None:
         destination_address = primary_destination_address(data)
         if destination_address:
-            destination_fallback_point = geocode_address(destination_address)
+            destination_fallback_point = _resolve_address_point_for_create(destination_address)
     if destination_fallback_point is not None:
         _store_destination_point(category, data, destination_fallback_point)
 
@@ -1743,7 +2045,7 @@ def _resolve_point(
             return point
 
     if address:
-        return geocode_address(address)
+        return _resolve_address_point_for_create(address)
 
     return None
 
@@ -1810,22 +2112,20 @@ def _persist_repaired_task_point(task_id: str, category: str, data: Dict[str, An
     return True
 
 
-def _save_upload(ann_id: str, file: UploadFile, content: bytes) -> str:
-    safe_name = (file.filename or "image").replace("/", "_").replace("\\", "_")
-    folder = UPLOADS_DIR / ann_id
-    folder.mkdir(parents=True, exist_ok=True)
-    out = folder / f"{uuid.uuid4().hex}_{safe_name}"
-    out.write_bytes(content)
-    return "/" + out.as_posix().lstrip("/")
+def _save_upload(ann_id: str, file: UploadFile, content: bytes, *, content_type: str) -> tuple[str, str]:
+    safe_name = _safe_upload_filename(file.filename, content_type=content_type)
+    key = f"{_storage_segment(ann_id, 'announcement')}/{uuid.uuid4().hex}_{safe_name}"
+    storage = get_storage()
+    object_key = storage.put(key, content, content_type=content_type)
+    return storage.get_url(object_key), object_key
 
 
-def _save_chat_upload(thread_id: str, filename: Optional[str], content: bytes) -> str:
-    safe_name = (filename or "image").replace("/", "_").replace("\\", "_")
-    folder = UPLOADS_DIR / "chat" / thread_id
-    folder.mkdir(parents=True, exist_ok=True)
-    out = folder / f"{uuid.uuid4().hex}_{safe_name}"
-    out.write_bytes(content)
-    return f"/uploads/chat/{thread_id}/{out.name}"
+def _save_chat_upload(thread_id: str, filename: Optional[str], content: bytes, *, content_type: str) -> tuple[str, str]:
+    safe_name = _safe_upload_filename(filename, content_type=content_type)
+    key = f"chat/{_storage_segment(thread_id, 'thread')}/{uuid.uuid4().hex}_{safe_name}"
+    storage = get_storage()
+    object_key = storage.put(key, content, content_type=content_type)
+    return storage.get_url(object_key), object_key
 
 
 def _utc_iso_now() -> str:
@@ -2088,8 +2388,6 @@ def _fetch_expanded_offer(ann_id: str, offer_id: str) -> Optional[OfferOutExpand
         profile_alias="up",
         fallback="Пользователь",
     )
-    performer_contact_sql, performer_contact_params = user_contact_sql(user_alias="u")
-
     row = fetch_one(
         f"""
         SELECT
@@ -2107,7 +2405,7 @@ def _fetch_expanded_offer(ann_id: str, offer_id: str) -> Optional[OfferOutExpand
             tf.performer_id::text,
             {performer_name_sql} AS performer_display_name,
             up.city,
-            {performer_contact_sql} AS performer_contact,
+            NULL::text AS performer_contact,
             {_offer_avatar_select_sql()},
             COALESCE(us.rating_avg, 0),
             COALESCE(us.rating_count, 0),
@@ -2123,7 +2421,7 @@ def _fetch_expanded_offer(ann_id: str, offer_id: str) -> Optional[OfferOutExpand
         WHERE tf.task_id::text = %s
           AND tf.id::text = %s
         """,
-        (*performer_name_params, *performer_contact_params, ann_id, offer_id),
+        (*performer_name_params, ann_id, offer_id),
     )
     if not row:
         return None
@@ -2437,9 +2735,10 @@ def create_announcement(
     payload: CreateAnnouncementIn,
     user: UserOut = Depends(get_current_user),
 ) -> AnnouncementOut:
+    assert_user_action_allowed(user.id, "posting")
     ann_id = str(uuid.uuid4())
 
-    data: Dict[str, Any] = dict(payload.data or {})
+    data: Dict[str, Any] = _sanitize_announcement_client_data(dict(payload.data or {}))
     category = (payload.category or "").strip().lower()
     _normalize_budget_fields(data)
     data["offers_count"] = int(_parse_float(data.get("offers_count")) or 0)
@@ -2598,6 +2897,10 @@ def upload_announcement_media(
     files: List[UploadFile] = File(...),
     user: UserOut = Depends(get_current_user),
 ) -> AnnouncementOut:
+    assert_user_action_allowed(user.id, "uploads")
+    if len(files) > UPLOAD_MAX_FILE_COUNT:
+        raise HTTPException(status_code=413, detail="Too many files")
+
     ann = _fetch_announcement_or_404(ann_id)
     if ann.user_id != user.id:
         raise HTTPException(status_code=403, detail="Not your announcement")
@@ -2611,18 +2914,21 @@ def upload_announcement_media(
     max_nsfw = 0.0
 
     for f in files:
-        content = f.file.read()
+        content = _read_upload_content_sync(f)
         if not content:
             continue
+        safe_filename, content_type = _verify_image_upload(f, content)
 
         r = det.predict_bytes(content)
         max_nsfw = max(max_nsfw, float(r.nsfw))
 
-        path = _save_upload(ann_id, f, content)
+        path, object_key = _save_upload(ann_id, f, content, content_type=content_type)
         items.append(
             {
-                "filename": f.filename,
+                "filename": safe_filename,
                 "path": path,
+                "object_key": object_key,
+                "content_type": content_type,
                 "nsfw": float(r.nsfw),
                 "sfw": float(r.sfw),
                 "top_label": r.top_label,
@@ -2804,6 +3110,7 @@ def create_offer(
     payload: CreateOfferIn,
     user: UserOut = Depends(get_current_user),
 ) -> OfferOut:
+    assert_user_action_allowed(user.id, "offers")
     ann = _fetch_announcement_or_404(ann_id)
 
     if ann.user_id == user.id:
@@ -2926,8 +3233,6 @@ def list_announcement_offers(
         profile_alias="up",
         fallback="Пользователь",
     )
-    performer_contact_sql, performer_contact_params = user_contact_sql(user_alias="u")
-
     rows = fetch_all(
         f"""
         SELECT
@@ -2945,7 +3250,7 @@ def list_announcement_offers(
             tf.performer_id::text,
             {performer_name_sql} AS performer_display_name,
             up.city,
-            {performer_contact_sql} AS performer_contact,
+            NULL::text AS performer_contact,
             {_offer_avatar_select_sql()},
             COALESCE(us.rating_avg, 0),
             COALESCE(us.rating_count, 0),
@@ -2963,7 +3268,7 @@ def list_announcement_offers(
         ORDER BY CASE WHEN tf.status = 'accepted_by_customer' THEN 0 ELSE 1 END,
                  tf.created_at DESC
         """,
-        (*performer_name_params, *performer_contact_params, ann_id),
+        (*performer_name_params, ann_id),
     )
 
     return [_offer_expanded_from_row(row) for row in rows]
@@ -2979,80 +3284,83 @@ def accept_announcement_offer(
     if ann.user_id != user.id:
         raise HTTPException(status_code=403, detail="Not your announcement")
 
-    row = fetch_one(
-        """
-        SELECT performer_id::text, status::text
-        FROM task_offers
-        WHERE id::text = %s
-          AND task_id::text = %s
-        """,
-        (offer_id, ann_id),
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="Offer not found")
-
-    performer_id, status = row
-    if status == "rejected_by_customer":
-        raise HTTPException(status_code=409, detail="Отклик уже отклонён")
-
-    did_accept_now = False
-    assignment_id = None
-
-    if status != "accepted_by_customer":
-        if status != "sent":
-            raise HTTPException(status_code=409, detail="Отклик нельзя принять в текущем статусе")
-
-        execute(
+    with transaction():
+        fetch_one("SELECT 1 FROM tasks WHERE id::text = %s FOR UPDATE", (ann_id,))
+        row = fetch_one(
             """
-            UPDATE task_offers
-            SET status = 'accepted_by_customer',
-                can_reoffer = FALSE,
-                accepted_at = now(),
-                agreed_price = COALESCE(agreed_price, proposed_price, %s)
+            SELECT performer_id::text, status::text
+            FROM task_offers
             WHERE id::text = %s
+              AND task_id::text = %s
+            FOR UPDATE
             """,
-            (derive_quick_offer_price(dict(ann.data or {})), offer_id),
+            (offer_id, ann_id),
         )
-        execute(
-            """
-            UPDATE task_offers
-            SET status = 'rejected_by_customer',
-                can_reoffer = FALSE,
-                reoffer_block_reason = 'task_already_assigned',
-                rejected_at = now(),
-                updated_at = now()
-            WHERE task_id::text = %s
-              AND id::text <> %s
-              AND status = 'sent'
-            """,
-            (ann_id, offer_id),
+        if not row:
+            raise HTTPException(status_code=404, detail="Offer not found")
+
+        performer_id, status = row
+        if status == "rejected_by_customer":
+            raise HTTPException(status_code=409, detail="Отклик уже отклонён")
+
+        did_accept_now = False
+        assignment_id = None
+
+        if status != "accepted_by_customer":
+            if status != "sent":
+                raise HTTPException(status_code=409, detail="Отклик нельзя принять в текущем статусе")
+
+            execute(
+                """
+                UPDATE task_offers
+                SET status = 'accepted_by_customer',
+                    can_reoffer = FALSE,
+                    accepted_at = now(),
+                    agreed_price = COALESCE(agreed_price, proposed_price, %s)
+                WHERE id::text = %s
+                """,
+                (derive_quick_offer_price(dict(ann.data or {})), offer_id),
+            )
+            execute(
+                """
+                UPDATE task_offers
+                SET status = 'rejected_by_customer',
+                    can_reoffer = FALSE,
+                    reoffer_block_reason = 'task_already_assigned',
+                    rejected_at = now(),
+                    updated_at = now()
+                WHERE task_id::text = %s
+                  AND id::text <> %s
+                  AND status = 'sent'
+                """,
+                (ann_id, offer_id),
+            )
+            _sync_announcement_offers_count(ann_id)
+            assignment_id = _create_or_update_assignment(ann_id, offer_id, ann.user_id, performer_id)
+            did_accept_now = True
+        else:
+            assignment_id = _create_or_update_assignment(ann_id, offer_id, ann.user_id, performer_id)
+
+        thread_id = get_or_create_offer_thread(
+            task_id=ann_id,
+            offer_id=offer_id,
+            assignment_id=assignment_id,
+            owner_id=ann.user_id,
+            performer_id=performer_id,
         )
-        _sync_announcement_offers_count(ann_id)
-        assignment_id = _create_or_update_assignment(ann_id, offer_id, ann.user_id, performer_id)
-        did_accept_now = True
-    else:
-        assignment_id = _create_or_update_assignment(ann_id, offer_id, ann.user_id, performer_id)
 
-    thread_id = get_or_create_offer_thread(
-        task_id=ann_id,
-        offer_id=offer_id,
-        assignment_id=assignment_id,
-        owner_id=ann.user_id,
-        performer_id=performer_id,
-    )
+        if did_accept_now:
+            post_system_thread_message(thread_id, "Задание согласовано. Чат открыт для заказчика и исполнителя.")
+            create_notification(
+                user_id=performer_id,
+                notif_type="offer_accepted",
+                body="Ваш отклик принят. Открыт чат.",
+                payload={"thread_id": thread_id, "announcement_id": ann_id, "offer_id": offer_id},
+            )
 
-    if did_accept_now:
-        post_system_thread_message(thread_id, "Задание согласовано. Чат открыт для заказчика и исполнителя.")
-        create_notification(
-            user_id=performer_id,
-            notif_type="offer_accepted",
-            body="Ваш отклик принят. Открыт чат.",
-            payload={"thread_id": thread_id, "announcement_id": ann_id, "offer_id": offer_id},
-        )
-
-    expanded = _fetch_expanded_offer(ann_id, offer_id)
-    if expanded is None:
-        raise HTTPException(status_code=500, detail="Failed to load accepted offer")
+        expanded = _fetch_expanded_offer(ann_id, offer_id)
+        if expanded is None:
+            raise HTTPException(status_code=500, detail="Failed to load accepted offer")
 
     return AcceptOfferOut(thread_id=thread_id, offer=expanded)
 
@@ -3354,6 +3662,7 @@ async def send_chat_message(
     if user.id == "dev":
         raise HTTPException(status_code=400, detail="DEV chat is not available")
 
+    assert_user_action_allowed(user.id, "chat")
     await run_in_threadpool(assert_thread_access, thread_id, user.id)
     message = await run_in_threadpool(post_thread_message, thread_id, user.id, payload.text)
     await broadcast_chat_message(thread_id=thread_id, message=message)
@@ -3371,10 +3680,12 @@ async def send_chat_media_message(
     if user.id == "dev":
         raise HTTPException(status_code=400, detail="DEV chat is not available")
 
+    assert_user_action_allowed(user.id, "chat")
     await run_in_threadpool(assert_thread_access, thread_id, user.id)
-    content = await file.read()
+    content = await _read_upload_content_async(file)
     if not content:
         raise HTTPException(status_code=400, detail="Фото пустое или не прочиталось")
+    safe_filename, content_type = _verify_image_upload(file, content)
 
     try:
         detector = await run_in_threadpool(get_nsfw_detector)
@@ -3393,7 +3704,13 @@ async def send_chat_media_message(
     if nsfw >= NSFW_REVIEW:
         raise HTTPException(status_code=400, detail="Фото выглядит небезопасным. Выберите другое фото.")
 
-    media_url = await run_in_threadpool(_save_chat_upload, thread_id, file.filename, content)
+    media_url, object_key = await run_in_threadpool(
+        _save_chat_upload,
+        thread_id,
+        safe_filename,
+        content,
+        content_type=content_type,
+    )
     message = await run_in_threadpool(
         post_thread_image_message,
         thread_id,
@@ -3401,8 +3718,9 @@ async def send_chat_media_message(
         text=text,
         media_url=media_url,
         media_metadata={
-            "filename": file.filename,
-            "content_type": file.content_type,
+            "filename": safe_filename,
+            "content_type": content_type,
+            "object_key": object_key,
             "nsfw": nsfw,
             "sfw": float(result.sfw),
             "top_label": result.top_label,
@@ -3441,6 +3759,7 @@ async def open_chat_dispute(
     if user.id == "dev":
         raise HTTPException(status_code=400, detail="DEV chat is not available")
 
+    assert_user_action_allowed(user.id, "disputes")
     await run_in_threadpool(assert_thread_access, thread_id, user.id)
     state = await run_in_threadpool(
         dispute_open_case,
@@ -3515,9 +3834,32 @@ async def select_chat_dispute_option(
         dispute_id=dispute_id,
         actor_user_id=user.id,
         option_id=payload.option_id,
+        option_ids=payload.option_ids,
+        option_adjustments=payload.option_adjustments,
     )
     if should_run_model:
         _schedule_dispute_model_cycle(dispute_id)
+    return DisputeStateOut(**state)
+
+
+@app.post("/chats/{thread_id}/disputes/{dispute_id}/final-acceptance", response_model=DisputeStateOut)
+async def accept_final_chat_dispute_resolution(
+    thread_id: str,
+    dispute_id: str,
+    payload: DisputeFinalAcceptanceIn,
+    user: UserOut = Depends(get_current_user),
+) -> DisputeStateOut:
+    if user.id == "dev":
+        raise HTTPException(status_code=400, detail="DEV chat is not available")
+
+    await run_in_threadpool(assert_thread_access, thread_id, user.id)
+    state = await run_in_threadpool(
+        dispute_submit_final_acceptance,
+        thread_id=thread_id,
+        dispute_id=dispute_id,
+        actor_user_id=user.id,
+        accepted=payload.accepted,
+    )
     return DisputeStateOut(**state)
 
 
@@ -3577,6 +3919,19 @@ async def chat_websocket(thread_id: str, websocket: WebSocket) -> None:
                 await websocket.send_json({"type": "pong"})
                 continue
 
+            try:
+                await enforce_rate_limit(
+                    "ws_chat_messages",
+                    f"user:{user.id}",
+                    (LimitRule(60, 60), LimitRule(600, 3600)),
+                )
+            except HTTPException as exc:
+                if exc.status_code == 429:
+                    await websocket.send_json({"type": "error", "message": "Too Many Requests"})
+                    await websocket.close(code=4429)
+                    return
+                raise
+
             message = await run_in_threadpool(post_thread_message, thread_id, user.id, text)
             await broadcast_chat_event(
                 thread_id=thread_id,
@@ -3607,6 +3962,7 @@ def submit_report(
     payload: ReportCreateIn,
     user: UserOut = Depends(get_current_user),
 ) -> ReportOut:
+    assert_user_action_allowed(user.id, "reports")
     canonical_target_type, canonical_target_id, report_meta = _prepare_report_target(
         payload.target_type,
         payload.target_id,
@@ -3660,6 +4016,7 @@ def send_support_thread_message(
     payload: SupportMessageIn,
     user: UserOut = Depends(get_current_user),
 ) -> SupportMessageOut:
+    assert_user_action_allowed(user.id, "support")
     message = post_support_message(
         thread_id=thread_id,
         sender_id=user.id,
@@ -3825,6 +4182,24 @@ def _user_can_fetch_announcement(ann_id: str, user_id: str, owner_id: str) -> bo
         (ann_id,),
     )
     return public_row is not None
+
+
+def _user_can_fetch_announcement_upload(ann_id: str, user_id: str, owner_id: str) -> bool:
+    if owner_id == user_id:
+        return True
+
+    assignment = fetch_one(
+        """
+        SELECT 1
+        FROM task_assignments
+        WHERE task_id::text = %s
+          AND performer_id::text = %s
+          AND assignment_status IN ('assigned', 'in_progress', 'completed')
+        LIMIT 1
+        """,
+        (ann_id, user_id),
+    )
+    return assignment is not None
 
 
 @app.get("/announcements/{ann_id}", response_model=AnnouncementOut)

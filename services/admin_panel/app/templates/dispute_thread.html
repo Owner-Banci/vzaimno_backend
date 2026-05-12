@@ -33,6 +33,7 @@
     <h3>Подключение к чату</h3>
     <p class="muted">При подключении в чат отправляется системное сообщение для двух участников спора.</p>
     <form method="post" action="/admin/disputes/{{ dispute.id }}/join" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ request.session.get('admin_csrf_token', '') }}">
       <button type="submit">Подключиться к спору</button>
     </form>
   </article>
@@ -46,6 +47,7 @@
     </div>
     {% endif %}
     <form method="post" action="/admin/disputes/{{ dispute.id }}/reply" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ request.session.get('admin_csrf_token', '') }}">
       <textarea name="text" rows="4" required {% if reply_blocked %}disabled{% endif %} placeholder="Сообщение в общий чат от имени администратора"></textarea>
       <button type="submit" {% if reply_blocked %}disabled{% endif %}>Отправить</button>
     </form>

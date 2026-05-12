@@ -3,17 +3,35 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
+
+
+def validate_password_policy(value: str) -> str:
+    password = str(value or "")
+    if len(password) < 8:
+        raise ValueError("Password must be at least 8 characters long")
+    if len(password) > 255:
+        raise ValueError("Password must be at most 255 characters long")
+    if not any(ch.isalpha() for ch in password):
+        raise ValueError("Password must contain at least one letter")
+    if not any(ch.isdigit() for ch in password):
+        raise ValueError("Password must contain at least one digit")
+    return password
 
 
 class RegisterIn(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(..., min_length=8, max_length=255)
+
+    @field_validator("password")
+    @classmethod
+    def _password_policy(cls, value: str) -> str:
+        return validate_password_policy(value)
 
 
 class LoginIn(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(..., min_length=1, max_length=255)
 
 
 class TokenOut(BaseModel):
@@ -31,9 +49,23 @@ class PasswordResetRequestIn(BaseModel):
     email: EmailStr
 
 
+class PasswordResetRequestOut(BaseModel):
+    ok: bool = True
+    reset_token: Optional[str] = None
+
+
 class PasswordResetConfirmIn(BaseModel):
     token: str = Field(..., min_length=32, max_length=512)
     new_password: str = Field(..., min_length=8, max_length=255)
+
+    @field_validator("new_password")
+    @classmethod
+    def _password_policy(cls, value: str) -> str:
+        return validate_password_policy(value)
+
+
+class RevokeSessionIn(BaseModel):
+    session_id: str = Field(..., min_length=16, max_length=80)
 
 
 class UserOut(BaseModel):
@@ -256,7 +288,13 @@ class DisputeCounterpartyResponseIn(BaseModel):
 
 
 class DisputeSelectOptionIn(BaseModel):
-    option_id: str = Field(..., min_length=1, max_length=64)
+    option_id: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    option_ids: list[str] = Field(default_factory=list, max_items=5)
+    option_adjustments: Dict[str, Dict[str, int]] = Field(default_factory=dict)
+
+
+class DisputeFinalAcceptanceIn(BaseModel):
+    accepted: bool
 
 
 class DisputeQuestionOut(BaseModel):
@@ -299,11 +337,17 @@ class DisputeStateOut(BaseModel):
     resolution_summary: Optional[str] = None
     selected_option_id: Optional[str] = None
     moderator_required: bool = False
+    final_acceptance_votes: Dict[str, str] = Field(default_factory=dict)
+    my_final_acceptance_decision: Optional[str] = None
     questions: list[DisputeQuestionOut] = Field(default_factory=list)
     required_answer_party_roles: list[str] = Field(default_factory=list)
     options: list[DisputeOptionOut] = Field(default_factory=list)
     votes: Dict[str, str] = Field(default_factory=dict)
+    vote_option_ids: Dict[str, list[str]] = Field(default_factory=dict)
+    vote_option_adjustments: Dict[str, Dict[str, Dict[str, int]]] = Field(default_factory=dict)
     my_vote_option_id: Optional[str] = None
+    my_vote_option_ids: list[str] = Field(default_factory=list)
+    my_vote_option_adjustments: Dict[str, Dict[str, int]] = Field(default_factory=dict)
     initiator_terms: DisputeInitiatorTermsOut = Field(default_factory=DisputeInitiatorTermsOut)
     last_model_error: Optional[str] = None
 
