@@ -85,7 +85,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz', timeout=2).read()"]
+      test: ["CMD-SHELL", "curl -fsS -H 'Host: api.vzaimno.net' http://127.0.0.1:8000/readyz >/dev/null"]
       interval: 20s
       timeout: 5s
       retries: 10
@@ -124,7 +124,7 @@ services:
       backend:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/readyz', timeout=2).read()"]
+      test: ["CMD-SHELL", "curl -fsS -H 'Host: admin.vzaimno.net' http://127.0.0.1:8001/readyz >/dev/null"]
       interval: 20s
       timeout: 5s
       retries: 10
