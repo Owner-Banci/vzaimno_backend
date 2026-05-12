@@ -1,8 +1,9 @@
 ##
 ## /etc/nginx/sites-available/vzaimno.conf
-## Two public domains:
-##  - api.example.com   -> backend (127.0.0.1:8000)
-##  - admin.example.com -> admin   (127.0.0.1:8001)
+## Public domains:
+##  - vzaimno.net       -> landing/backend (127.0.0.1:8000)
+##  - api.vzaimno.net   -> backend API      (127.0.0.1:8000)
+##  - admin.vzaimno.net -> admin panel      (127.0.0.1:8001)
 ##
 
 map $http_upgrade $connection_upgrade {
@@ -33,7 +34,7 @@ gzip_vary on;
 
 server {
   listen 80;
-  server_name api.example.com admin.example.com;
+  server_name vzaimno.net api.vzaimno.net admin.vzaimno.net;
 
   location ^~ /.well-known/acme-challenge/ {
     root /var/www/certbot;
@@ -44,10 +45,10 @@ server {
 
 server {
   listen 443 ssl http2;
-  server_name api.example.com;
+  server_name vzaimno.net api.vzaimno.net;
 
-  ssl_certificate     /etc/letsencrypt/live/api.example.com/fullchain.pem;
-  ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
+  ssl_certificate     /etc/letsencrypt/live/vzaimno.net/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/vzaimno.net/privkey.pem;
 
   limit_conn vzaimno_conn 40;
   client_max_body_size 25m;
@@ -135,10 +136,10 @@ server {
 
 server {
   listen 443 ssl http2;
-  server_name admin.example.com;
+  server_name admin.vzaimno.net;
 
-  ssl_certificate     /etc/letsencrypt/live/admin.example.com/fullchain.pem;
-  ssl_certificate_key /etc/letsencrypt/live/admin.example.com/privkey.pem;
+  ssl_certificate     /etc/letsencrypt/live/vzaimno.net/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/vzaimno.net/privkey.pem;
 
   limit_conn vzaimno_conn 20;
   client_max_body_size 25m;

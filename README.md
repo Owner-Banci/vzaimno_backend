@@ -42,9 +42,10 @@ ssh -i ~/.ssh/do_vzaimno root@<DROPLET_IP>
 
 1. Создать Droplet: Ubuntu 24.04 LTS, Basic, 2 vCPU / 4 GB RAM.
 2. Добавить SSH key (шаг выше).
-3. Купить/подключить домены (минимум 2):
-   - `api.your-domain.com` -> backend
-   - `admin.your-domain.com` -> admin
+3. Подключить домены:
+   - `vzaimno.net` -> landing/backend
+   - `api.vzaimno.net` -> backend API
+   - `admin.vzaimno.net` -> admin
 4. В DNS сделать `A` записи на IP Droplet.
 5. Оплатить Droplet (иначе сервер не поднимется).
 
@@ -91,7 +92,7 @@ python3 -c "import secrets; print(secrets.token_urlsafe(48))"
 - `PII_ENCRYPTION_KEY`
 - `PHONE_HASH_KEY`
 - `REDIS_URL`
-- `TRUSTED_HOSTS` (оба домена)
+- `TRUSTED_HOSTS` (`vzaimno.net,api.vzaimno.net,admin.vzaimno.net`)
 
 ### 2.3 Поднять стек
 
@@ -127,7 +128,7 @@ docker compose -f docker-compose.prod.yml --env-file .env.production logs -f bac
 docker compose -f docker-compose.prod.yml --env-file .env.production ps
 ```
 
-## 4) Nginx (2 адреса + SSL)
+## 4) Nginx (vzaimno.net + API + admin + SSL)
 
 Скопируй шаблон:
 
@@ -138,7 +139,7 @@ nginx -t
 systemctl reload nginx
 ```
 
-Сертификаты (Let's Encrypt) выпусти для обоих доменов и подставь пути в конфиг.
+Сертификаты (Let's Encrypt) выпусти для `vzaimno.net`, `api.vzaimno.net`, `admin.vzaimno.net`. Готовый чеклист для текущего Droplet и Cloudflare лежит в `deploy/digitalocean-vzaimno-net.md`.
 
 ## 5) Обновление без потери данных
 
