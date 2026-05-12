@@ -29,6 +29,23 @@ const screenData = {
   }
 };
 
+document.body.classList.add("is-loading");
+
+const appLoader = document.querySelector(".app-loader");
+function hideAppLoader() {
+  if (!appLoader) return;
+  appLoader.classList.add("is-hidden");
+  document.body.classList.remove("is-loading");
+  window.setTimeout(() => appLoader.remove(), 520);
+}
+
+if (document.readyState === "complete") {
+  window.setTimeout(hideAppLoader, 520);
+} else {
+  window.addEventListener("load", () => window.setTimeout(hideAppLoader, 520), { once: true });
+  window.setTimeout(hideAppLoader, 2200);
+}
+
 const toast = document.querySelector("[data-toast]");
 let toastTimer;
 

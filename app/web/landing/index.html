@@ -4,7 +4,12 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="Vzaimno — мобильное приложение для локальной помощи, бытовых поручений и заработка по пути.">
+    <meta name="theme-color" content="#2aada8">
     <title>Vzaimno — помощь рядом</title>
+    <link rel="icon" type="image/png" sizes="16x16" href="assets/favicon-16.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon.png">
+    <link rel="manifest" href="assets/site.webmanifest">
     <link rel="stylesheet" href="styles.css">
   </head>
   <body>
@@ -69,9 +74,16 @@
       </symbol>
     </svg>
 
+    <div class="app-loader" aria-hidden="true">
+      <div class="loader-icon">
+        <img src="assets/app-icon.png" alt="">
+      </div>
+      <span>Vzaimno</span>
+    </div>
+
     <header class="site-header" data-header>
       <a class="brand" href="#top" aria-label="Vzaimno">
-        <span class="brand-mark">V</span>
+        <span class="brand-mark"><img src="assets/app-icon.png" alt=""></span>
         <span>Vzaimno</span>
       </a>
       <nav class="nav" aria-label="Навигация">
