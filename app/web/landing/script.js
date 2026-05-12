@@ -80,7 +80,7 @@ if ("IntersectionObserver" in window) {
 
 const screenImage = document.querySelector("[data-screen-image]");
 const screenButtons = Array.from(document.querySelectorAll("[data-screen]"));
-const screenOrder = screenButtons.map((button) => button.dataset.screen);
+const screenOrder = Array.from(new Set(screenButtons.map((button) => button.dataset.screen)));
 let activeScreenIndex = 0;
 let screenTimer;
 

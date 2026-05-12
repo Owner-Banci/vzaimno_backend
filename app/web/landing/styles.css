@@ -1137,6 +1137,10 @@ svg path {
   margin-top: 28px;
 }
 
+.mobile-screen-tabs {
+  display: none;
+}
+
 .screen-tabs button {
   min-height: 44px;
   padding: 0 16px;
@@ -1152,7 +1156,18 @@ svg path {
   display: none;
 }
 
+.mobile-screen-tabs button svg {
+  display: block;
+}
+
 .screen-tabs button.active {
+  border-color: transparent;
+  color: #fff;
+  background: var(--teal);
+  box-shadow: 0 14px 28px rgba(42, 173, 168, 0.22);
+}
+
+.mobile-screen-tabs button.active {
   border-color: transparent;
   color: #fff;
   background: var(--teal);
@@ -2417,12 +2432,6 @@ svg path {
   }
 
   .app-copy {
-    display: contents;
-  }
-
-  .app-copy .eyebrow,
-  .app-copy h2,
-  .app-copy p:not(.eyebrow) {
     grid-column: 1 / -1;
   }
 
@@ -2434,12 +2443,18 @@ svg path {
 
   .screen-phone {
     grid-column: 1;
+    align-self: start;
     justify-content: start;
     padding-left: 10px;
   }
 
   .screen-tabs {
+    display: none;
+  }
+
+  .mobile-screen-tabs {
     grid-column: 2;
+    align-self: center;
     display: grid;
     grid-template-columns: 1fr;
     align-content: center;
@@ -2450,7 +2465,7 @@ svg path {
     overflow: visible;
   }
 
-  .screen-tabs button {
+  .mobile-screen-tabs button {
     display: grid;
     place-items: center;
     width: 44px;
@@ -2458,12 +2473,14 @@ svg path {
     height: 44px;
     min-height: 44px;
     padding: 0;
+    border: 1px solid var(--line);
     border-radius: 999px;
     background: rgba(255, 255, 255, 0.86);
+    color: var(--muted-strong);
     box-shadow: 0 12px 28px rgba(31, 35, 41, 0.1);
   }
 
-  .screen-tabs button span {
+  .mobile-screen-tabs button span {
     position: absolute;
     width: 1px;
     height: 1px;
@@ -2472,8 +2489,7 @@ svg path {
     white-space: nowrap;
   }
 
-  .screen-tabs button svg {
-    display: block;
+  .mobile-screen-tabs button svg {
     width: 20px;
     height: 20px;
   }
@@ -2529,27 +2545,34 @@ svg path {
 
   .founder-card {
     display: block;
-    padding: 18px;
+    padding: 22px;
     border-radius: 24px;
   }
 
   .founder-photo {
     float: left;
-    width: 126px;
-    height: 126px;
-    margin: 0 18px 10px 0;
+    width: 132px;
+    height: 132px;
+    margin: 0 18px 14px 0;
     border-width: 5px;
     border-radius: 30px;
   }
 
+  .founder-copy .eyebrow {
+    padding-top: 6px;
+  }
+
   .founder-copy h2 {
-    font-size: 22px;
-    line-height: 1.16;
+    clear: both;
+    margin-top: 16px;
+    font-size: 25px;
+    line-height: 1.14;
   }
 
   .founder-copy p:not(.eyebrow) {
-    margin-top: 12px;
-    font-size: 13px;
+    margin-top: 14px;
+    font-size: 15px;
+    line-height: 1.52;
   }
 
   .founder-copy::after {
@@ -2645,14 +2668,14 @@ svg path {
   }
 
   .founder-photo {
-    width: 112px;
-    height: 112px;
+    width: 120px;
+    height: 120px;
     margin-right: 14px;
     border-radius: 28px;
   }
 
   .founder-copy h2 {
-    font-size: 20px;
+    font-size: 23px;
   }
 }
 
@@ -2684,13 +2707,13 @@ svg path {
     padding-left: 0;
   }
 
-  .screen-tabs button {
+  .mobile-screen-tabs button {
     width: 40px;
     height: 40px;
     min-height: 40px;
   }
 
-  .screen-tabs button svg {
+  .mobile-screen-tabs button svg {
     width: 18px;
     height: 18px;
   }
@@ -2701,8 +2724,12 @@ svg path {
   }
 
   .founder-photo {
-    width: 96px;
-    height: 96px;
+    width: 104px;
+    height: 104px;
+  }
+
+  .founder-copy h2 {
+    font-size: 21px;
   }
 }
 
