@@ -360,7 +360,7 @@
         </div>
       </section>
 
-      <section class="section app-section" aria-labelledby="app-title">
+      <section class="section app-section" id="app" aria-labelledby="app-title">
         <div class="app-showcase">
           <div class="app-copy reveal">
             <p class="eyebrow">Возможности приложения</p>
@@ -370,13 +370,34 @@
               собираются в один понятный сценарий
             </p>
             <div class="screen-tabs" role="tablist" aria-label="Экраны приложения">
-              <button class="active" type="button" data-screen="map">Карта</button>
-              <button type="button" data-screen="new-task">Создание</button>
-              <button type="button" data-screen="preview">Предпросмотр</button>
-              <button type="button" data-screen="route">Маршрут</button>
-              <button type="button" data-screen="ads">Объявления</button>
-              <button type="button" data-screen="chats">Чаты</button>
-              <button type="button" data-screen="profile">Профиль</button>
+              <button class="active" type="button" data-screen="map" aria-label="Карта">
+                <svg aria-hidden="true"><use href="#icon-map"></use></svg>
+                <span>Карта</span>
+              </button>
+              <button type="button" data-screen="new-task" aria-label="Создание">
+                <svg aria-hidden="true"><use href="#icon-send"></use></svg>
+                <span>Создание</span>
+              </button>
+              <button type="button" data-screen="preview" aria-label="Предпросмотр">
+                <svg aria-hidden="true"><use href="#icon-phone"></use></svg>
+                <span>Предпросмотр</span>
+              </button>
+              <button type="button" data-screen="route" aria-label="Маршрут">
+                <svg aria-hidden="true"><use href="#icon-route"></use></svg>
+                <span>Маршрут</span>
+              </button>
+              <button type="button" data-screen="ads" aria-label="Объявления">
+                <svg aria-hidden="true"><use href="#icon-box"></use></svg>
+                <span>Объявления</span>
+              </button>
+              <button type="button" data-screen="chats" aria-label="Чаты">
+                <svg aria-hidden="true"><use href="#icon-chat"></use></svg>
+                <span>Чаты</span>
+              </button>
+              <button type="button" data-screen="profile" aria-label="Профиль">
+                <svg aria-hidden="true"><use href="#icon-user"></use></svg>
+                <span>Профиль</span>
+              </button>
             </div>
           </div>
           <div class="screen-phone reveal">

@@ -1148,6 +1148,10 @@ svg path {
   font-weight: 850;
 }
 
+.screen-tabs button svg {
+  display: none;
+}
+
 .screen-tabs button.active {
   border-color: transparent;
   color: #fff;
@@ -1904,6 +1908,7 @@ svg path {
   #how,
   #scenarios,
   #safety,
+  #app,
   .app-section,
   .founder-section {
     scroll-margin-top: 84px;
@@ -2404,8 +2409,21 @@ svg path {
   }
 
   .app-showcase {
-    gap: 22px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 52px;
+    gap: 18px 12px;
+    align-items: center;
     margin-bottom: 18px;
+  }
+
+  .app-copy {
+    display: contents;
+  }
+
+  .app-copy .eyebrow,
+  .app-copy h2,
+  .app-copy p:not(.eyebrow) {
+    grid-column: 1 / -1;
   }
 
   .app-copy p:not(.eyebrow) {
@@ -2414,21 +2432,55 @@ svg path {
     font-size: 14px;
   }
 
+  .screen-phone {
+    grid-column: 1;
+    justify-content: start;
+    padding-left: 10px;
+  }
+
   .screen-tabs {
-    gap: 7px;
-    margin-top: 18px;
-    padding-bottom: 6px;
+    grid-column: 2;
+    display: grid;
+    grid-template-columns: 1fr;
+    align-content: center;
+    justify-items: center;
+    gap: 9px;
+    margin-top: 0;
+    padding-bottom: 0;
+    overflow: visible;
   }
 
   .screen-tabs button {
-    min-height: 36px;
-    padding: 0 12px;
-    font-size: 12px;
+    display: grid;
+    place-items: center;
+    width: 44px;
+    min-width: 0;
+    height: 44px;
+    min-height: 44px;
+    padding: 0;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.86);
+    box-shadow: 0 12px 28px rgba(31, 35, 41, 0.1);
+  }
+
+  .screen-tabs button span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  .screen-tabs button svg {
+    display: block;
+    width: 20px;
+    height: 20px;
   }
 
   .app-phone {
-    width: 198px;
-    height: 430px;
+    width: min(248px, calc(100vw - 114px));
+    height: 538px;
     border-width: 7px;
     border-radius: 32px;
   }
@@ -2476,22 +2528,22 @@ svg path {
   }
 
   .founder-card {
-    grid-template-columns: 88px minmax(0, 1fr);
-    gap: 16px;
-    align-items: start;
+    display: block;
     padding: 18px;
     border-radius: 24px;
   }
 
   .founder-photo {
-    width: 88px;
-    height: 88px;
+    float: left;
+    width: 126px;
+    height: 126px;
+    margin: 0 18px 10px 0;
     border-width: 5px;
-    border-radius: 26px;
+    border-radius: 30px;
   }
 
   .founder-copy h2 {
-    font-size: 21px;
+    font-size: 22px;
     line-height: 1.16;
   }
 
@@ -2500,8 +2552,10 @@ svg path {
     font-size: 13px;
   }
 
-  .founder-copy .social-row {
-    grid-column: 1 / -1;
+  .founder-copy::after {
+    content: "";
+    display: block;
+    clear: both;
   }
 
   .social-row {
@@ -2590,18 +2644,15 @@ svg path {
     font-size: 14px;
   }
 
-  .founder-card {
-    grid-template-columns: 78px minmax(0, 1fr);
-  }
-
   .founder-photo {
-    width: 78px;
-    height: 78px;
-    border-radius: 23px;
+    width: 112px;
+    height: 112px;
+    margin-right: 14px;
+    border-radius: 28px;
   }
 
   .founder-copy h2 {
-    font-size: 19px;
+    font-size: 20px;
   }
 }
 
@@ -2623,6 +2674,35 @@ svg path {
 
   .city-connection {
     order: 3;
+  }
+
+  .app-showcase {
+    grid-template-columns: minmax(0, 1fr) 46px;
+  }
+
+  .screen-phone {
+    padding-left: 0;
+  }
+
+  .screen-tabs button {
+    width: 40px;
+    height: 40px;
+    min-height: 40px;
+  }
+
+  .screen-tabs button svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .app-phone {
+    width: min(214px, calc(100vw - 92px));
+    height: 464px;
+  }
+
+  .founder-photo {
+    width: 96px;
+    height: 96px;
   }
 }
 
