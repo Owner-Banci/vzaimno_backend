@@ -1894,6 +1894,738 @@ svg path {
   }
 }
 
+@media (max-width: 760px) {
+  html,
+  body {
+    overflow-x: hidden;
+  }
+
+  #idea,
+  #how,
+  #scenarios,
+  #safety,
+  .app-section,
+  .founder-section {
+    scroll-margin-top: 84px;
+  }
+
+  .site-header {
+    top: 8px;
+    width: calc(100% - 18px);
+    gap: 8px;
+    padding: 7px;
+  }
+
+  .brand {
+    gap: 8px;
+    padding-right: 8px;
+  }
+
+  .brand-mark {
+    width: 34px;
+    height: 34px;
+    border-radius: 13px;
+  }
+
+  .header-cta {
+    min-height: 38px;
+    padding: 0 12px;
+    font-size: 13px;
+  }
+
+  .hero {
+    gap: 18px;
+    padding: 92px 16px 112px;
+    text-align: center;
+  }
+
+  .hero-copy {
+    max-width: 440px;
+    margin: 0 auto;
+    padding-top: 0;
+  }
+
+  .eyebrow {
+    margin-bottom: 10px;
+    font-size: 11px;
+  }
+
+  .hero h1 {
+    font-size: 52px;
+    line-height: 0.96;
+  }
+
+  .hero-slogan {
+    margin-top: 14px;
+    font-size: 26px;
+    line-height: 1.12;
+  }
+
+  .hero-text {
+    margin-top: 14px;
+    font-size: 15px;
+    line-height: 1.55;
+  }
+
+  .store-row {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 22px;
+  }
+
+  .store-button {
+    width: 100%;
+    min-width: 0;
+    min-height: 54px;
+    justify-content: center;
+    gap: 8px;
+    padding: 9px 10px;
+    font-size: 14px;
+    line-height: 1.05;
+  }
+
+  .store-button small {
+    font-size: 10px;
+  }
+
+  .store-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 12px;
+  }
+
+  .hero-pills {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 16px;
+  }
+
+  .hero-pills span {
+    justify-content: center;
+    min-height: 32px;
+    padding: 0 10px;
+    font-size: 12px;
+  }
+
+  .hero-map img {
+    top: -52px;
+    right: -250px;
+    width: 680px;
+    min-width: 0;
+    opacity: 0.28;
+  }
+
+  .map-wash {
+    background:
+      linear-gradient(180deg, rgba(247, 250, 248, 0.92) 0%, rgba(247, 250, 248, 0.68) 43%, rgba(247, 250, 248, 0.96) 100%),
+      linear-gradient(90deg, rgba(247, 250, 248, 0.96), rgba(247, 250, 248, 0.5), rgba(247, 250, 248, 0.96));
+  }
+
+  .hero-route {
+    right: -28%;
+    bottom: 13%;
+    width: 150%;
+    height: 42%;
+    opacity: 0.72;
+  }
+
+  .hero-product {
+    min-height: 398px;
+    width: min(100%, 360px);
+    margin: 2px auto 0;
+  }
+
+  .phone-main {
+    top: 0;
+    right: calc(50% - 165px);
+    width: 188px;
+    height: 408px;
+    border-width: 8px;
+  }
+
+  .android-phone {
+    border-width: 9px 7px 11px;
+    border-radius: 30px;
+  }
+
+  .android-phone img {
+    border-radius: 22px;
+  }
+
+  .android-camera {
+    top: 9px;
+    width: 13px;
+    height: 13px;
+    border-width: 3px;
+  }
+
+  .phone-secondary {
+    top: 78px;
+    left: calc(50% - 166px);
+    width: 138px;
+    height: 300px;
+    border-width: 6px;
+    border-radius: 31px;
+    opacity: 0.98;
+  }
+
+  .phone-speaker {
+    top: 7px;
+    width: 50px;
+    height: 13px;
+  }
+
+  .phone-mockup img,
+  .phone-secondary img {
+    border-radius: 22px;
+  }
+
+  .floating-task {
+    min-width: 138px;
+    max-width: 166px;
+    gap: 2px;
+    padding: 10px 11px;
+    border-radius: 17px;
+    text-align: left;
+  }
+
+  .floating-task strong {
+    font-size: 13px;
+  }
+
+  .floating-task span:last-child {
+    font-size: 11px;
+  }
+
+  .floating-task svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .task-dot {
+    width: 9px;
+    height: 9px;
+  }
+
+  .task-one {
+    left: calc(50% - 168px);
+    top: 12px;
+  }
+
+  .task-two {
+    right: calc(50% - 176px);
+    bottom: 12px;
+  }
+
+  .hero-next-peek {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    width: calc(100% - 24px);
+    padding: 6px;
+    border-radius: 22px;
+  }
+
+  .hero-next-peek div {
+    padding: 10px 8px;
+    border-radius: 17px;
+  }
+
+  .hero-next-peek strong {
+    font-size: 11px;
+    line-height: 1.15;
+  }
+
+  .hero-next-peek span {
+    font-size: 10px;
+  }
+
+  .section {
+    width: min(calc(100% - 28px), var(--container));
+    padding: 58px 0;
+  }
+
+  .section-head {
+    margin-bottom: 26px;
+  }
+
+  .section h2,
+  .final-cta h2 {
+    font-size: 30px;
+    line-height: 1.12;
+  }
+
+  .section h3 {
+    font-size: 17px;
+    line-height: 1.22;
+  }
+
+  .section p {
+    font-size: 14px;
+    line-height: 1.52;
+  }
+
+  .idea-section,
+  .sides-section {
+    padding-right: 14px;
+    padding-left: 14px;
+  }
+
+  .idea-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .city-connection {
+    order: 2;
+    grid-column: 1 / -1;
+    min-height: 276px;
+  }
+
+  .person-panel {
+    order: 1;
+    gap: 12px;
+    padding: 14px;
+    border-radius: 20px;
+  }
+
+  .avatar,
+  .founder-avatar,
+  .supporter-avatar {
+    width: 44px;
+    height: 44px;
+    border-radius: 16px;
+    font-size: 18px;
+  }
+
+  .panel-label,
+  .side-kicker {
+    margin-bottom: 8px;
+    padding: 6px 9px;
+    font-size: 10px;
+  }
+
+  .person-panel p {
+    margin-top: 8px;
+    font-size: 12px;
+  }
+
+  .mini-map {
+    height: 276px;
+    border-radius: 24px;
+    background-size: 36px 36px;
+  }
+
+  .muted-road {
+    stroke-width: 10;
+  }
+
+  .active-road {
+    stroke-width: 11;
+  }
+
+  .city-point {
+    min-height: 32px;
+    padding: 0 10px;
+    font-size: 11px;
+  }
+
+  .city-point::before {
+    width: 8px;
+    height: 8px;
+  }
+
+  .task-preview-card {
+    right: 6%;
+    bottom: 9%;
+    width: 142px;
+    padding: 13px;
+    border-radius: 18px;
+  }
+
+  .task-preview-card strong {
+    font-size: 20px;
+  }
+
+  .value-strip,
+  .steps,
+  .scenario-grid,
+  .feature-grid,
+  .safety-items {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .value-strip {
+    margin-top: 12px;
+  }
+
+  .value-strip div {
+    min-height: 70px;
+    padding: 12px;
+    border-radius: 18px;
+    gap: 9px;
+    font-size: 12px;
+    line-height: 1.25;
+  }
+
+  .value-strip svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  .step-card,
+  .scenario-card,
+  .feature-card,
+  .supporter-card {
+    min-height: 0;
+    padding: 16px;
+    border-radius: 20px;
+  }
+
+  .step-number {
+    width: 36px;
+    height: 36px;
+    margin-bottom: 26px;
+    border-width: 5px;
+    font-size: 13px;
+  }
+
+  .step-card svg {
+    top: 18px;
+    right: 16px;
+    width: 22px;
+    height: 22px;
+  }
+
+  .step-card p,
+  .scenario-card p,
+  .feature-card p {
+    margin-top: 8px;
+    font-size: 12px;
+  }
+
+  .scenario-layout {
+    gap: 16px;
+  }
+
+  .route-card {
+    border-radius: 24px;
+  }
+
+  .route-card-map {
+    height: 182px;
+    background-size: auto, auto, 34px 34px, 34px 34px;
+  }
+
+  .route-card-map path {
+    stroke-width: 11;
+  }
+
+  .route-pin {
+    width: 42px;
+    height: 42px;
+    border-width: 4px;
+    border-radius: 15px;
+    font-size: 16px;
+  }
+
+  .route-pin.start {
+    left: 32px;
+    top: 28px;
+  }
+
+  .route-pin.finish {
+    right: 34px;
+    bottom: 28px;
+  }
+
+  .route-stats {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    padding: 8px;
+  }
+
+  .route-stats span {
+    padding: 10px 8px;
+    border-radius: 15px;
+    font-size: 11px;
+  }
+
+  .route-stats strong {
+    font-size: 18px;
+  }
+
+  .scenario-card svg,
+  .feature-card svg {
+    width: 25px;
+    height: 25px;
+    margin-bottom: 20px;
+  }
+
+  .scenario-card.wide {
+    display: block;
+    grid-column: 1 / -1;
+  }
+
+  .sides-grid {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .side-card {
+    padding: 22px;
+    border-radius: 24px;
+  }
+
+  .side-card::before {
+    right: -110px;
+    bottom: -130px;
+  }
+
+  .side-card h3 {
+    font-size: 24px;
+  }
+
+  .side-card ul {
+    gap: 8px;
+    margin-top: 18px;
+  }
+
+  .side-card li {
+    gap: 9px;
+    font-size: 14px;
+  }
+
+  .side-card li::before {
+    width: 9px;
+    height: 9px;
+  }
+
+  .app-showcase {
+    gap: 22px;
+    margin-bottom: 18px;
+  }
+
+  .app-copy p:not(.eyebrow) {
+    max-width: none;
+    margin-top: 14px;
+    font-size: 14px;
+  }
+
+  .screen-tabs {
+    gap: 7px;
+    margin-top: 18px;
+    padding-bottom: 6px;
+  }
+
+  .screen-tabs button {
+    min-height: 36px;
+    padding: 0 12px;
+    font-size: 12px;
+  }
+
+  .app-phone {
+    width: 198px;
+    height: 430px;
+    border-width: 7px;
+    border-radius: 32px;
+  }
+
+  .feature-card h3,
+  .scenario-card h3 {
+    font-size: 15px;
+  }
+
+  .safety-section {
+    gap: 14px;
+  }
+
+  .safety-copy {
+    padding: 24px;
+    border-radius: 24px;
+  }
+
+  .safety-copy h2 {
+    font-size: 28px;
+  }
+
+  .safety-item,
+  .safety-item:nth-child(5) {
+    grid-column: auto;
+  }
+
+  .safety-item {
+    min-height: 74px;
+    gap: 9px;
+    padding: 14px;
+    border-radius: 18px;
+    font-size: 13px;
+    line-height: 1.25;
+  }
+
+  .safety-item svg {
+    width: 21px;
+    height: 21px;
+    flex: 0 0 auto;
+  }
+
+  .founder-section {
+    padding-top: 34px;
+  }
+
+  .founder-card {
+    grid-template-columns: 88px minmax(0, 1fr);
+    gap: 16px;
+    align-items: start;
+    padding: 18px;
+    border-radius: 24px;
+  }
+
+  .founder-photo {
+    width: 88px;
+    height: 88px;
+    border-width: 5px;
+    border-radius: 26px;
+  }
+
+  .founder-copy h2 {
+    font-size: 21px;
+    line-height: 1.16;
+  }
+
+  .founder-copy p:not(.eyebrow) {
+    margin-top: 12px;
+    font-size: 13px;
+  }
+
+  .founder-copy .social-row {
+    grid-column: 1 / -1;
+  }
+
+  .social-row {
+    gap: 7px;
+    margin-top: 16px;
+  }
+
+  .social-row a,
+  .footer-links a {
+    min-height: 34px;
+    padding: 0 11px;
+    font-size: 12px;
+  }
+
+  .final-cta {
+    width: calc(100% - 28px);
+    margin-top: 18px;
+    padding: 48px 16px;
+    border-radius: 24px;
+  }
+
+  .final-cta p {
+    margin-top: 14px;
+    font-size: 14px;
+  }
+
+  .site-footer {
+    width: calc(100% - 28px);
+    margin-top: 18px;
+    gap: 14px;
+    font-size: 13px;
+  }
+
+  .footer-links {
+    gap: 7px;
+  }
+}
+
+@media (max-width: 420px) {
+  .hero {
+    padding-right: 14px;
+    padding-left: 14px;
+  }
+
+  .hero h1 {
+    font-size: 48px;
+  }
+
+  .hero-slogan {
+    font-size: 24px;
+  }
+
+  .hero-product {
+    min-height: 378px;
+    width: min(100%, 334px);
+  }
+
+  .phone-main {
+    right: calc(50% - 152px);
+    width: 174px;
+    height: 378px;
+  }
+
+  .phone-secondary {
+    top: 78px;
+    left: calc(50% - 152px);
+    width: 126px;
+    height: 274px;
+  }
+
+  .task-one {
+    left: calc(50% - 154px);
+  }
+
+  .task-two {
+    right: calc(50% - 160px);
+  }
+
+  .section h2,
+  .final-cta h2 {
+    font-size: 28px;
+  }
+
+  .feature-card h3,
+  .scenario-card h3 {
+    font-size: 14px;
+  }
+
+  .founder-card {
+    grid-template-columns: 78px minmax(0, 1fr);
+  }
+
+  .founder-photo {
+    width: 78px;
+    height: 78px;
+    border-radius: 23px;
+  }
+
+  .founder-copy h2 {
+    font-size: 19px;
+  }
+}
+
+@media (max-width: 360px) {
+  .store-row,
+  .hero-pills,
+  .idea-grid,
+  .value-strip,
+  .steps,
+  .scenario-grid,
+  .feature-grid,
+  .safety-items {
+    grid-template-columns: 1fr;
+  }
+
+  .hero-next-peek {
+    grid-template-columns: 1fr;
+  }
+
+  .city-connection {
+    order: 3;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   html {
     scroll-behavior: auto;
