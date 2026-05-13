@@ -7,7 +7,7 @@ import uuid
 from fastapi.testclient import TestClient
 
 from app.bootstrap import ensure_all_tables
-from app.chat import _offer_thread_kind_value, ensure_chat_participant
+from app.chat import _offer_thread_kind_value, ensure_chat_participant, post_system_thread_message
 from app.db import execute, fetch_one
 from app.main import _insert_task, app as public_app
 from app.security import hash_password
@@ -131,6 +131,54 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(messages_response.status_code, 200, messages_response.text)
         self.assertGreaterEqual(len(messages_response.json()), 1)
+
+    def test_chat_read_receipts_clear_unread_and_update_sender_status(self) -> None:
+        owner = self._create_user("receipt-owner")
+        performer = self._create_user("receipt-performer")
+        owner_token = self._login_user(owner)
+        performer_token = self._login_user(performer)
+        thread_id = self._create_direct_thread(owner["id"], performer["id"])
+
+        send_response = self.client.post(
+            f"/chats/{thread_id}/messages",
+            headers={"Authorization": f"Bearer {performer_token}"},
+            json={"text": "Проверка галочек"},
+        )
+        self.assertEqual(send_response.status_code, 201, send_response.text)
+        performer_message_id = send_response.json()["id"]
+        system_message = post_system_thread_message(thread_id, "Системное сообщение не должно висеть в счётчике")
+
+        chats_before_read = self.client.get(
+            "/chats",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(chats_before_read.status_code, 200, chats_before_read.text)
+        current_thread = next(item for item in chats_before_read.json() if item["thread_id"] == thread_id)
+        self.assertEqual(current_thread["unread_count"], 1)
+
+        read_response = self.client.post(
+            f"/chats/{thread_id}/messages/read",
+            headers={"Authorization": f"Bearer {owner_token}"},
+            json={"message_ids": [system_message["id"]]},
+        )
+        self.assertEqual(read_response.status_code, 200, read_response.text)
+
+        chats_after_read = self.client.get(
+            "/chats",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(chats_after_read.status_code, 200, chats_after_read.text)
+        updated_thread = next(item for item in chats_after_read.json() if item["thread_id"] == thread_id)
+        self.assertEqual(updated_thread["unread_count"], 0)
+
+        performer_messages = self.client.get(
+            f"/chats/{thread_id}/messages",
+            headers={"Authorization": f"Bearer {performer_token}"},
+        )
+        self.assertEqual(performer_messages.status_code, 200, performer_messages.text)
+        performer_message = next(item for item in performer_messages.json() if item["id"] == performer_message_id)
+        self.assertEqual(performer_message["delivery_status"], "read")
+        self.assertTrue(performer_message["is_read_by_recipient"])
 
     def test_chats_realtime_capabilities_endpoint(self) -> None:
         owner = self._create_user("realtime-owner")
