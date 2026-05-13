@@ -37,6 +37,7 @@ from app.chat import (
     get_or_create_offer_thread,
     list_thread_messages,
     list_user_threads,
+    mark_thread_messages_read,
     post_thread_image_message,
     post_system_thread_message,
     post_thread_message,
@@ -67,6 +68,7 @@ from app.schemas import (
     AppealIn,
     ChatMessageIn,
     ChatMessageOut,
+    ChatMessagesReadIn,
     ChatRealtimeCapabilitiesOut,
     ChatThreadOut,
     CreateAnnouncementIn,
@@ -3711,6 +3713,19 @@ async def send_chat_message(
     await broadcast_chat_message(thread_id=thread_id, message=message)
     await _capture_dispute_answer_if_needed(message, user.id)
     return ChatMessageOut(**message)
+
+
+@app.post("/chats/{thread_id}/messages/read", response_model=OKOut)
+def mark_chat_messages_read(
+    thread_id: str,
+    payload: ChatMessagesReadIn,
+    user: UserOut = Depends(get_current_user),
+) -> OKOut:
+    if user.id == "dev":
+        return OKOut()
+
+    mark_thread_messages_read(thread_id=thread_id, user_id=user.id, message_ids=payload.message_ids)
+    return OKOut()
 
 
 @app.post("/chats/{thread_id}/messages/media", response_model=ChatMessageOut, status_code=201)

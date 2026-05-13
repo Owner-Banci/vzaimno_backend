@@ -274,6 +274,10 @@ class ChatMessageIn(BaseModel):
     text: str = Field(..., min_length=1, max_length=5000)
 
 
+class ChatMessagesReadIn(BaseModel):
+    message_ids: list[str] = Field(default_factory=list, max_items=100)
+
+
 class DisputeOpenIn(BaseModel):
     problem_title: str = Field(..., min_length=1, max_length=120)
     problem_description: str = Field(..., min_length=1, max_length=5000)
@@ -374,6 +378,10 @@ class ChatMessageOut(BaseModel):
     media_url: Optional[str] = None
     created_at: datetime
     type: str = "text"
+    delivery_status: str = "delivered"
+    delivered_at: Optional[datetime] = None
+    read_at: Optional[datetime] = None
+    is_read_by_recipient: bool = False
 
 
 class SupportMessageOut(BaseModel):

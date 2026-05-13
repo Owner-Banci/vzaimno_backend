@@ -595,6 +595,9 @@ CREATE TABLE chat_messages (
   sender_display_name       TEXT NULL,
   sender_label              TEXT NULL,
   metadata                  JSONB NOT NULL DEFAULT '{}'::jsonb,
+  delivery_status           TEXT NOT NULL DEFAULT 'delivered',
+  delivered_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+  read_at                   TIMESTAMPTZ NULL,
   created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
   edited_at                 TIMESTAMPTZ NULL,
   deleted_at                TIMESTAMPTZ NULL,
@@ -604,6 +607,8 @@ CREATE TABLE chat_messages (
     CHECK (char_length(text) <= 10000),
   CONSTRAINT chk_chat_messages_sender_type
     CHECK (sender_type IS NULL OR sender_type IN ('user', 'admin', 'system')),
+  CONSTRAINT chk_chat_messages_delivery_status
+    CHECK (delivery_status IN ('delivered', 'read')),
   -- Enforce: sender_type matches which *_account_id is set.
   CONSTRAINT chk_chat_messages_sender_identity
     CHECK (

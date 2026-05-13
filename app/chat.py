@@ -167,6 +167,12 @@ def _message_row_to_dict(row) -> Dict[str, Any]:
             metadata = {}
     else:
         metadata = {}
+    delivery_status = str(row[12]) if len(row) > 12 and row[12] is not None else "delivered"
+    delivered_at = row[13] if len(row) > 13 else None
+    read_at = row[14] if len(row) > 14 else None
+    is_read_by_recipient = bool(row[15]) if len(row) > 15 and row[15] is not None else False
+    if read_at is not None or is_read_by_recipient:
+        delivery_status = "read"
     sender_value = SYSTEM_CHAT_SENDER_ID
     if sender_type == "user":
         sender_value = sender_user_account_id or (str(row[2]) if row[2] is not None else None)
@@ -185,7 +191,37 @@ def _message_row_to_dict(row) -> Dict[str, Any]:
         "media_url": metadata.get("media_url"),
         "created_at": row[4],
         "type": message_type,
+        "delivery_status": delivery_status,
+        "delivered_at": delivered_at or row[4],
+        "read_at": read_at,
+        "is_read_by_recipient": is_read_by_recipient or read_at is not None,
     }
+
+
+def _chat_message_status_select_sql(alias: str = "chat_messages") -> str:
+    prefix = f"{alias}." if alias else ""
+    sender_expr = f"COALESCE({prefix}sender_user_account_id::text, {prefix}sender_id::text, '')"
+    read_by_recipient_sql = f"""
+            EXISTS (
+                SELECT 1
+                FROM message_reads mr
+                WHERE mr.message_id = {prefix}id
+                  AND mr.user_id::text <> {sender_expr}
+            ) AS is_read_by_recipient
+    """
+    if table_has_column("chat_messages", "delivery_status"):
+        return f"""
+            COALESCE({prefix}delivery_status, 'delivered') AS delivery_status,
+            COALESCE({prefix}delivered_at, {prefix}created_at) AS delivered_at,
+            {prefix}read_at AS read_at,
+            {read_by_recipient_sql}
+        """
+    return f"""
+            'delivered' AS delivery_status,
+            {prefix}created_at AS delivered_at,
+            NULL::timestamptz AS read_at,
+            {read_by_recipient_sql}
+        """
 
 
 def _avatar_select_sql(alias: str) -> str:
@@ -470,7 +506,7 @@ def _thread_preview_rows(user_id: str, thread_id: str | None = None) -> List[Dic
         fallback="Собеседник",
     )
     assignment_kind = _assignment_thread_kind_value()
-    params: List[Any] = [assignment_kind, user_id, *partner_name_params, user_id, user_id]
+    params: List[Any] = [assignment_kind, user_id, *partner_name_params, user_id, user_id, user_id]
     extra_filter = ""
     if thread_id is not None:
         extra_filter = " AND ct.id::text = %s"
@@ -561,14 +597,12 @@ def _thread_preview_rows(user_id: str, thread_id: str | None = None) -> List[Dic
                     OR COALESCE(m.sender_type, 'user') = 'admin'
                     OR COALESCE(m.sender_user_account_id::text, m.sender_id::text, '') <> %s
               )
-              AND (
-                    me.last_read_message_id IS NULL
-                    OR m.created_at > COALESCE(read_msg.created_at, 'epoch'::timestamptz)
-                    OR (
-                        m.created_at = COALESCE(read_msg.created_at, 'epoch'::timestamptz)
-                        AND m.id::text > COALESCE(me.last_read_message_id::text, '')
-                    )
-                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM message_reads mr
+                    WHERE mr.message_id = m.id
+                      AND mr.user_id::text = %s
+              )
         ) unread ON TRUE
         WHERE ct.archived_at IS NULL
           AND (t.id IS NULL OR t.deleted_at IS NULL)
@@ -700,7 +734,7 @@ def list_thread_messages(
 
     lim = max(1, min(int(limit), 100))
     params: List[Any] = [thread_id]
-    sql = """
+    sql = f"""
         SELECT
             id,
             thread_id,
@@ -713,7 +747,8 @@ def list_thread_messages(
             sender_admin_account_id,
             sender_display_name,
             sender_label,
-            metadata
+            metadata,
+            {_chat_message_status_select_sql("chat_messages")}
         FROM chat_messages
         WHERE thread_id = %s
           AND deleted_at IS NULL
@@ -728,7 +763,78 @@ def list_thread_messages(
     rows = fetch_all(sql, tuple(params))
     ordered = list(reversed(rows))
 
-    if ordered:
+    return [_message_row_to_dict(row) for row in ordered]
+
+
+def _normalize_message_ids(message_ids: List[str]) -> List[str]:
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for raw_id in message_ids[:100]:
+        try:
+            message_id = str(uuid.UUID(str(raw_id)))
+        except (TypeError, ValueError):
+            continue
+        if message_id not in seen:
+            normalized.append(message_id)
+            seen.add(message_id)
+    return normalized
+
+
+def mark_thread_messages_read(thread_id: str, user_id: str, message_ids: List[str]) -> None:
+    assert_thread_access(thread_id, user_id)
+    normalized_ids = _normalize_message_ids(message_ids)
+    if not normalized_ids:
+        return
+
+    rows = fetch_all(
+        """
+        SELECT id::text
+        FROM chat_messages
+        WHERE thread_id = %s
+          AND id::text = ANY(%s)
+          AND deleted_at IS NULL
+          AND COALESCE(sender_type, 'user') <> 'system'
+          AND COALESCE(sender_user_account_id::text, sender_id::text, '') <> %s
+        """,
+        (thread_id, normalized_ids, user_id),
+    )
+    readable_ids = [str(row[0]) for row in rows if row and row[0]]
+    if not readable_ids:
+        return
+
+    execute(
+        """
+        INSERT INTO message_reads (message_id, user_id, read_at)
+        SELECT id, %s::uuid, now()
+        FROM chat_messages
+        WHERE id::text = ANY(%s)
+        ON CONFLICT (message_id, user_id) DO NOTHING
+        """,
+        (user_id, readable_ids),
+    )
+
+    if table_has_column("chat_messages", "delivery_status"):
+        execute(
+            """
+            UPDATE chat_messages
+            SET delivery_status = 'read',
+                read_at = COALESCE(read_at, now())
+            WHERE id::text = ANY(%s)
+            """,
+            (readable_ids,),
+        )
+
+    latest_row = fetch_one(
+        """
+        SELECT id
+        FROM chat_messages
+        WHERE id::text = ANY(%s)
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (readable_ids,),
+    )
+    if latest_row:
         execute(
             """
             UPDATE chat_participants
@@ -736,16 +842,15 @@ def list_thread_messages(
             WHERE thread_id = %s
               AND user_id = %s
             """,
-            (ordered[-1][0], thread_id, user_id),
+            (latest_row[0], thread_id, user_id),
         )
-        publish_thread_preview_sync(thread_id, user_id=user_id)
 
-    return [_message_row_to_dict(row) for row in ordered]
+    publish_thread_preview_sync(thread_id, user_id=user_id)
 
 
 def _fetch_chat_message_row(message_id: str):
     return fetch_one(
-        """
+        f"""
         SELECT
             id,
             thread_id,
@@ -758,7 +863,8 @@ def _fetch_chat_message_row(message_id: str):
             sender_admin_account_id,
             sender_display_name,
             sender_label,
-            metadata
+            metadata,
+            {_chat_message_status_select_sql("chat_messages")}
         FROM chat_messages
         WHERE id = %s
         """,
