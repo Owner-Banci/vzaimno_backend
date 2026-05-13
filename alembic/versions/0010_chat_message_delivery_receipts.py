@@ -1,6 +1,6 @@
 """Add delivery and read receipt fields to chat messages.
 
-Revision ID: 0010_chat_message_delivery_receipts
+Revision ID: 0010_chat_receipts
 Revises: 0009_scrub_public_display_names
 Create Date: 2026-05-13
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 from alembic import op
 
 
-revision = "0010_chat_message_delivery_receipts"
+revision = "0010_chat_receipts"
 down_revision = "0009_scrub_public_display_names"
 branch_labels = None
 depends_on = None
