@@ -138,11 +138,15 @@ FROM (
     SELECT
         t.id AS task_id,
         1 AS priority,
-        COALESCE(t.updated_at, t.created_at) AS sort_at
+        COALESCE(ta.updated_at, t.updated_at, t.created_at) AS sort_at
     FROM tasks t
+    JOIN task_assignments ta
+      ON ta.task_id = t.id
+     AND ta.customer_id::text = %s
+     AND ta.assignment_status IN ('assigned', 'in_progress')
     WHERE t.customer_id::text = %s
       AND t.deleted_at IS NULL
-      AND t.status IN ('published', 'in_responses', 'agreed', 'in_progress')
+      AND t.status IN ('agreed', 'in_progress')
       AND t.moderation_status = 'published'
 ) candidate
 ORDER BY candidate.priority ASC, candidate.sort_at DESC NULLS LAST

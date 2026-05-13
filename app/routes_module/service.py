@@ -178,7 +178,7 @@ def build_route_from_polyline(
 
 
 def _resolve_current_announcement_id(user_id: str) -> str:
-    row = fetch_one(FIND_CURRENT_ROUTE_TASK_SQL, (user_id, user_id))
+    row = fetch_one(FIND_CURRENT_ROUTE_TASK_SQL, (user_id, user_id, user_id))
     if not row:
         raise HTTPException(status_code=404, detail="Для вас пока нет активного маршрута")
     return str(row[0])
@@ -234,7 +234,7 @@ def _load_route_context(*, announcement_id: str, user_id: str) -> dict[str, Any]
         user_id=user_id,
     )
 
-    if assignment_status not in {"assigned", "in_progress"} and ann_owner_id != user_id:
+    if assignment_status not in {"assigned", "in_progress"}:
         raise HTTPException(status_code=409, detail="Маршрут появится после принятия активного задания")
 
     route_points = _extract_route_points(data, category)

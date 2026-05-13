@@ -145,6 +145,62 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         self.assertIn("chat_websocket_enabled", payload)
         self.assertIn("websocket_path", payload)
 
+    def test_customer_route_ignores_unaccepted_task_even_with_legacy_execution_status(self) -> None:
+        owner = self._create_user("route-owner")
+        performer = self._create_user("route-performer")
+        owner_token = self._login_user(owner)
+        performer_token = self._login_user(performer)
+        task_id = str(uuid.uuid4())
+        self.task_ids.append(task_id)
+
+        _insert_task(
+            task_id,
+            owner["id"],
+            "delivery",
+            "Забрать коробку",
+            "active",
+            {
+                "pickup_address": "Москва, Тверская 1",
+                "dropoff_address": "Москва, Арбат 10",
+                "address_text": "Москва, Тверская 1",
+                "pickup_point": {"lat": 55.7558, "lon": 37.6173},
+                "dropoff_point": {"lat": 55.7522, "lon": 37.5931},
+                "point": {"lat": 55.7558, "lon": 37.6173},
+                "execution_status": "in_progress",
+                "execution_status_confirmed": True,
+                "notes": "Проверяем, что несогласованная задача не попадает в маршрут",
+            },
+        )
+
+        offer_response = self.client.post(
+            f"/announcements/{task_id}/offers",
+            headers={"Authorization": f"Bearer {performer_token}"},
+            json={"message": "Готов выполнить", "proposed_price": 1000},
+        )
+        self.assertEqual(offer_response.status_code, 201, offer_response.text)
+
+        current_route = self.client.get(
+            "/routes/me/current/context",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(current_route.status_code, 404, current_route.text)
+
+        explicit_route = self.client.get(
+            f"/announcements/{task_id}/route/context",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(explicit_route.status_code, 409, explicit_route.text)
+
+        my_tasks = self.client.get(
+            "/announcements/me",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(my_tasks.status_code, 200, my_tasks.text)
+        task = next(item for item in my_tasks.json() if item["id"] == task_id)
+        self.assertEqual(task["status"], "active")
+        self.assertEqual(task["data"]["task"]["execution"]["status"], "open")
+        self.assertIsNone(task["data"]["task"]["assignment"]["performer_user_id"])
+
     def test_accepting_offer_exposes_same_assignment_chat_to_owner_and_performer(self) -> None:
         owner = self._create_user("accept-owner")
         performer = self._create_user("accept-performer")

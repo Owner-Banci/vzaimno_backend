@@ -375,11 +375,23 @@ def ensure_task_payload(
     }.get((announcement_status or normalized_status or "").strip().lower(), "open")
 
     assignment_info = normalize_json_object(assignment)
+    assignment_status = normalize_optional_text(assignment_info.get("assignment_status"))
+    announcement_status_key = (announcement_status or normalized_status or "").strip().lower()
+    has_active_assignment = (assignment_status or "").lower() in TASK_ASSIGNMENT_ACTIVE_STATUSES
+    legacy_execution_value = (
+        normalize_optional_text(execution.get("status"))
+        or normalize_optional_text(data.get("execution_status"))
+    )
+    if not has_active_assignment and announcement_status_key not in {"in_progress", "completed", "cancelled"}:
+        legacy_execution_value = None
+        execution.pop("accepted_confirmed", None)
+        data.pop("execution_status", None)
+        data.pop("execution_status_confirmed", None)
+
     execution_status = canonical_execution_status(
         execution_stage=assignment_info.get("execution_stage"),
-        assignment_status=assignment_info.get("assignment_status"),
-        current_value=normalize_optional_text(execution.get("status"))
-        or normalize_optional_text(data.get("execution_status")),
+        assignment_status=assignment_status,
+        current_value=legacy_execution_value,
     )
 
     builder.setdefault("main_group", normalize_optional_text(data.get("main_group")) or normalize_optional_text(data.get("category")) or "help")
