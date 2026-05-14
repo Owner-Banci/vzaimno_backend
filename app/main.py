@@ -73,6 +73,7 @@ from app.schemas import (
     ChatThreadOut,
     CreateAnnouncementIn,
     CreateOfferIn,
+    CurrentUserDetailsOut,
     DisputeCounterpartyResponseIn,
     DisputeFinalAcceptanceIn,
     DisputeOpenIn,
@@ -324,6 +325,12 @@ class ReviewFeedOut(BaseModel):
     items: list[ReviewFeedItemOut] = Field(default_factory=list)
     selected_role: str = REVIEW_ROLE_ALL
     summary: ReviewFeedSummaryOut = Field(default_factory=ReviewFeedSummaryOut)
+
+
+class PublicUserProfileOut(BaseModel):
+    user: CurrentUserDetailsOut
+    profile: UserProfileOut
+    stats: UserStatsOut
 
 
 class ReviewEligibilityOut(BaseModel):
@@ -883,6 +890,63 @@ def _fetch_me_profile(user_id: str) -> MeProfileOut:
     )
 
 
+def _fetch_public_user_profile(user_id: str) -> PublicUserProfileOut:
+    if user_id == "dev":
+        return PublicUserProfileOut(**_dev_me_profile().model_dump())
+
+    if not fetch_one("SELECT 1 FROM users WHERE id::text = %s LIMIT 1", (user_id,)):
+        raise HTTPException(status_code=404, detail="User not found")
+
+    _ensure_profile_and_stats(user_id)
+
+    row = fetch_one(
+        f"""
+        SELECT
+            u.id::text,
+            u.email,
+            u.created_at,
+            up.display_name,
+            up.bio,
+            up.city,
+            {_profile_extra_select_sql("up")},
+            {_profile_home_location_select_sql("up")},
+            COALESCE(us.rating_avg, 0),
+            COALESCE(us.rating_count, 0),
+            COALESCE(us.completed_count, 0),
+            COALESCE(us.cancelled_count, 0)
+        FROM users u
+        LEFT JOIN user_profiles up ON up.user_id = u.id
+        LEFT JOIN user_stats us ON us.user_id = u.id
+        WHERE u.id::text = %s
+        """,
+        (user_id,),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return PublicUserProfileOut(
+        user={
+            "id": row[0],
+            "email": row[1],
+            "phone": None,
+            "created_at": row[2],
+        },
+        profile={
+            "display_name": _normalize_optional_text(row[3], collapse_spaces=True),
+            "bio": _normalize_optional_text(row[4]),
+            "city": _normalize_optional_text(row[5], collapse_spaces=True),
+            "preferred_address": _preferred_address_from_extra(row[6]),
+            "home_location": _point_out({"lat": row[7], "lon": row[8]}) if row[7] is not None and row[8] is not None else None,
+        },
+        stats=UserStatsOut(
+            rating_avg=float(row[9] or 0),
+            rating_count=int(row[10] or 0),
+            completed_count=int(row[11] or 0),
+            cancelled_count=int(row[12] or 0),
+        ),
+    )
+
+
 def _fetch_profile_section(user_id: str) -> UserProfileOut:
     if user_id == "dev":
         return UserProfileOut(display_name="Dev User", preferred_address=None)
@@ -918,6 +982,14 @@ def _fetch_profile_section(user_id: str) -> UserProfileOut:
 @app.get("/users/me", response_model=MeProfileOut)
 def users_me(user: UserOut = Depends(get_current_user)) -> MeProfileOut:
     return _fetch_me_profile(user.id)
+
+
+@app.get("/users/{target_user_id}", response_model=PublicUserProfileOut)
+def user_profile(
+    target_user_id: str,
+    _: UserOut = Depends(get_current_user),
+) -> PublicUserProfileOut:
+    return _fetch_public_user_profile(target_user_id)
 
 
 @app.patch("/users/me/profile", response_model=UserProfileOut)
@@ -1147,15 +1219,40 @@ def my_reviews(
     role: str = REVIEW_ROLE_ALL,
     user: UserOut = Depends(get_current_user),
 ) -> ReviewFeedOut:
+    return _reviews_for_user(user.id, limit=limit, offset=offset, role=role)
+
+
+@app.get("/users/{target_user_id}/reviews", response_model=ReviewFeedOut)
+def user_reviews(
+    target_user_id: str,
+    limit: int = 2,
+    offset: int = 0,
+    role: str = REVIEW_ROLE_ALL,
+    _: UserOut = Depends(get_current_user),
+) -> ReviewFeedOut:
+    return _reviews_for_user(target_user_id, limit=limit, offset=offset, role=role)
+
+
+def _reviews_for_user(
+    target_user_id: str,
+    *,
+    limit: int,
+    offset: int,
+    role: str,
+) -> ReviewFeedOut:
     selected_role = _normalize_review_role(role)
-    if user.id == "dev":
+    if target_user_id == "dev":
         return ReviewFeedOut(items=[], selected_role=selected_role, summary=ReviewFeedSummaryOut())
 
+    if not fetch_one("SELECT 1 FROM users WHERE id::text = %s LIMIT 1", (target_user_id,)):
+        raise HTTPException(status_code=404, detail="User not found")
+
+    _ensure_profile_and_stats(target_user_id)
     lim = max(1, min(int(limit), 100))
     off = max(0, int(offset))
-    summary = _review_feed_summary(user.id, selected_role)
+    summary = _review_feed_summary(target_user_id, selected_role)
 
-    params: List[Any] = [user.id]
+    params: List[Any] = [target_user_id]
     filter_sql = ""
     if selected_role != REVIEW_ROLE_ALL:
         filter_sql = " AND COALESCE(r.target_role, '') = %s"

@@ -184,6 +184,24 @@ class ReviewIntegrationTests(unittest.TestCase):
         self.assertEqual(customer_feed.json()["summary"], {"average": 4.0, "count": 1})
         self.assertEqual(customer_feed.json()["items"][0]["target_role"], "customer")
 
+        public_profile = self.client.get(
+            f"/users/{performer['id']}",
+            headers={"Authorization": f"Bearer {customer['token']}"},
+        )
+        self.assertEqual(public_profile.status_code, 200, public_profile.text)
+        self.assertEqual(public_profile.json()["user"]["id"], performer["id"])
+        self.assertEqual(public_profile.json()["profile"]["display_name"], "Performer")
+        self.assertEqual(public_profile.json()["stats"]["rating_avg"], 5.0)
+
+        public_reviews = self.client.get(
+            f"/users/{performer['id']}/reviews",
+            headers={"Authorization": f"Bearer {customer['token']}"},
+            params={"role": "performer"},
+        )
+        self.assertEqual(public_reviews.status_code, 200, public_reviews.text)
+        self.assertEqual(public_reviews.json()["summary"], {"average": 5.0, "count": 1})
+        self.assertEqual(public_reviews.json()["items"][0]["text"], "Отличная работа")
+
         stored_roles = fetch_one(
             """
             SELECT
