@@ -1231,7 +1231,9 @@ def submit_announcement_review(
         """
         INSERT INTO reviews (id, task_id, from_user_id, to_user_id, stars, text, author_role, target_role, created_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
-        ON CONFLICT (task_id, from_user_id) DO NOTHING
+        ON CONFLICT (task_id, from_user_id)
+        WHERE task_id IS NOT NULL AND from_user_id IS NOT NULL
+        DO NOTHING
         RETURNING id
         """,
         (
