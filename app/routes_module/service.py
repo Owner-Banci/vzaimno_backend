@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import math
+import uuid
 from typing import Any
 
 from fastapi import HTTPException
 
 from app.config import get_bool, get_env, get_int
-from app.db import fetch_all, fetch_one
+from app.db import execute, fetch_all, fetch_one
 from app.geocoding import geocode_address, lookup_local_address_point
 from app.storage import default_presigned_expires_seconds, get_storage
 from app.task_compat import ensure_task_payload
@@ -26,7 +27,10 @@ DEFAULT_ROUTE_RADIUS_METERS = max(50, get_int("ROUTE_TASK_RADIUS_METERS", 500))
 DEFAULT_ROUTE_LIMIT = max(1, get_int("ROUTE_TASKS_LIMIT", 50))
 DEFAULT_TRAVEL_MODE = get_env("ROUTE_DEFAULT_TRAVEL_MODE", "driving") or "driving"
 SUPPORTED_TRAVEL_MODES = {"driving", "walking", "truck", "transit", "bicycle", "scooter"}
-ROUTE_EXTERNAL_GEOCODE_ENABLED = get_bool("ROUTE_EXTERNAL_GEOCODE_ENABLED", False)
+ROUTE_EXTERNAL_GEOCODE_ENABLED = get_bool(
+    "ROUTE_EXTERNAL_GEOCODE_ENABLED",
+    get_bool("GEOCODE_ON_CREATE", True),
+)
 ROUTE_GEOCODE_TIMEOUT_SECONDS = max(1, get_int("ROUTE_GEOCODE_TIMEOUT_SECONDS", 2))
 
 
@@ -237,10 +241,14 @@ def _load_route_context(*, announcement_id: str, user_id: str) -> dict[str, Any]
     if assignment_status not in {"assigned", "in_progress"}:
         raise HTTPException(status_code=409, detail="Маршрут появится после принятия активного задания")
 
-    route_points = _extract_route_points(data, category)
     stored_route_points = _load_stored_route_points(ann_id)
+    route_points = _extract_route_points_without_geocoding(data, category)
     if not route_points:
-        route_points = _route_points_from_stored(stored_route_points)
+        stored_points = _route_points_from_stored(stored_route_points)
+        if stored_points and (len(stored_route_points) >= 2 or not _payload_destination_address(data, category)):
+            route_points = stored_points
+    if not route_points:
+        route_points = _extract_route_points(data, category)
     if not route_points:
         raise HTTPException(
             status_code=404,
@@ -253,6 +261,16 @@ def _load_route_context(*, announcement_id: str, user_id: str) -> dict[str, Any]
         category,
         start_point,
         end_point,
+        stored_route_points=stored_route_points,
+    )
+    _persist_route_context_points_if_needed(
+        announcement_id=ann_id,
+        data=data,
+        category=category,
+        start_point=start_point,
+        end_point=end_point,
+        start_address=start_address,
+        end_address=end_address,
         stored_route_points=stored_route_points,
     )
 
@@ -452,6 +470,7 @@ def _extract_route_points(
     start_address = (
         _normalize_address(data.get("pickup_address"))
         or _normalize_address(data.get("address"))
+        or _normalize_address(data.get("source_address"))
         or _normalize_address(data.get("start_address"))
         or _normalize_address(data.get("address_text"))
         or _normalize_address(route_source.get("address"))
@@ -461,6 +480,7 @@ def _extract_route_points(
         or _normalize_address(data.get("end_address"))
         or _normalize_address(data.get("to_address"))
         or _normalize_address(data.get("destination_address"))
+        or _normalize_address(data.get("help_destination_address"))
         or _normalize_address(route_destination.get("address"))
     )
 
@@ -485,6 +505,25 @@ def _extract_route_points(
     return start, end
 
 
+def _extract_route_points_without_geocoding(
+    data: dict[str, Any],
+    category: str,
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    start = _raw_source_point(data)
+    end = _raw_destination_point(data)
+    if start is not None and end is None:
+        if _payload_destination_address(data, category):
+            return None
+        end = start
+    elif end is not None and start is None:
+        if _payload_source_address(data):
+            return None
+        start = end
+    if start is None or end is None:
+        return None
+    return start, end
+
+
 def _resolve_address_point(address: str) -> tuple[float, float] | None:
     known_point = _lookup_known_address_point(address)
     if known_point is not None:
@@ -495,6 +534,247 @@ def _resolve_address_point(address: str) -> tuple[float, float] | None:
     if not ROUTE_EXTERNAL_GEOCODE_ENABLED:
         return None
     return geocode_address(address, timeout_seconds=ROUTE_GEOCODE_TIMEOUT_SECONDS)
+
+
+def _persist_route_context_points_if_needed(
+    *,
+    announcement_id: str,
+    data: dict[str, Any],
+    category: str,
+    start_point: tuple[float, float],
+    end_point: tuple[float, float],
+    start_address: str,
+    end_address: str,
+    stored_route_points: list[dict[str, Any]],
+) -> None:
+    should_store_destination = _should_store_destination_point(
+        data=data,
+        category=category,
+        start_point=start_point,
+        end_point=end_point,
+    )
+    raw_start = _raw_source_point(data)
+    raw_end = _raw_destination_point(data)
+    needs_payload_update = raw_start is None or not _same_point(raw_start, start_point)
+    if should_store_destination:
+        needs_payload_update = needs_payload_update or raw_end is None or not _same_point(raw_end, end_point)
+
+    needs_stored_update = not stored_route_points or (should_store_destination and len(stored_route_points) < 2)
+    if not needs_payload_update and not needs_stored_update:
+        return
+
+    if needs_payload_update:
+        _store_route_points_in_payload(
+            data=data,
+            category=category,
+            start_point=start_point,
+            end_point=end_point if should_store_destination else None,
+        )
+        _persist_route_payload(
+            announcement_id=announcement_id,
+            data=data,
+            start_point=start_point,
+            start_address=start_address,
+        )
+
+    if needs_stored_update:
+        _replace_stored_route_points(
+            announcement_id=announcement_id,
+            start_point=start_point,
+            end_point=end_point if should_store_destination else None,
+            start_address=start_address,
+            end_address=end_address,
+        )
+
+
+def _raw_source_point(data: dict[str, Any]) -> tuple[float, float] | None:
+    task = data.get("task") if isinstance(data.get("task"), dict) else {}
+    route = task.get("route") if isinstance(task.get("route"), dict) else {}
+    route_source = route.get("source") if isinstance(route.get("source"), dict) else {}
+    return (
+        _extract_point(data.get("pickup_point"))
+        or _extract_point(data.get("help_point"))
+        or _extract_point(data.get("start_point"))
+        or _extract_point(data.get("source_point"))
+        or _extract_point(data.get("from_point"))
+        or _extract_point(data.get("origin_point"))
+        or _extract_point(data.get("point"))
+        or _extract_point(route_source.get("point"))
+        or _extract_flat_point(data, ("pickup", "help", "start", "source", "from", "origin"))
+    )
+
+
+def _raw_destination_point(data: dict[str, Any]) -> tuple[float, float] | None:
+    task = data.get("task") if isinstance(data.get("task"), dict) else {}
+    route = task.get("route") if isinstance(task.get("route"), dict) else {}
+    route_destination = route.get("destination") if isinstance(route.get("destination"), dict) else {}
+    return (
+        _extract_point(data.get("dropoff_point"))
+        or _extract_point(data.get("end_point"))
+        or _extract_point(data.get("destination_point"))
+        or _extract_point(data.get("to_point"))
+        or _extract_point(data.get("delivery_point"))
+        or _extract_point(route_destination.get("point"))
+        or _extract_flat_point(data, ("dropoff", "end", "destination", "to", "delivery"))
+    )
+
+
+def _should_store_destination_point(
+    *,
+    data: dict[str, Any],
+    category: str,
+    start_point: tuple[float, float],
+    end_point: tuple[float, float],
+) -> bool:
+    if not _same_point(start_point, end_point):
+        return True
+    return _payload_destination_address(data, category) is not None
+
+
+def _payload_destination_address(data: dict[str, Any], category: str) -> str | None:
+    task = data.get("task") if isinstance(data.get("task"), dict) else {}
+    route = task.get("route") if isinstance(task.get("route"), dict) else {}
+    route_destination = route.get("destination") if isinstance(route.get("destination"), dict) else {}
+    keys = ("dropoff_address", "end_address", "to_address", "destination_address", "help_destination_address")
+    if category.strip().lower() == "delivery":
+        keys = ("dropoff_address", "destination_address", "end_address", "to_address")
+    for key in keys:
+        value = _normalize_address(data.get(key))
+        if value:
+            return value
+    return _normalize_address(route_destination.get("address"))
+
+
+def _payload_source_address(data: dict[str, Any]) -> str | None:
+    task = data.get("task") if isinstance(data.get("task"), dict) else {}
+    route = task.get("route") if isinstance(task.get("route"), dict) else {}
+    route_source = route.get("source") if isinstance(route.get("source"), dict) else {}
+    for key in ("pickup_address", "address", "source_address", "start_address", "address_text"):
+        value = _normalize_address(data.get(key))
+        if value:
+            return value
+    return _normalize_address(route_source.get("address"))
+
+
+def _store_route_points_in_payload(
+    *,
+    data: dict[str, Any],
+    category: str,
+    start_point: tuple[float, float],
+    end_point: tuple[float, float] | None,
+) -> None:
+    normalized_category = category.strip().lower()
+    start = _point_json(start_point)
+    data["point"] = start
+    if normalized_category == "delivery":
+        data["pickup_point"] = start
+    else:
+        data["help_point"] = start
+    _route_node(data, "source")["point"] = start
+
+    if end_point is None:
+        return
+    end = _point_json(end_point)
+    if normalized_category == "delivery":
+        data["dropoff_point"] = end
+    else:
+        data["destination_point"] = end
+    _route_node(data, "destination")["point"] = end
+
+
+def _route_node(data: dict[str, Any], key: str) -> dict[str, Any]:
+    task = data.get("task")
+    if not isinstance(task, dict):
+        task = {}
+        data["task"] = task
+    route = task.get("route")
+    if not isinstance(route, dict):
+        route = {}
+        task["route"] = route
+    node = route.get(key)
+    if not isinstance(node, dict):
+        node = {}
+        route[key] = node
+    return node
+
+
+def _point_json(point: tuple[float, float]) -> dict[str, float]:
+    return {"lat": point[0], "lon": point[1]}
+
+
+def _same_point(left: tuple[float, float], right: tuple[float, float]) -> bool:
+    return abs(left[0] - right[0]) < 0.000001 and abs(left[1] - right[1]) < 0.000001
+
+
+def _persist_route_payload(
+    *,
+    announcement_id: str,
+    data: dict[str, Any],
+    start_point: tuple[float, float],
+    start_address: str,
+) -> None:
+    payload_json = json.dumps(data, ensure_ascii=False)
+    execute(
+        """
+        UPDATE tasks
+        SET extra = %s::jsonb,
+            address_text = COALESCE(%s, address_text),
+            location_point = ST_SetSRID(ST_MakePoint(%s::double precision, %s::double precision), 4326)::geography,
+            updated_at = now()
+        WHERE id::text = %s
+        """,
+        (payload_json, start_address, start_point[1], start_point[0], announcement_id),
+    )
+    execute(
+        """
+        UPDATE announcements
+        SET data = %s::jsonb,
+            location_point = ST_SetSRID(ST_MakePoint(%s::double precision, %s::double precision), 4326)::geography,
+            updated_at = now()
+        WHERE id::text = %s
+        """,
+        (payload_json, start_point[1], start_point[0], announcement_id),
+    )
+
+
+def _replace_stored_route_points(
+    *,
+    announcement_id: str,
+    start_point: tuple[float, float],
+    end_point: tuple[float, float] | None,
+    start_address: str,
+    end_address: str,
+) -> None:
+    points = [
+        ("Старт", start_address, start_point, "source"),
+    ]
+    if end_point is not None:
+        points.append(("Финиш", end_address, end_point, "destination"))
+
+    execute("DELETE FROM task_route_points WHERE task_id::text = %s", (announcement_id,))
+    for index, (title, address, point, kind) in enumerate(points):
+        execute(
+            """
+            INSERT INTO task_route_points (
+                id, task_id, point_order, title, address_text, point, point_kind, created_at
+            )
+            VALUES (
+                %s, %s, %s, %s, %s,
+                ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
+                %s, now()
+            )
+            """,
+            (
+                str(uuid.uuid4()),
+                announcement_id,
+                index,
+                title,
+                address,
+                point[1],
+                point[0],
+                kind,
+            ),
+        )
 
 
 def _lookup_known_address_point(address: str) -> tuple[float, float] | None:
@@ -565,6 +845,7 @@ def _resolve_route_addresses(
         start_address = (
             _normalize_address(data.get("start_address"))
             or _normalize_address(data.get("address"))
+            or _normalize_address(data.get("source_address"))
             or _normalize_address(data.get("address_text"))
             or _normalize_address(route_source.get("address"))
         )
@@ -572,6 +853,7 @@ def _resolve_route_addresses(
             _normalize_address(data.get("end_address"))
             or _normalize_address(data.get("to_address"))
             or _normalize_address(data.get("destination_address"))
+            or _normalize_address(data.get("help_destination_address"))
             or _normalize_address(route_destination.get("address"))
         )
 

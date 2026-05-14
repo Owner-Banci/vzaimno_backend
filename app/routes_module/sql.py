@@ -87,6 +87,54 @@ candidates AS (
     UNION ALL
 
     SELECT
+        t.extra->>'address' AS address,
+        (t.extra->'help_point'->>'lat')::double precision AS latitude,
+        (t.extra->'help_point'->>'lon')::double precision AS longitude,
+        t.updated_at AS created_at
+    FROM tasks t
+    WHERE jsonb_typeof(t.extra->'help_point') = 'object'
+      AND COALESCE(t.extra->'help_point'->>'lat', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+      AND COALESCE(t.extra->'help_point'->>'lon', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+
+    UNION ALL
+
+    SELECT
+        t.extra->>'address' AS address,
+        (t.extra->'point'->>'lat')::double precision AS latitude,
+        (t.extra->'point'->>'lon')::double precision AS longitude,
+        t.updated_at AS created_at
+    FROM tasks t
+    WHERE jsonb_typeof(t.extra->'point') = 'object'
+      AND COALESCE(t.extra->'point'->>'lat', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+      AND COALESCE(t.extra->'point'->>'lon', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+
+    UNION ALL
+
+    SELECT
+        t.extra->>'source_address' AS address,
+        (t.extra->'source_point'->>'lat')::double precision AS latitude,
+        (t.extra->'source_point'->>'lon')::double precision AS longitude,
+        t.updated_at AS created_at
+    FROM tasks t
+    WHERE jsonb_typeof(t.extra->'source_point') = 'object'
+      AND COALESCE(t.extra->'source_point'->>'lat', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+      AND COALESCE(t.extra->'source_point'->>'lon', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+
+    UNION ALL
+
+    SELECT
+        t.extra->>'destination_address' AS address,
+        (t.extra->'destination_point'->>'lat')::double precision AS latitude,
+        (t.extra->'destination_point'->>'lon')::double precision AS longitude,
+        t.updated_at AS created_at
+    FROM tasks t
+    WHERE jsonb_typeof(t.extra->'destination_point') = 'object'
+      AND COALESCE(t.extra->'destination_point'->>'lat', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+      AND COALESCE(t.extra->'destination_point'->>'lon', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+
+    UNION ALL
+
+    SELECT
         t.extra#>>'{task,route,source,address}' AS address,
         (t.extra#>>'{task,route,source,point,lat}')::double precision AS latitude,
         (t.extra#>>'{task,route,source,point,lon}')::double precision AS longitude,

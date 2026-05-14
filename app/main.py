@@ -369,7 +369,7 @@ Image.MAX_IMAGE_PIXELS = UPLOAD_MAX_IMAGE_PIXELS
 
 
 def _create_external_geocoding_enabled() -> bool:
-    return os.getenv("GEOCODE_ON_CREATE", "0").strip().lower() in {"1", "true", "yes", "on"}
+    return os.getenv("GEOCODE_ON_CREATE", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _create_geocode_timeout_seconds() -> float:
@@ -2008,9 +2008,20 @@ def _task_route_node(data: Dict[str, Any], key: str) -> Dict[str, Any]:
     return node
 
 
+def _existing_task_route_node(data: Dict[str, Any], key: str) -> Dict[str, Any]:
+    task = data.get("task")
+    if not isinstance(task, dict):
+        return {}
+    route = task.get("route")
+    if not isinstance(route, dict):
+        return {}
+    node = route.get(key)
+    return node if isinstance(node, dict) else {}
+
+
 def _source_point_from_payload(category: str, data: Dict[str, Any]) -> Optional[Tuple[float, float]]:
     normalized_category = (category or "").strip().lower()
-    route_source = _task_route_node(data, "source")
+    route_source = _existing_task_route_node(data, "source")
 
     if normalized_category == "delivery":
         return (
@@ -2039,7 +2050,7 @@ def _source_point_from_payload(category: str, data: Dict[str, Any]) -> Optional[
 
 
 def _destination_point_from_payload(data: Dict[str, Any]) -> Optional[Tuple[float, float]]:
-    route_destination = _task_route_node(data, "destination")
+    route_destination = _existing_task_route_node(data, "destination")
     return destination_point(data) or _extract_point(route_destination.get("point"))
 
 

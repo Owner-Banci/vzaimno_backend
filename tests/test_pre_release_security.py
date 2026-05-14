@@ -265,7 +265,10 @@ class PreReleaseSecurityIntegrationTests(unittest.TestCase):
         user = self._create_user("sanitize-owner")
         token = self._login_user(user)
 
-        with patch("app.main.classify_text", return_value={"label": "LEGAL", "reason": "test"}):
+        with patch("app.main.classify_text", return_value={"label": "LEGAL", "reason": "test"}), patch(
+            "app.main.geocode_address",
+            return_value=None,
+        ):
             response = self.client.post(
                 "/announcements",
                 headers={"Authorization": f"Bearer {token}"},

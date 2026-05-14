@@ -103,6 +103,12 @@ def point_json(point: tuple[float, float]) -> Dict[str, float]:
     return {"lat": point[0], "lon": point[1]}
 
 
+def nested_route_node(data: Dict[str, Any], key: str) -> Dict[str, Any]:
+    task = normalize_json_object(data.get("task"))
+    route = normalize_json_object(task.get("route"))
+    return normalize_json_object(route.get(key))
+
+
 def current_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
 
@@ -258,31 +264,31 @@ def primary_source_address(data: Dict[str, Any]) -> Optional[str]:
         value = normalize_optional_text(data.get(key), collapse_spaces=True)
         if value:
             return value
-    return None
+    return normalize_optional_text(nested_route_node(data, "source").get("address"), collapse_spaces=True)
 
 
 def primary_destination_address(data: Dict[str, Any]) -> Optional[str]:
-    for key in ("dropoff_address", "destination_address", "end_address", "to_address"):
+    for key in ("dropoff_address", "destination_address", "help_destination_address", "end_address", "to_address"):
         value = normalize_optional_text(data.get(key), collapse_spaces=True)
         if value:
             return value
-    return None
+    return normalize_optional_text(nested_route_node(data, "destination").get("address"), collapse_spaces=True)
 
 
 def primary_map_point(data: Dict[str, Any]) -> Optional[tuple[float, float]]:
-    for key in ("point", "pickup_point", "help_point", "source_point"):
+    for key in ("point", "pickup_point", "help_point", "source_point", "start_point", "from_point", "origin_point"):
         point = extract_point(data.get(key))
         if point:
             return point
-    return None
+    return extract_point(nested_route_node(data, "source").get("point"))
 
 
 def destination_point(data: Dict[str, Any]) -> Optional[tuple[float, float]]:
-    for key in ("dropoff_point", "destination_point", "end_point", "to_point"):
+    for key in ("dropoff_point", "destination_point", "end_point", "to_point", "delivery_point"):
         point = extract_point(data.get(key))
         if point:
             return point
-    return None
+    return extract_point(nested_route_node(data, "destination").get("point"))
 
 
 def derive_quick_offer_price(data: Dict[str, Any]) -> Optional[int]:
@@ -449,22 +455,23 @@ def ensure_task_payload(
     route.setdefault("has_end_time", bool(data.get("has_end_time")))
     route.setdefault("end_at", normalize_optional_text(data.get("end_at")))
     route.setdefault("timezone", normalize_optional_text(data.get("timezone")) or normalize_optional_text(data.get("schedule_timezone")))
-    route.setdefault(
-        "source",
-        {
-            "address": source_address,
-            "kind": normalize_optional_text(data.get("source_kind")),
-            "point": point_json(source_point) if source_point else None,
-        },
-    )
-    route.setdefault(
-        "destination",
-        {
-            "address": destination_address,
-            "kind": normalize_optional_text(data.get("destination_kind")),
-            "point": point_json(destination) if destination else None,
-        },
-    )
+    route_source = normalize_json_object(route.get("source"))
+    if route_source.get("address") in (None, ""):
+        route_source["address"] = source_address
+    if route_source.get("kind") in (None, ""):
+        route_source["kind"] = normalize_optional_text(data.get("source_kind"))
+    if route_source.get("point") in (None, {}, []):
+        route_source["point"] = point_json(source_point) if source_point else None
+    route["source"] = route_source
+
+    route_destination = normalize_json_object(route.get("destination"))
+    if route_destination.get("address") in (None, ""):
+        route_destination["address"] = destination_address
+    if route_destination.get("kind") in (None, ""):
+        route_destination["kind"] = normalize_optional_text(data.get("destination_kind"))
+    if route_destination.get("point") in (None, {}, []):
+        route_destination["point"] = point_json(destination) if destination else None
+    route["destination"] = route_destination
 
     contacts.setdefault("name", normalize_optional_text(data.get("contact_name")))
     contacts.setdefault("phone", normalize_optional_text(data.get("contact_phone")))

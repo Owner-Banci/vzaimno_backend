@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 import uuid
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -410,18 +411,19 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         task_id = str(uuid.uuid4())
         self.task_ids.append(task_id)
 
-        _insert_task(
-            task_id,
-            owner["id"],
-            "delivery",
-            "Помощь от профи",
-            "active",
-            {
-                "pickup_address": "Москва, Тверская 1",
-                "dropoff_address": "Москва, Арбат 10",
-                "notes": "Маршрутные точки уже сохранены отдельно",
-            },
-        )
+        with patch("app.main.geocode_address", return_value=None):
+            _insert_task(
+                task_id,
+                owner["id"],
+                "delivery",
+                "Помощь от профи",
+                "active",
+                {
+                    "pickup_address": "Москва, Тверская 1",
+                    "dropoff_address": "Москва, Арбат 10",
+                    "notes": "Маршрутные точки уже сохранены отдельно",
+                },
+            )
         execute(
             """
             UPDATE tasks
@@ -488,6 +490,84 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["end_address"], "Москва, Арбат 10")
         self.assertAlmostEqual(payload["start"]["lat"], 55.7558, places=4)
         self.assertAlmostEqual(payload["end"]["lon"], 37.5931, places=4)
+
+    def test_current_route_repairs_address_only_assigned_task_with_geocoding(self) -> None:
+        owner = self._create_user("route-owner")
+        performer = self._create_user("route-performer")
+        owner_token = self._login_user(owner)
+        performer_token = self._login_user(performer)
+        task_id = str(uuid.uuid4())
+        self.task_ids.append(task_id)
+        source_address = f"Тестовый проезд {uuid.uuid4().hex}"
+        destination_address = f"Финишная улица {uuid.uuid4().hex}"
+
+        with patch("app.main.geocode_address", return_value=None):
+            _insert_task(
+                task_id,
+                owner["id"],
+                "delivery",
+                "Доставить пакет",
+                "active",
+                {
+                    "pickup_address": source_address,
+                    "dropoff_address": destination_address,
+                    "notes": "Клиент отправил только адреса, без координат",
+                },
+            )
+
+        self.assertEqual(
+            fetch_one("SELECT COUNT(*) FROM task_route_points WHERE task_id = %s::uuid", (task_id,))[0],
+            0,
+        )
+
+        offer_response = self.client.post(
+            f"/announcements/{task_id}/offers",
+            headers={"Authorization": f"Bearer {performer_token}"},
+            json={"message": "Готов выполнить", "proposed_price": 1000},
+        )
+        self.assertEqual(offer_response.status_code, 201, offer_response.text)
+        offer_id = offer_response.json()["id"]
+
+        accept_response = self.client.post(
+            f"/announcements/{task_id}/offers/{offer_id}/accept",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(accept_response.status_code, 200, accept_response.text)
+        self.thread_ids.append(accept_response.json()["thread_id"])
+
+        with patch("app.routes_module.service.ROUTE_EXTERNAL_GEOCODE_ENABLED", True), patch(
+            "app.routes_module.service.geocode_address",
+            side_effect=[(55.701, 37.601), (55.702, 37.602)],
+        ):
+            route_context = self.client.get(
+                "/routes/me/current/context",
+                headers={"Authorization": f"Bearer {performer_token}"},
+            )
+
+        self.assertEqual(route_context.status_code, 200, route_context.text)
+        payload = route_context.json()
+        self.assertEqual(payload["entity_id"], task_id)
+        self.assertEqual(payload["start_address"], source_address)
+        self.assertEqual(payload["end_address"], destination_address)
+        self.assertAlmostEqual(payload["start"]["lat"], 55.701, places=4)
+        self.assertAlmostEqual(payload["end"]["lon"], 37.602, places=4)
+
+        repaired = fetch_one(
+            """
+            SELECT t.extra, COUNT(trp.id)
+            FROM tasks t
+            LEFT JOIN task_route_points trp
+              ON trp.task_id = t.id
+            WHERE t.id = %s::uuid
+            GROUP BY t.extra
+            """,
+            (task_id,),
+        )
+        self.assertIsNotNone(repaired)
+        repaired_data = repaired[0] if isinstance(repaired[0], dict) else json.loads(repaired[0])
+        self.assertEqual(repaired[1], 2)
+        self.assertEqual(repaired_data["pickup_point"], {"lat": 55.701, "lon": 37.601})
+        self.assertEqual(repaired_data["dropoff_point"], {"lat": 55.702, "lon": 37.602})
 
     def test_accept_offer_refuses_assignment_where_customer_is_performer(self) -> None:
         owner = self._create_user("self-assignment-owner")
