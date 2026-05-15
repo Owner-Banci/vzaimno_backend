@@ -694,7 +694,11 @@ def ensure_user_assignment_threads(user_id: str) -> None:
             ta.customer_id::text,
             ta.performer_id::text
         FROM task_assignments ta
+        JOIN tasks t
+          ON t.id = ta.task_id
+         AND t.customer_id = ta.customer_id
         WHERE ta.assignment_status IN ('assigned', 'in_progress')
+          AND ta.performer_id <> ta.customer_id
           AND (
                 ta.customer_id::text = %s
                 OR ta.performer_id::text = %s

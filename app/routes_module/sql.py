@@ -26,6 +26,8 @@ LEFT JOIN LATERAL (
     SELECT performer_id, assignment_status, execution_stage, route_visibility
     FROM task_assignments
     WHERE task_id::text = t.id::text
+      AND customer_id = t.customer_id
+      AND performer_id <> t.customer_id
       AND assignment_status IN ('assigned', 'in_progress')
     ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
     LIMIT 1
@@ -176,7 +178,9 @@ FROM (
     FROM task_assignments ta
     JOIN tasks t
       ON t.id::text = ta.task_id::text
+     AND t.customer_id = ta.customer_id
     WHERE ta.performer_id::text = %s
+      AND ta.performer_id <> ta.customer_id
       AND ta.assignment_status IN ('assigned', 'in_progress')
       AND COALESCE(ta.route_visibility::text, 'performer_only') <> 'hidden'
       AND t.deleted_at IS NULL
@@ -191,13 +195,46 @@ FROM (
     JOIN task_assignments ta
       ON ta.task_id = t.id
      AND ta.customer_id::text = %s
+     AND ta.customer_id = t.customer_id
      AND ta.assignment_status IN ('assigned', 'in_progress')
     WHERE t.customer_id::text = %s
+      AND ta.performer_id <> t.customer_id
       AND t.deleted_at IS NULL
       AND t.status IN ('agreed', 'in_progress')
       AND t.moderation_status = 'published'
 ) candidate
 ORDER BY candidate.priority ASC, candidate.sort_at DESC NULLS LAST
+LIMIT 1
+"""
+
+FIND_CURRENT_PERFORMER_ROUTE_TASK_SQL = """
+SELECT ta.task_id::text
+FROM task_assignments ta
+JOIN tasks t
+  ON t.id = ta.task_id
+ AND t.customer_id = ta.customer_id
+WHERE ta.performer_id::text = %s
+  AND ta.performer_id <> ta.customer_id
+  AND ta.assignment_status IN ('assigned', 'in_progress')
+  AND COALESCE(ta.route_visibility::text, 'performer_only') <> 'hidden'
+  AND t.deleted_at IS NULL
+ORDER BY COALESCE(ta.updated_at, ta.created_at) DESC NULLS LAST
+LIMIT 1
+"""
+
+FIND_CURRENT_CUSTOMER_ROUTE_TASK_SQL = """
+SELECT t.id::text
+FROM tasks t
+JOIN task_assignments ta
+  ON ta.task_id = t.id
+ AND ta.customer_id = t.customer_id
+ AND ta.assignment_status IN ('assigned', 'in_progress')
+WHERE t.customer_id::text = %s
+  AND ta.performer_id <> t.customer_id
+  AND t.deleted_at IS NULL
+  AND t.status IN ('agreed', 'in_progress')
+  AND t.moderation_status = 'published'
+ORDER BY COALESCE(ta.updated_at, t.updated_at, t.created_at) DESC NULLS LAST
 LIMIT 1
 """
 

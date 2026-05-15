@@ -363,7 +363,9 @@ CREATE TABLE tasks (
       AND (reward_amount IS NULL OR reward_amount >= 0)
     ),
   CONSTRAINT chk_tasks_budget_range_order
-    CHECK (budget_min IS NULL OR budget_max IS NULL OR budget_min <= budget_max)
+    CHECK (budget_min IS NULL OR budget_max IS NULL OR budget_min <= budget_max),
+  CONSTRAINT ux_tasks_id_customer_id
+    UNIQUE (id, customer_id)
 );
 CREATE INDEX idx_tasks_customer_id        ON tasks (customer_id);
 CREATE INDEX idx_tasks_deleted_status     ON tasks (deleted_at, status, moderation_status);
@@ -451,7 +453,13 @@ CREATE TABLE task_assignments (
     CHECK (execution_stage IN ('accepted', 'en_route', 'on_site', 'in_progress',
                                'handoff', 'completed', 'cancelled')),
   CONSTRAINT chk_task_assignments_route_visibility
-    CHECK (route_visibility IN ('hidden', 'performer_only', 'customer_visible'))
+    CHECK (route_visibility IN ('hidden', 'performer_only', 'customer_visible')),
+  CONSTRAINT chk_task_assignments_distinct_parties
+    CHECK (customer_id <> performer_id),
+  CONSTRAINT fk_task_assignments_task_customer
+    FOREIGN KEY (task_id, customer_id)
+    REFERENCES tasks(id, customer_id)
+    ON DELETE CASCADE
 );
 CREATE UNIQUE INDEX ux_task_assignments_offer_id
   ON task_assignments (offer_id);

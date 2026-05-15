@@ -1133,12 +1133,16 @@ def _review_context_for_user(task_id: str, user_id: str) -> Dict[str, Any]:
             {performer_name_sql} AS performer_name,
             a.title
         FROM task_assignments ta
+        JOIN tasks t
+          ON t.id = ta.task_id
+         AND t.customer_id = ta.customer_id
         LEFT JOIN announcements a ON a.id::text = ta.task_id::text
         LEFT JOIN user_profiles cup ON cup.user_id = ta.customer_id
         LEFT JOIN users cu ON cu.id = ta.customer_id
         LEFT JOIN user_profiles pup ON pup.user_id = ta.performer_id
         LEFT JOIN users pu ON pu.id = ta.performer_id
         WHERE ta.task_id::text = %s
+          AND ta.performer_id <> ta.customer_id
         ORDER BY
             CASE ta.assignment_status
                 WHEN 'completed' THEN 0
@@ -1498,6 +1502,8 @@ TASK_ANNOUNCEMENT_SELECT = """
       ON c.id = t.category_id
     LEFT JOIN task_assignments ta
       ON ta.task_id = t.id
+     AND ta.customer_id = t.customer_id
+     AND ta.performer_id <> t.customer_id
      AND ta.assignment_status IN ('assigned', 'in_progress')
 """
 
@@ -2779,11 +2785,21 @@ def _update_task_content(
 def _active_assignment_for_task(task_id: str):
     return fetch_one(
         """
-        SELECT id::text, offer_id::text, performer_id::text, assignment_status, execution_stage, chat_thread_id::text
-        FROM task_assignments
-        WHERE task_id::text = %s
-          AND assignment_status IN ('assigned', 'in_progress')
-        ORDER BY created_at DESC
+        SELECT
+            ta.id::text,
+            ta.offer_id::text,
+            ta.performer_id::text,
+            ta.assignment_status,
+            ta.execution_stage,
+            ta.chat_thread_id::text
+        FROM task_assignments ta
+        JOIN tasks t
+          ON t.id = ta.task_id
+         AND t.customer_id = ta.customer_id
+        WHERE ta.task_id::text = %s
+          AND ta.performer_id <> ta.customer_id
+          AND ta.assignment_status IN ('assigned', 'in_progress')
+        ORDER BY ta.created_at DESC
         LIMIT 1
         """,
         (task_id,),
@@ -2793,6 +2809,20 @@ def _active_assignment_for_task(task_id: str):
 def _create_or_update_assignment(task_id: str, offer_id: str, customer_id: str, performer_id: str) -> str:
     if str(customer_id) == str(performer_id):
         raise HTTPException(status_code=409, detail="Исполнитель не может совпадать с заказчиком")
+
+    task_row = fetch_one(
+        """
+        SELECT customer_id::text
+        FROM tasks
+        WHERE id::text = %s
+        LIMIT 1
+        """,
+        (task_id,),
+    )
+    if not task_row:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if str(task_row[0]) != str(customer_id):
+        raise HTTPException(status_code=409, detail="Заказчик назначения не совпадает с автором задания")
 
     offer_row = fetch_one(
         """
@@ -4319,10 +4349,14 @@ def _user_can_fetch_announcement(ann_id: str, user_id: str, owner_id: str) -> bo
     assignment = fetch_one(
         """
         SELECT 1
-        FROM task_assignments
-        WHERE task_id::text = %s
-          AND performer_id::text = %s
-          AND assignment_status IN ('assigned', 'in_progress', 'completed')
+        FROM task_assignments ta
+        JOIN tasks t
+          ON t.id = ta.task_id
+         AND t.customer_id = ta.customer_id
+        WHERE ta.task_id::text = %s
+          AND ta.performer_id::text = %s
+          AND ta.performer_id <> ta.customer_id
+          AND ta.assignment_status IN ('assigned', 'in_progress', 'completed')
         LIMIT 1
         """,
         (ann_id, user_id),
@@ -4359,10 +4393,14 @@ def _user_can_fetch_announcement_upload(ann_id: str, user_id: str, owner_id: str
     assignment = fetch_one(
         """
         SELECT 1
-        FROM task_assignments
-        WHERE task_id::text = %s
-          AND performer_id::text = %s
-          AND assignment_status IN ('assigned', 'in_progress', 'completed')
+        FROM task_assignments ta
+        JOIN tasks t
+          ON t.id = ta.task_id
+         AND t.customer_id = ta.customer_id
+        WHERE ta.task_id::text = %s
+          AND ta.performer_id::text = %s
+          AND ta.performer_id <> ta.customer_id
+          AND ta.assignment_status IN ('assigned', 'in_progress', 'completed')
         LIMIT 1
         """,
         (ann_id, user_id),

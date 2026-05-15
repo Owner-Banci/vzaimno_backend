@@ -359,6 +359,40 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         self.assertEqual(owner_route_context.json()["viewer_role"], "customer")
         self.assertFalse(owner_route_context.json()["can_update_execution"])
 
+        owner_performer_tab = self.client.get(
+            "/routes/me/current/context",
+            headers={"Authorization": f"Bearer {owner_token}"},
+            params={"role": "performer"},
+        )
+        self.assertEqual(owner_performer_tab.status_code, 404, owner_performer_tab.text)
+
+        owner_customer_tab = self.client.get(
+            "/routes/me/current/context",
+            headers={"Authorization": f"Bearer {owner_token}"},
+            params={"role": "customer"},
+        )
+        self.assertEqual(owner_customer_tab.status_code, 200, owner_customer_tab.text)
+        self.assertEqual(owner_customer_tab.json()["entity_id"], task_id)
+        self.assertEqual(owner_customer_tab.json()["viewer_role"], "customer")
+        self.assertFalse(owner_customer_tab.json()["can_update_execution"])
+
+        performer_customer_tab = self.client.get(
+            "/routes/me/current/context",
+            headers={"Authorization": f"Bearer {performer_token}"},
+            params={"role": "customer"},
+        )
+        self.assertEqual(performer_customer_tab.status_code, 404, performer_customer_tab.text)
+
+        performer_performer_tab = self.client.get(
+            "/routes/me/current/context",
+            headers={"Authorization": f"Bearer {performer_token}"},
+            params={"role": "performer"},
+        )
+        self.assertEqual(performer_performer_tab.status_code, 200, performer_performer_tab.text)
+        self.assertEqual(performer_performer_tab.json()["entity_id"], task_id)
+        self.assertEqual(performer_performer_tab.json()["viewer_role"], "performer")
+        self.assertTrue(performer_performer_tab.json()["can_update_execution"])
+
         owner_stage_response = self.client.post(
             f"/announcements/{task_id}/execution-stage",
             headers={"Authorization": f"Bearer {owner_token}"},

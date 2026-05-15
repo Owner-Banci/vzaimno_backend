@@ -15,6 +15,8 @@ from app.task_compat import ensure_task_payload
 
 from .schemas import CoordinateOut, RouteContextOut, RouteDetailsOut, RouteTaskByPathOut
 from .sql import (
+    FIND_CURRENT_CUSTOMER_ROUTE_TASK_SQL,
+    FIND_CURRENT_PERFORMER_ROUTE_TASK_SQL,
     FIND_CURRENT_ROUTE_TASK_SQL,
     FIND_KNOWN_ROUTE_POINT_BY_ADDRESS_SQL,
     FIND_TASK_ROUTE_POINTS_SQL,
@@ -39,8 +41,9 @@ def build_route_for_current_user(
     *,
     radius_m: int = DEFAULT_ROUTE_RADIUS_METERS,
     limit: int = DEFAULT_ROUTE_LIMIT,
+    viewer_role: str | None = None,
 ) -> RouteDetailsOut:
-    announcement_id = _resolve_current_announcement_id(user_id)
+    announcement_id = _resolve_current_announcement_id(user_id, viewer_role=viewer_role)
     return build_route_for_announcement(
         announcement_id=announcement_id,
         user_id=user_id,
@@ -82,8 +85,9 @@ def build_route_context_for_current_user(
     user_id: str,
     *,
     radius_m: int = DEFAULT_ROUTE_RADIUS_METERS,
+    viewer_role: str | None = None,
 ) -> RouteContextOut:
-    announcement_id = _resolve_current_announcement_id(user_id)
+    announcement_id = _resolve_current_announcement_id(user_id, viewer_role=viewer_role)
     return build_route_context_for_announcement(
         announcement_id=announcement_id,
         user_id=user_id,
@@ -181,8 +185,14 @@ def build_route_from_polyline(
     )
 
 
-def _resolve_current_announcement_id(user_id: str) -> str:
-    row = fetch_one(FIND_CURRENT_ROUTE_TASK_SQL, (user_id, user_id, user_id))
+def _resolve_current_announcement_id(user_id: str, *, viewer_role: str | None = None) -> str:
+    normalized_role = (viewer_role or "").strip().lower()
+    if normalized_role == "performer":
+        row = fetch_one(FIND_CURRENT_PERFORMER_ROUTE_TASK_SQL, (user_id,))
+    elif normalized_role == "customer":
+        row = fetch_one(FIND_CURRENT_CUSTOMER_ROUTE_TASK_SQL, (user_id,))
+    else:
+        row = fetch_one(FIND_CURRENT_ROUTE_TASK_SQL, (user_id, user_id, user_id))
     if not row:
         raise HTTPException(status_code=404, detail="Для вас пока нет активного маршрута")
     return str(row[0])

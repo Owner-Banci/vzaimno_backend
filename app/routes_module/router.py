@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
 from app.auth_context import get_current_user
 from app.schemas import UserOut
@@ -17,6 +17,25 @@ from .service import (
 )
 
 router = APIRouter(tags=["routes"])
+
+_ROUTE_ROLE_QUERY_NAMES = ("role", "viewer_role", "side", "tab")
+_PERFORMER_ROLE_ALIASES = {"performer", "executor", "worker", "assignee", "исполнитель"}
+_CUSTOMER_ROLE_ALIASES = {"customer", "owner", "client", "observer", "watcher", "заказчик"}
+
+
+def _current_route_viewer_role(request: Request) -> str | None:
+    for name in _ROUTE_ROLE_QUERY_NAMES:
+        raw_value = request.query_params.get(name)
+        if raw_value is None:
+            continue
+        normalized = raw_value.strip().lower()
+        if normalized in _PERFORMER_ROLE_ALIASES:
+            return "performer"
+        if normalized in _CUSTOMER_ROLE_ALIASES:
+            return "customer"
+        if normalized in {"", "any", "all", "auto", "current"}:
+            return None
+    return None
 
 
 @router.get("/announcements/{ann_id}/route", response_model=RouteDetailsOut)
@@ -38,6 +57,7 @@ def announcement_route(
 
 @router.get("/routes/me/current", response_model=RouteDetailsOut)
 def my_current_route(
+    request: Request,
     radius_m: int = DEFAULT_ROUTE_RADIUS_METERS,
     limit: int = DEFAULT_ROUTE_LIMIT,
     user: UserOut = Depends(get_current_user),
@@ -48,6 +68,7 @@ def my_current_route(
         user_id=user.id,
         radius_m=normalized_radius,
         limit=normalized_limit,
+        viewer_role=_current_route_viewer_role(request),
     )
 
 
@@ -67,6 +88,7 @@ def announcement_route_context(
 
 @router.get("/routes/me/current/context", response_model=RouteContextOut)
 def my_current_route_context(
+    request: Request,
     radius_m: int = DEFAULT_ROUTE_RADIUS_METERS,
     user: UserOut = Depends(get_current_user),
 ) -> RouteContextOut:
@@ -74,6 +96,7 @@ def my_current_route_context(
     return build_route_context_for_current_user(
         user_id=user.id,
         radius_m=normalized_radius,
+        viewer_role=_current_route_viewer_role(request),
     )
 
 
