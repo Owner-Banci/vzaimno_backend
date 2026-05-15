@@ -56,6 +56,34 @@ class RouteTaskByPathOut(BaseModel):
     status: Optional[str] = None
 
 
+class RouteTaskSummaryOut(BaseModel):
+    task_id: str
+    title: str
+    category: Optional[str] = None
+    address_text: Optional[str] = None
+    price_text: Optional[str] = None
+    budget: Optional[int] = None
+    budget_min: Optional[int] = None
+    budget_max: Optional[int] = None
+    assignment_status: Optional[str] = None
+    execution_stage: Optional[str] = None
+    customer_user_id: str
+    performer_user_id: Optional[str] = None
+    viewer_role: str
+    can_update_execution: bool = False
+
+
+class TaskMyRoleOut(BaseModel):
+    task_id: str
+    is_customer: bool
+    is_performer: bool
+    viewer_role: Optional[str] = None
+    customer_user_id: str
+    performer_user_id: Optional[str] = None
+    can_view_route: bool = False
+    can_update_execution: bool = False
+
+
 class RouteDetailsOut(BaseModel):
     entity_id: str
     start_address: str

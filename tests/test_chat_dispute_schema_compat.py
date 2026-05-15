@@ -393,6 +393,83 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         self.assertEqual(performer_performer_tab.json()["viewer_role"], "performer")
         self.assertTrue(performer_performer_tab.json()["can_update_execution"])
 
+        owner_performer_tasks = self.client.get(
+            "/routes/me/performer/tasks",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(owner_performer_tasks.status_code, 200, owner_performer_tasks.text)
+        self.assertEqual(owner_performer_tasks.json(), [])
+
+        owner_customer_tasks = self.client.get(
+            "/routes/me/customer/tasks",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(owner_customer_tasks.status_code, 200, owner_customer_tasks.text)
+        owner_customer_payload = owner_customer_tasks.json()
+        self.assertEqual([item["task_id"] for item in owner_customer_payload], [task_id])
+        self.assertEqual(owner_customer_payload[0]["viewer_role"], "customer")
+        self.assertFalse(owner_customer_payload[0]["can_update_execution"])
+        self.assertEqual(owner_customer_payload[0]["customer_user_id"], owner["id"])
+        self.assertEqual(owner_customer_payload[0]["performer_user_id"], performer["id"])
+        self.assertNotIn("polyline", owner_customer_payload[0])
+        self.assertNotIn("tasks_by_route", owner_customer_payload[0])
+
+        performer_performer_tasks = self.client.get(
+            "/routes/me/performer/tasks",
+            headers={"Authorization": f"Bearer {performer_token}"},
+        )
+        self.assertEqual(performer_performer_tasks.status_code, 200, performer_performer_tasks.text)
+        performer_performer_payload = performer_performer_tasks.json()
+        self.assertEqual([item["task_id"] for item in performer_performer_payload], [task_id])
+        self.assertEqual(performer_performer_payload[0]["viewer_role"], "performer")
+        self.assertTrue(performer_performer_payload[0]["can_update_execution"])
+        self.assertEqual(performer_performer_payload[0]["customer_user_id"], owner["id"])
+        self.assertEqual(performer_performer_payload[0]["performer_user_id"], performer["id"])
+
+        performer_customer_tasks = self.client.get(
+            "/routes/me/customer/tasks",
+            headers={"Authorization": f"Bearer {performer_token}"},
+        )
+        self.assertEqual(performer_customer_tasks.status_code, 200, performer_customer_tasks.text)
+        self.assertEqual(performer_customer_tasks.json(), [])
+
+        owner_role = self.client.get(
+            f"/tasks/{task_id}/my-role",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(owner_role.status_code, 200, owner_role.text)
+        self.assertEqual(owner_role.json()["task_id"], task_id)
+        self.assertTrue(owner_role.json()["is_customer"])
+        self.assertFalse(owner_role.json()["is_performer"])
+        self.assertEqual(owner_role.json()["viewer_role"], "customer")
+        self.assertFalse(owner_role.json()["can_update_execution"])
+
+        performer_role = self.client.get(
+            f"/tasks/{task_id}/my-role",
+            headers={"Authorization": f"Bearer {performer_token}"},
+        )
+        self.assertEqual(performer_role.status_code, 200, performer_role.text)
+        self.assertFalse(performer_role.json()["is_customer"])
+        self.assertTrue(performer_role.json()["is_performer"])
+        self.assertEqual(performer_role.json()["viewer_role"], "performer")
+        self.assertTrue(performer_role.json()["can_update_execution"])
+
+        owner_explicit_route = self.client.get(
+            f"/announcements/{task_id}/route/context",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(owner_explicit_route.status_code, 200, owner_explicit_route.text)
+        self.assertEqual(owner_explicit_route.json()["viewer_role"], "customer")
+        self.assertFalse(owner_explicit_route.json()["can_update_execution"])
+
+        performer_explicit_route = self.client.get(
+            f"/announcements/{task_id}/route/context",
+            headers={"Authorization": f"Bearer {performer_token}"},
+        )
+        self.assertEqual(performer_explicit_route.status_code, 200, performer_explicit_route.text)
+        self.assertEqual(performer_explicit_route.json()["viewer_role"], "performer")
+        self.assertTrue(performer_explicit_route.json()["can_update_execution"])
+
         owner_stage_response = self.client.post(
             f"/announcements/{task_id}/execution-stage",
             headers={"Authorization": f"Bearer {owner_token}"},

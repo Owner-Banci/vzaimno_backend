@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Request
 from app.auth_context import get_current_user
 from app.schemas import UserOut
 
-from .schemas import RouteBuildIn, RouteContextOut, RouteDetailsOut
+from .schemas import RouteBuildIn, RouteContextOut, RouteDetailsOut, RouteTaskSummaryOut, TaskMyRoleOut
 from .service import (
     DEFAULT_ROUTE_LIMIT,
     DEFAULT_ROUTE_RADIUS_METERS,
@@ -14,6 +14,9 @@ from .service import (
     build_route_from_polyline,
     build_route_context_for_announcement,
     build_route_context_for_current_user,
+    get_task_my_role,
+    list_customer_route_tasks,
+    list_performer_route_tasks,
 )
 
 router = APIRouter(tags=["routes"])
@@ -55,7 +58,29 @@ def announcement_route(
     )
 
 
-@router.get("/routes/me/current", response_model=RouteDetailsOut)
+@router.get("/routes/me/performer/tasks", response_model=list[RouteTaskSummaryOut])
+def my_performer_route_tasks(
+    user: UserOut = Depends(get_current_user),
+) -> list[RouteTaskSummaryOut]:
+    return list_performer_route_tasks(user.id)
+
+
+@router.get("/routes/me/customer/tasks", response_model=list[RouteTaskSummaryOut])
+def my_customer_route_tasks(
+    user: UserOut = Depends(get_current_user),
+) -> list[RouteTaskSummaryOut]:
+    return list_customer_route_tasks(user.id)
+
+
+@router.get("/tasks/{task_id}/my-role", response_model=TaskMyRoleOut)
+def task_my_role(
+    task_id: str,
+    user: UserOut = Depends(get_current_user),
+) -> TaskMyRoleOut:
+    return get_task_my_role(task_id=task_id, user_id=user.id)
+
+
+@router.get("/routes/me/current", response_model=RouteDetailsOut, deprecated=True)
 def my_current_route(
     request: Request,
     radius_m: int = DEFAULT_ROUTE_RADIUS_METERS,
@@ -86,7 +111,7 @@ def announcement_route_context(
     )
 
 
-@router.get("/routes/me/current/context", response_model=RouteContextOut)
+@router.get("/routes/me/current/context", response_model=RouteContextOut, deprecated=True)
 def my_current_route_context(
     request: Request,
     radius_m: int = DEFAULT_ROUTE_RADIUS_METERS,

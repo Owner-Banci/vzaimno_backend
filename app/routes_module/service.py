@@ -13,14 +13,17 @@ from app.geocoding import geocode_address, lookup_local_address_point
 from app.storage import default_presigned_expires_seconds, get_storage
 from app.task_compat import ensure_task_payload
 
-from .schemas import CoordinateOut, RouteContextOut, RouteDetailsOut, RouteTaskByPathOut
+from .schemas import CoordinateOut, RouteContextOut, RouteDetailsOut, RouteTaskByPathOut, RouteTaskSummaryOut, TaskMyRoleOut
 from .sql import (
     FIND_CURRENT_CUSTOMER_ROUTE_TASK_SQL,
     FIND_CURRENT_PERFORMER_ROUTE_TASK_SQL,
     FIND_CURRENT_ROUTE_TASK_SQL,
     FIND_KNOWN_ROUTE_POINT_BY_ADDRESS_SQL,
+    FIND_TASK_MY_ROLE_SQL,
     FIND_TASK_ROUTE_POINTS_SQL,
     FIND_TASK_ROUTE_CONTEXT_SQL,
+    LIST_CUSTOMER_ROUTE_TASKS_SQL,
+    LIST_PERFORMER_ROUTE_TASKS_SQL,
     NEARBY_TASKS_BY_ROUTE_SQL,
 )
 
@@ -92,6 +95,62 @@ def build_route_context_for_current_user(
         announcement_id=announcement_id,
         user_id=user_id,
         radius_m=radius_m,
+    )
+
+
+def list_performer_route_tasks(user_id: str) -> list[RouteTaskSummaryOut]:
+    rows = fetch_all(LIST_PERFORMER_ROUTE_TASKS_SQL, (user_id,))
+    return [
+        _route_task_summary_from_row(row, viewer_role="performer", can_update_execution=True)
+        for row in rows
+    ]
+
+
+def list_customer_route_tasks(user_id: str) -> list[RouteTaskSummaryOut]:
+    rows = fetch_all(LIST_CUSTOMER_ROUTE_TASKS_SQL, (user_id,))
+    return [
+        _route_task_summary_from_row(row, viewer_role="customer", can_update_execution=False)
+        for row in rows
+    ]
+
+
+def get_task_my_role(*, task_id: str, user_id: str) -> TaskMyRoleOut:
+    row = fetch_one(FIND_TASK_MY_ROLE_SQL, (task_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="Задание не найдено")
+
+    resolved_task_id = str(row[0])
+    customer_user_id = str(row[1])
+    task_status = str(row[2] or "")
+    moderation_status = str(row[3] or "")
+    performer_user_id = str(row[5]) if row[5] else None
+    assignment_status = str(row[6] or "")
+    route_visibility = str(row[8] or "")
+
+    is_customer = customer_user_id == user_id
+    is_performer = performer_user_id == user_id
+    is_participant = is_customer or is_performer
+    is_public = moderation_status == "published" and task_status in {"active", "published", "in_responses"}
+    if not is_participant and not is_public:
+        raise HTTPException(status_code=403, detail="У вас нет доступа к этому заданию")
+
+    viewer_role = "customer" if is_customer else ("performer" if is_performer else None)
+    can_view_route = (
+        is_participant
+        and assignment_status in {"assigned", "in_progress"}
+        and (is_customer or route_visibility != "hidden")
+    )
+    can_update_execution = bool(is_performer and assignment_status in {"assigned", "in_progress"})
+
+    return TaskMyRoleOut(
+        task_id=resolved_task_id,
+        is_customer=is_customer,
+        is_performer=is_performer,
+        viewer_role=viewer_role,
+        customer_user_id=customer_user_id,
+        performer_user_id=performer_user_id,
+        can_view_route=can_view_route,
+        can_update_execution=can_update_execution,
     )
 
 
@@ -977,6 +1036,58 @@ def _estimate_duration_seconds(distance_meters: int, travel_mode: str) -> int:
     }
     speed = speeds.get(travel_mode, 6.0)
     return max(1, int(round(distance_meters / max(0.1, speed))))
+
+
+def _route_task_summary_from_row(
+    row: Any,
+    *,
+    viewer_role: str,
+    can_update_execution: bool,
+) -> RouteTaskSummaryOut:
+    data = _coerce_data(row[4])
+    budget = _to_int(row[8]) or _to_int(row[5])
+    budget_min = _to_int(row[6])
+    budget_max = _to_int(row[7])
+    price_text = _extract_price_text(data) or _format_summary_price(
+        budget=budget,
+        budget_min=budget_min,
+        budget_max=budget_max,
+    )
+    return RouteTaskSummaryOut(
+        task_id=str(row[0]),
+        title=str(row[1] or "Без названия"),
+        category=_normalize_address(row[2]),
+        address_text=_normalize_address(row[3]) or _extract_address_text(data, str(row[2] or "")),
+        price_text=price_text,
+        budget=budget,
+        budget_min=budget_min,
+        budget_max=budget_max,
+        assignment_status=str(row[9]) if row[9] else None,
+        execution_stage=str(row[10]) if row[10] else None,
+        customer_user_id=str(row[11]),
+        performer_user_id=str(row[12]) if row[12] else None,
+        viewer_role=viewer_role,
+        can_update_execution=can_update_execution,
+    )
+
+
+def _format_summary_price(
+    *,
+    budget: int | None,
+    budget_min: int | None,
+    budget_max: int | None,
+) -> str | None:
+    if budget_min is not None and budget_max is not None:
+        if budget_min == budget_max:
+            return _format_price(budget_min)
+        return f"{_format_price_raw(budget_min)}–{_format_price_raw(budget_max)} ₽"
+    if budget_min is not None:
+        return f"от {_format_price_raw(budget_min)} ₽"
+    if budget_max is not None:
+        return f"до {_format_price_raw(budget_max)} ₽"
+    if budget is not None:
+        return _format_price(budget)
+    return None
 
 
 def _fetch_tasks_by_route(

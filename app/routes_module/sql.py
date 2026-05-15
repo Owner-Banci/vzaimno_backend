@@ -238,6 +238,112 @@ ORDER BY COALESCE(ta.updated_at, t.updated_at, t.created_at) DESC NULLS LAST
 LIMIT 1
 """
 
+LIST_PERFORMER_ROUTE_TASKS_SQL = """
+SELECT
+    t.id::text,
+    t.title,
+    COALESCE(c.slug, COALESCE(t.extra->>'category', t.extra->>'main_group', 'help')) AS category,
+    COALESCE(t.address_text, t.extra->>'address_text') AS address_text,
+    t.extra,
+    t.reward_amount,
+    t.budget_min,
+    t.budget_max,
+    t.quick_offer_price,
+    ta.assignment_status::text,
+    ta.execution_stage::text,
+    t.customer_id::text,
+    ta.performer_id::text
+FROM task_assignments ta
+JOIN tasks t
+  ON t.id = ta.task_id
+ AND ta.customer_id = t.customer_id
+LEFT JOIN categories c
+  ON c.id = t.category_id
+WHERE ta.performer_id::text = %s
+  AND ta.customer_id = t.customer_id
+  AND ta.performer_id <> ta.customer_id
+  AND ta.assignment_status IN ('assigned', 'in_progress')
+  AND t.deleted_at IS NULL
+ORDER BY COALESCE(ta.updated_at, ta.created_at, t.updated_at, t.created_at) DESC NULLS LAST
+"""
+
+LIST_CUSTOMER_ROUTE_TASKS_SQL = """
+SELECT
+    t.id::text,
+    t.title,
+    COALESCE(c.slug, COALESCE(t.extra->>'category', t.extra->>'main_group', 'help')) AS category,
+    COALESCE(t.address_text, t.extra->>'address_text') AS address_text,
+    t.extra,
+    t.reward_amount,
+    t.budget_min,
+    t.budget_max,
+    t.quick_offer_price,
+    ta.assignment_status::text,
+    ta.execution_stage::text,
+    t.customer_id::text,
+    ta.performer_id::text
+FROM tasks t
+LEFT JOIN categories c
+  ON c.id = t.category_id
+LEFT JOIN LATERAL (
+    SELECT
+        id,
+        performer_id,
+        assignment_status,
+        execution_stage,
+        updated_at,
+        created_at
+    FROM task_assignments ta
+    WHERE ta.task_id = t.id
+      AND ta.customer_id = t.customer_id
+      AND ta.performer_id <> t.customer_id
+      AND ta.assignment_status IN ('assigned', 'in_progress')
+    ORDER BY COALESCE(ta.updated_at, ta.created_at) DESC NULLS LAST
+    LIMIT 1
+) ta ON TRUE
+WHERE t.customer_id::text = %s
+  AND t.deleted_at IS NULL
+  AND t.moderation_status = 'published'
+  AND (
+      ta.id IS NOT NULL
+      OR t.status IN ('active', 'published', 'in_responses')
+  )
+ORDER BY COALESCE(ta.updated_at, ta.created_at, t.updated_at, t.created_at) DESC NULLS LAST
+"""
+
+FIND_TASK_MY_ROLE_SQL = """
+SELECT
+    t.id::text,
+    t.customer_id::text,
+    t.status::text,
+    t.moderation_status::text,
+    t.deleted_at,
+    ta.performer_id::text,
+    ta.assignment_status::text,
+    ta.execution_stage::text,
+    COALESCE(ta.route_visibility::text, 'performer_only')
+FROM tasks t
+LEFT JOIN LATERAL (
+    SELECT performer_id, assignment_status, execution_stage, route_visibility, updated_at, created_at
+    FROM task_assignments ta
+    WHERE ta.task_id = t.id
+      AND ta.customer_id = t.customer_id
+      AND ta.performer_id <> t.customer_id
+      AND ta.assignment_status IN ('assigned', 'in_progress', 'completed')
+    ORDER BY
+      CASE
+        WHEN ta.assignment_status IN ('assigned', 'in_progress') THEN 0
+        WHEN ta.assignment_status = 'completed' THEN 1
+        ELSE 2
+      END,
+      COALESCE(ta.updated_at, ta.created_at) DESC NULLS LAST
+    LIMIT 1
+) ta ON TRUE
+WHERE t.id::text = %s
+  AND t.deleted_at IS NULL
+LIMIT 1
+"""
+
 NEARBY_TASKS_BY_ROUTE_SQL = """
 WITH route AS (
     SELECT ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)::geography AS geog
