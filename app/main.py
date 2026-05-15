@@ -64,6 +64,8 @@ from app.schema_compat import table_has_column
 from app.security import decode_user_access_token
 from app.schemas import (
     AcceptOfferOut,
+    AccountDataDeletionIn,
+    AccountDataDeletionOut,
     AnnouncementOut,
     AppealIn,
     ChatMessageIn,
@@ -150,6 +152,7 @@ app.include_router(routes_router)
 
 LANDING_DIR = Path(__file__).resolve().parent / "web" / "landing"
 LANDING_INDEX_PATH = LANDING_DIR / "index.html"
+ACCOUNT_DELETION_PATH = LANDING_DIR / "account-deletion.html"
 LANDING_STYLES_PATH = LANDING_DIR / "styles.css"
 LANDING_SCRIPT_PATH = LANDING_DIR / "script.js"
 
@@ -160,6 +163,11 @@ if (LANDING_DIR / "assets").exists():
 @app.get("/", include_in_schema=False)
 def landing_page() -> FileResponse:
     return FileResponse(LANDING_INDEX_PATH)
+
+
+@app.get("/account-deletion", include_in_schema=False)
+def account_deletion_page() -> FileResponse:
+    return FileResponse(ACCOUNT_DELETION_PATH)
 
 
 @app.get("/styles.css", include_in_schema=False)
@@ -249,6 +257,26 @@ REVIEW_ROLE_ALL = "all"
 REVIEW_ROLE_CUSTOMER = "customer"
 REVIEW_ROLE_PERFORMER = "performer"
 VALID_REVIEW_ROLES = {REVIEW_ROLE_ALL, REVIEW_ROLE_CUSTOMER, REVIEW_ROLE_PERFORMER}
+DATA_DELETION_ACCOUNT = "account"
+DATA_DELETION_PROFILE = "profile"
+DATA_DELETION_ANNOUNCEMENTS = "announcements"
+DATA_DELETION_OFFERS = "offers"
+DATA_DELETION_MESSAGES = "messages"
+DATA_DELETION_REVIEWS_REPORTS = "reviews_reports"
+DATA_DELETION_DEVICES = "devices"
+DATA_DELETION_ALL_CATEGORIES = {
+    DATA_DELETION_ACCOUNT,
+    DATA_DELETION_PROFILE,
+    DATA_DELETION_ANNOUNCEMENTS,
+    DATA_DELETION_OFFERS,
+    DATA_DELETION_MESSAGES,
+    DATA_DELETION_REVIEWS_REPORTS,
+    DATA_DELETION_DEVICES,
+}
+DATA_DELETION_RETAINED_NOTICE = (
+    "Могут сохраняться минимальные технические записи, если это необходимо для безопасности, "
+    "предотвращения мошенничества или выполнения закона."
+)
 REPORT_REASON_OPTIONS: List[Dict[str, Any]] = [
     {
         "code": "abuse_insults",
@@ -1081,6 +1109,544 @@ def update_my_profile(
     )
 
     return _fetch_profile_section(user.id)
+
+
+def _collect_storage_object_keys(value: Any) -> set[str]:
+    keys: set[str] = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in {"object_key", "storage_key"}:
+                object_key = str(child or "").strip()
+                if object_key:
+                    keys.add(object_key)
+            else:
+                keys.update(_collect_storage_object_keys(child))
+    elif isinstance(value, list):
+        for child in value:
+            keys.update(_collect_storage_object_keys(child))
+    return keys
+
+
+def _collect_user_storage_object_keys(user_id: str, categories: set[str]) -> set[str]:
+    keys: set[str] = set()
+
+    if DATA_DELETION_ANNOUNCEMENTS in categories:
+        rows = fetch_all(
+            """
+            SELECT data
+            FROM announcements
+            WHERE user_id = %s
+            UNION ALL
+            SELECT extra
+            FROM tasks
+            WHERE customer_id::text = %s
+            """,
+            (user_id, user_id),
+        )
+        for row in rows:
+            keys.update(_collect_storage_object_keys(row[0]))
+
+    if DATA_DELETION_MESSAGES in categories:
+        rows = fetch_all(
+            """
+            SELECT metadata
+            FROM chat_messages
+            WHERE sender_user_account_id::text = %s
+               OR sender_id::text = %s
+            """,
+            (user_id, user_id),
+        )
+        for row in rows:
+            keys.update(_collect_storage_object_keys(row[0]))
+
+    return keys
+
+
+def _delete_storage_objects(object_keys: set[str]) -> None:
+    if not object_keys:
+        return
+
+    storage = get_storage()
+    for object_key in sorted(object_keys):
+        try:
+            storage.delete(object_key)
+        except Exception as exc:
+            logger.warning(
+                "account_data_storage_delete_failed",
+                extra={
+                    "event": "account_data_storage_delete_failed",
+                    "object_key": object_key,
+                    "error": str(exc),
+                },
+            )
+
+
+def _scrub_profile_data(user_id: str, *, delete_account: bool) -> None:
+    if delete_account:
+        execute("DELETE FROM user_profiles WHERE user_id::text = %s", (user_id,))
+        execute("DELETE FROM user_stats WHERE user_id::text = %s", (user_id,))
+        return
+
+    set_clauses = [
+        "display_name = NULL",
+        "bio = NULL",
+        "city = NULL",
+        "updated_at = now()",
+    ]
+    if table_has_column("user_profiles", "home_location"):
+        set_clauses.append("home_location = NULL")
+    if table_has_column("user_profiles", "extra"):
+        set_clauses.append("extra = '{}'::jsonb")
+
+    execute(
+        f"""
+        UPDATE user_profiles
+        SET {", ".join(set_clauses)}
+        WHERE user_id::text = %s
+        """,
+        (user_id,),
+    )
+    execute(
+        """
+        UPDATE user_stats
+        SET rating_avg = 0,
+            rating_count = 0,
+            completed_count = 0,
+            cancelled_count = 0,
+            updated_at = now()
+        WHERE user_id::text = %s
+        """,
+        (user_id,),
+    )
+
+
+def _delete_device_and_session_data(user_id: str, *, previous_email: Optional[str]) -> None:
+    execute("DELETE FROM user_devices WHERE user_id::text = %s", (user_id,))
+    execute("DELETE FROM user_sessions WHERE user_id::text = %s", (user_id,))
+    execute("DELETE FROM password_reset_tokens WHERE user_id::text = %s", (user_id,))
+    if previous_email:
+        execute("DELETE FROM login_attempts WHERE lower(email) = lower(%s)", (previous_email,))
+
+
+def _scrub_announcement_data(user_id: str) -> None:
+    now = datetime.now(timezone.utc)
+    task_rows = fetch_all("SELECT id::text FROM tasks WHERE customer_id::text = %s", (user_id,))
+    task_ids = [str(row[0]) for row in task_rows if row and row[0]]
+
+    if task_ids:
+        execute(
+            """
+            UPDATE task_assignments
+            SET assignment_status = 'cancelled',
+                execution_stage = 'cancelled',
+                route_visibility = 'hidden',
+                cancelled_at = COALESCE(cancelled_at, now()),
+                updated_at = now()
+            WHERE task_id::text = ANY(%s::text[])
+              AND assignment_status IN ('assigned', 'in_progress')
+            """,
+            (task_ids,),
+        )
+        execute(
+            """
+            UPDATE chat_threads
+            SET archived_at = COALESCE(archived_at, now())
+            WHERE task_id::text = ANY(%s::text[])
+            """,
+            (task_ids,),
+        )
+        execute(
+            """
+            UPDATE chat_participants
+            SET left_at = COALESCE(left_at, now())
+            WHERE thread_id IN (
+                SELECT id FROM chat_threads WHERE task_id::text = ANY(%s::text[])
+            )
+            """,
+            (task_ids,),
+        )
+        execute(
+            """
+            UPDATE tasks
+            SET title = 'Удалённое задание',
+                description = NULL,
+                address_text = NULL,
+                customer_comment = NULL,
+                performer_preferences = NULL,
+                location_point = NULL,
+                extra = '{}'::jsonb,
+                status = CASE WHEN status = 'completed' THEN status ELSE 'cancelled' END,
+                deleted_at = COALESCE(deleted_at, %s),
+                closed_at = COALESCE(closed_at, %s),
+                updated_at = now()
+            WHERE id::text = ANY(%s::text[])
+            """,
+            (now, now, task_ids),
+        )
+
+    execute(
+        """
+        UPDATE announcements
+        SET title = 'Удалённое объявление',
+            data = '{}'::jsonb,
+            status = 'deleted',
+            deleted_at = COALESCE(deleted_at, %s),
+            updated_at = now()
+        WHERE user_id = %s
+        """,
+        (now, user_id),
+    )
+
+
+def _scrub_offer_data(user_id: str) -> None:
+    thread_rows = fetch_all(
+        """
+        SELECT chat_thread_id::text
+        FROM task_offers
+        WHERE performer_id::text = %s
+          AND chat_thread_id IS NOT NULL
+        """,
+        (user_id,),
+    )
+    thread_ids = [str(row[0]) for row in thread_rows if row and row[0]]
+    if thread_ids:
+        execute(
+            """
+            UPDATE chat_threads
+            SET archived_at = COALESCE(archived_at, now())
+            WHERE id::text = ANY(%s::text[])
+            """,
+            (thread_ids,),
+        )
+        execute(
+            """
+            UPDATE chat_participants
+            SET left_at = COALESCE(left_at, now())
+            WHERE thread_id::text = ANY(%s::text[])
+              AND user_id::text = %s
+            """,
+            (thread_ids, user_id),
+        )
+
+    execute(
+        """
+        UPDATE task_offers
+        SET message = NULL,
+            proposed_price = NULL,
+            agreed_price = NULL,
+            status = CASE
+                WHEN status IN ('sent', 'accepted_by_customer') THEN 'withdrawn_by_sender'
+                ELSE status
+            END,
+            withdrawn_at = COALESCE(withdrawn_at, now()),
+            updated_at = now()
+        WHERE performer_id::text = %s
+        """,
+        (user_id,),
+    )
+    execute(
+        """
+        UPDATE task_assignments
+        SET assignment_status = CASE
+                WHEN assignment_status = 'completed' THEN assignment_status
+                ELSE 'cancelled'
+            END,
+            execution_stage = CASE
+                WHEN execution_stage = 'completed' THEN execution_stage
+                ELSE 'cancelled'
+            END,
+            route_visibility = 'hidden',
+            cancelled_at = CASE
+                WHEN assignment_status = 'completed' THEN cancelled_at
+                ELSE COALESCE(cancelled_at, now())
+            END,
+            updated_at = now()
+        WHERE performer_id::text = %s
+        """,
+        (user_id,),
+    )
+
+
+def _scrub_message_data(user_id: str) -> None:
+    execute(
+        """
+        DELETE FROM chat_threads
+        WHERE id IN (
+            SELECT id
+            FROM support_threads
+            WHERE user_account_id::text = %s
+        )
+        """,
+        (user_id,),
+    )
+    execute(
+        """
+        DELETE FROM disputes
+        WHERE initiator_user_id::text = %s
+           OR counterparty_user_id::text = %s
+        """,
+        (user_id, user_id),
+    )
+    execute("DELETE FROM message_reads WHERE user_id::text = %s", (user_id,))
+    execute(
+        """
+        UPDATE chat_participants
+        SET left_at = COALESCE(left_at, now()),
+            last_read_message_id = NULL
+        WHERE user_id::text = %s
+        """,
+        (user_id,),
+    )
+    execute(
+        """
+        UPDATE chat_messages
+        SET sender_id = NULL,
+            sender_type = NULL,
+            sender_user_account_id = NULL,
+            sender_display_name = 'Пользователь удалён',
+            sender_label = NULL,
+            text = CASE
+                WHEN type = 'image' THEN 'Фото удалено пользователем'
+                ELSE 'Сообщение удалено пользователем'
+            END,
+            metadata = '{}'::jsonb,
+            deleted_at = COALESCE(deleted_at, now())
+        WHERE sender_user_account_id::text = %s
+           OR sender_id::text = %s
+        """,
+        (user_id, user_id),
+    )
+
+
+def _recalculate_review_stats_for_users(user_ids: set[str]) -> None:
+    for target_user_id in sorted(user_ids):
+        if not target_user_id:
+            continue
+        if not fetch_one(
+            "SELECT 1 FROM users WHERE id::text = %s AND deleted_at IS NULL LIMIT 1",
+            (target_user_id,),
+        ):
+            continue
+        _ensure_profile_and_stats(target_user_id)
+        summary = _review_feed_summary(target_user_id, REVIEW_ROLE_ALL)
+        execute(
+            """
+            UPDATE user_stats
+            SET rating_avg = %s,
+                rating_count = %s,
+                updated_at = now()
+            WHERE user_id::text = %s
+            """,
+            (summary.average, summary.count, target_user_id),
+        )
+
+
+def _delete_reviews_reports_and_moderation_data(user_id: str) -> None:
+    impacted_rows = fetch_all(
+        """
+        SELECT DISTINCT to_user_id::text
+        FROM reviews
+        WHERE (from_user_id::text = %s OR to_user_id::text = %s)
+          AND to_user_id IS NOT NULL
+          AND to_user_id::text <> %s
+        """,
+        (user_id, user_id, user_id),
+    )
+    impacted_user_ids = {str(row[0]) for row in impacted_rows if row and row[0]}
+
+    execute(
+        """
+        DELETE FROM reviews
+        WHERE from_user_id::text = %s
+           OR to_user_id::text = %s
+        """,
+        (user_id, user_id),
+    )
+    _recalculate_review_stats_for_users(impacted_user_ids)
+
+    execute(
+        """
+        DELETE FROM reports
+        WHERE reporter_id = %s
+           OR (target_type = 'user' AND target_id = %s)
+        """,
+        (user_id, user_id),
+    )
+    execute(
+        """
+        DELETE FROM moderation_actions
+        WHERE moderator_id = %s
+           OR (target_type = 'user' AND target_id = %s)
+        """,
+        (user_id, user_id),
+    )
+    execute(
+        """
+        DELETE FROM user_restrictions
+        WHERE user_id::text = %s
+        """,
+        (user_id,),
+    )
+    execute(
+        """
+        UPDATE user_restrictions
+        SET issued_by = NULL,
+            revoked_by = NULL,
+            updated_at = now()
+        WHERE issued_by::text = %s
+           OR revoked_by::text = %s
+        """,
+        (user_id, user_id),
+    )
+    execute(
+        """
+        DELETE FROM notifications
+        WHERE user_id::text = %s
+        """,
+        (user_id,),
+    )
+    execute(
+        """
+        UPDATE notifications
+        SET payload = payload - 'from_user_id' - 'user_id'
+        WHERE payload->>'from_user_id' = %s
+           OR payload->>'user_id' = %s
+        """,
+        (user_id, user_id),
+    )
+    execute(
+        """
+        DELETE FROM audit_logs
+        WHERE actor_user_account_id::text = %s
+           OR (target_type = 'user' AND target_id = %s)
+        """,
+        (user_id, user_id),
+    )
+
+
+def _scrub_account_identity(user_id: str) -> None:
+    execute(
+        """
+        UPDATE admin_accounts
+        SET linked_user_account_id = NULL,
+            updated_at = now()
+        WHERE linked_user_account_id::text = %s
+        """,
+        (user_id,),
+    )
+    execute(
+        """
+        UPDATE users
+        SET email = %s,
+            phone_enc = NULL,
+            phone_hash = NULL,
+            password_hash = 'deleted-account',
+            is_email_verified = FALSE,
+            is_phone_verified = FALSE,
+            failed_login_attempts = 0,
+            locked_until = NULL,
+            last_login_at = NULL,
+            deleted_at = COALESCE(deleted_at, now()),
+            updated_at = now()
+        WHERE id::text = %s
+        """,
+        (f"deleted-{user_id}@deleted.vzaimno.local", user_id),
+    )
+
+
+def _apply_account_data_deletion(
+    *,
+    user_id: str,
+    previous_email: Optional[str],
+    categories: set[str],
+    delete_account: bool,
+) -> None:
+    if DATA_DELETION_DEVICES in categories or delete_account:
+        _delete_device_and_session_data(user_id, previous_email=previous_email if delete_account else None)
+
+    if DATA_DELETION_MESSAGES in categories:
+        _scrub_message_data(user_id)
+
+    if DATA_DELETION_ANNOUNCEMENTS in categories:
+        _scrub_announcement_data(user_id)
+
+    if DATA_DELETION_OFFERS in categories:
+        _scrub_offer_data(user_id)
+
+    if DATA_DELETION_REVIEWS_REPORTS in categories:
+        _delete_reviews_reports_and_moderation_data(user_id)
+
+    if DATA_DELETION_PROFILE in categories:
+        _scrub_profile_data(user_id, delete_account=delete_account)
+
+    if delete_account:
+        _scrub_account_identity(user_id)
+
+
+@app.delete("/users/me/data", response_model=AccountDataDeletionOut)
+def delete_my_account_data(
+    payload: AccountDataDeletionIn,
+    user: UserOut = Depends(get_current_user),
+) -> AccountDataDeletionOut:
+    if user.id == "dev":
+        return AccountDataDeletionOut(
+            ok=True,
+            account_deleted=False,
+            deleted_categories=[],
+            retained_data=[DATA_DELETION_RETAINED_NOTICE],
+            message="DEV-пользователь не хранится в базе данных.",
+        )
+
+    categories = set(payload.categories)
+    unknown_categories = sorted(categories - DATA_DELETION_ALL_CATEGORIES)
+    if unknown_categories:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown data deletion categories: {', '.join(unknown_categories)}",
+        )
+
+    delete_account = bool(payload.delete_account or DATA_DELETION_ACCOUNT in categories)
+    if delete_account:
+        confirmation = str(payload.confirmation_text or "").strip().upper()
+        if confirmation not in {"УДАЛИТЬ", "DELETE"}:
+            raise HTTPException(status_code=422, detail="Confirmation text is required to delete account")
+        categories = set(DATA_DELETION_ALL_CATEGORIES)
+
+    current_user = fetch_one(
+        """
+        SELECT email
+        FROM users
+        WHERE id::text = %s
+          AND deleted_at IS NULL
+        LIMIT 1
+        """,
+        (user.id,),
+    )
+    if not current_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    object_keys = _collect_user_storage_object_keys(user.id, categories)
+    with transaction():
+        _apply_account_data_deletion(
+            user_id=user.id,
+            previous_email=str(current_user[0] or ""),
+            categories=categories,
+            delete_account=delete_account,
+        )
+
+    _delete_storage_objects(object_keys)
+
+    return AccountDataDeletionOut(
+        ok=True,
+        account_deleted=delete_account,
+        deleted_categories=sorted(categories),
+        retained_data=[DATA_DELETION_RETAINED_NOTICE],
+        message=(
+            "Аккаунт и выбранные связанные данные удалены."
+            if delete_account
+            else "Выбранные данные удалены."
+        ),
+    )
 
 
 def _normalize_review_role(role: Optional[str]) -> str:

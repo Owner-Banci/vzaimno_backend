@@ -115,6 +115,32 @@ class UpdateMyProfileIn(BaseModel):
     home_location: Optional[GeoPointOut] = None
 
 
+class AccountDataDeletionIn(BaseModel):
+    categories: list[str] = Field(..., min_length=1, max_length=16)
+    delete_account: bool = False
+    confirmation_text: Optional[str] = Field(default=None, max_length=80)
+
+    @field_validator("categories")
+    @classmethod
+    def _normalize_categories(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for item in value:
+            category = str(item or "").strip().lower()
+            if category and category not in normalized:
+                normalized.append(category)
+        if not normalized:
+            raise ValueError("Select at least one data category")
+        return normalized
+
+
+class AccountDataDeletionOut(BaseModel):
+    ok: bool = True
+    account_deleted: bool = False
+    deleted_categories: list[str] = Field(default_factory=list)
+    retained_data: list[str] = Field(default_factory=list)
+    message: str
+
+
 class UserReviewOut(BaseModel):
     from_user_display_name: str
     stars: int = Field(..., ge=1, le=5)
