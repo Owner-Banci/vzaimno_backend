@@ -285,9 +285,11 @@ SELECT
 FROM tasks t
 LEFT JOIN categories c
   ON c.id = t.category_id
-LEFT JOIN LATERAL (
+JOIN LATERAL (
     SELECT
         id,
+        task_id,
+        customer_id,
         performer_id,
         assignment_status,
         execution_stage,
@@ -304,10 +306,6 @@ LEFT JOIN LATERAL (
 WHERE t.customer_id::text = %s
   AND t.deleted_at IS NULL
   AND t.moderation_status = 'published'
-  AND (
-      ta.id IS NOT NULL
-      OR t.status IN ('active', 'published', 'in_responses')
-  )
 ORDER BY COALESCE(ta.updated_at, ta.created_at, t.updated_at, t.created_at) DESC NULLS LAST
 """
 

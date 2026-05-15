@@ -71,6 +71,7 @@ class RouteTaskSummaryOut(BaseModel):
     performer_user_id: Optional[str] = None
     viewer_role: str
     can_update_execution: bool = False
+    is_accepted: bool = False
 
 
 class TaskMyRoleOut(BaseModel):

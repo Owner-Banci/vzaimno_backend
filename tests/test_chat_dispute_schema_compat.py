@@ -103,6 +103,43 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         self.thread_ids.append(thread_id)
         return thread_id
 
+    def _create_route_task(self, owner_id: str, title: str) -> str:
+        task_id = str(uuid.uuid4())
+        self.task_ids.append(task_id)
+        _insert_task(
+            task_id,
+            owner_id,
+            "delivery",
+            title,
+            "active",
+            {
+                "pickup_address": "Москва, Тверская 1",
+                "dropoff_address": "Москва, Арбат 10",
+                "address_text": "Москва, Тверская 1",
+                "pickup_point": {"lat": 55.7558, "lon": 37.6173},
+                "dropoff_point": {"lat": 55.7522, "lon": 37.5931},
+                "point": {"lat": 55.7558, "lon": 37.6173},
+                "notes": "Маршрутный интеграционный тест",
+            },
+        )
+        return task_id
+
+    def _accept_route_task(self, task_id: str, owner_token: str, performer_token: str) -> None:
+        offer_response = self.client.post(
+            f"/announcements/{task_id}/offers",
+            headers={"Authorization": f"Bearer {performer_token}"},
+            json={"message": "Готов выполнить", "proposed_price": 1000},
+        )
+        self.assertEqual(offer_response.status_code, 201, offer_response.text)
+        offer_id = offer_response.json()["id"]
+
+        accept_response = self.client.post(
+            f"/announcements/{task_id}/offers/{offer_id}/accept",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(accept_response.status_code, 200, accept_response.text)
+        self.thread_ids.append(accept_response.json()["thread_id"])
+
     def test_chats_and_messages_endpoints_are_compatible_with_phone_removed_schema(self) -> None:
         owner = self._create_user("chat-owner")
         performer = self._create_user("chat-performer")
@@ -221,12 +258,42 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
             },
         )
 
+        owner_tasks_before_offer = self.client.get(
+            "/routes/me/customer/tasks",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(owner_tasks_before_offer.status_code, 200, owner_tasks_before_offer.text)
+        self.assertFalse(
+            any(item["task_id"] == task_id for item in owner_tasks_before_offer.json()),
+            owner_tasks_before_offer.text,
+        )
+
         offer_response = self.client.post(
             f"/announcements/{task_id}/offers",
             headers={"Authorization": f"Bearer {performer_token}"},
             json={"message": "Готов выполнить", "proposed_price": 1000},
         )
         self.assertEqual(offer_response.status_code, 201, offer_response.text)
+
+        owner_tasks_after_offer = self.client.get(
+            "/routes/me/customer/tasks",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        self.assertEqual(owner_tasks_after_offer.status_code, 200, owner_tasks_after_offer.text)
+        self.assertFalse(
+            any(item["task_id"] == task_id for item in owner_tasks_after_offer.json()),
+            owner_tasks_after_offer.text,
+        )
+
+        performer_tasks_after_offer = self.client.get(
+            "/routes/me/performer/tasks",
+            headers={"Authorization": f"Bearer {performer_token}"},
+        )
+        self.assertEqual(performer_tasks_after_offer.status_code, 200, performer_tasks_after_offer.text)
+        self.assertFalse(
+            any(item["task_id"] == task_id for item in performer_tasks_after_offer.json()),
+            performer_tasks_after_offer.text,
+        )
 
         current_route = self.client.get(
             "/routes/me/current/context",
@@ -411,6 +478,7 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         self.assertFalse(owner_customer_payload[0]["can_update_execution"])
         self.assertEqual(owner_customer_payload[0]["customer_user_id"], owner["id"])
         self.assertEqual(owner_customer_payload[0]["performer_user_id"], performer["id"])
+        self.assertTrue(owner_customer_payload[0]["is_accepted"])
         self.assertNotIn("polyline", owner_customer_payload[0])
         self.assertNotIn("tasks_by_route", owner_customer_payload[0])
 
@@ -425,6 +493,7 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         self.assertTrue(performer_performer_payload[0]["can_update_execution"])
         self.assertEqual(performer_performer_payload[0]["customer_user_id"], owner["id"])
         self.assertEqual(performer_performer_payload[0]["performer_user_id"], performer["id"])
+        self.assertTrue(performer_performer_payload[0]["is_accepted"])
 
         performer_customer_tasks = self.client.get(
             "/routes/me/customer/tasks",
@@ -513,6 +582,32 @@ class ChatDisputeSchemaCompatIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(owner_messages.status_code, 200, owner_messages.text)
         self.assertTrue(any(message["text"] == "Привет, я на связи" for message in owner_messages.json()))
+
+    def test_performer_route_tasks_returns_all_accepted_tasks_from_different_customers(self) -> None:
+        owner_one = self._create_user("multi-route-owner-one")
+        owner_two = self._create_user("multi-route-owner-two")
+        performer = self._create_user("multi-route-performer")
+        owner_one_token = self._login_user(owner_one)
+        owner_two_token = self._login_user(owner_two)
+        performer_token = self._login_user(performer)
+
+        first_task_id = self._create_route_task(owner_one["id"], "Первая согласованная задача")
+        second_task_id = self._create_route_task(owner_two["id"], "Вторая согласованная задача")
+
+        self._accept_route_task(first_task_id, owner_one_token, performer_token)
+        self._accept_route_task(second_task_id, owner_two_token, performer_token)
+
+        performer_tasks = self.client.get(
+            "/routes/me/performer/tasks",
+            headers={"Authorization": f"Bearer {performer_token}"},
+        )
+        self.assertEqual(performer_tasks.status_code, 200, performer_tasks.text)
+        payload = performer_tasks.json()
+
+        self.assertEqual({item["task_id"] for item in payload}, {first_task_id, second_task_id})
+        self.assertTrue(all(item["viewer_role"] == "performer" for item in payload))
+        self.assertTrue(all(item["performer_user_id"] == performer["id"] for item in payload))
+        self.assertTrue(all(item["is_accepted"] for item in payload))
 
     def test_accepted_offer_current_route_uses_stored_route_points_for_performer(self) -> None:
         owner = self._create_user("route-owner")

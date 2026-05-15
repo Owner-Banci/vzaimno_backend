@@ -1053,6 +1053,8 @@ def _route_task_summary_from_row(
         budget_min=budget_min,
         budget_max=budget_max,
     )
+    assignment_status = str(row[9]) if row[9] else None
+    performer_user_id = str(row[12]) if row[12] else None
     return RouteTaskSummaryOut(
         task_id=str(row[0]),
         title=str(row[1] or "Без названия"),
@@ -1062,12 +1064,13 @@ def _route_task_summary_from_row(
         budget=budget,
         budget_min=budget_min,
         budget_max=budget_max,
-        assignment_status=str(row[9]) if row[9] else None,
+        assignment_status=assignment_status,
         execution_stage=str(row[10]) if row[10] else None,
         customer_user_id=str(row[11]),
-        performer_user_id=str(row[12]) if row[12] else None,
+        performer_user_id=performer_user_id,
         viewer_role=viewer_role,
         can_update_execution=can_update_execution,
+        is_accepted=bool(performer_user_id and assignment_status in {"assigned", "in_progress"}),
     )
 
 
