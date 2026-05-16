@@ -89,10 +89,11 @@
       <nav class="nav" aria-label="Навигация">
         <a href="#idea">Идея</a>
         <a href="#how">Как работает</a>
+        <a href="#guide">Инструкция</a>
         <a href="#scenarios">Сценарии</a>
         <a href="#safety">Безопасность</a>
       </nav>
-      <a class="header-cta" href="#download" data-placeholder>
+      <a class="header-cta" href="#download">
         <svg><use href="#icon-phone"></use></svg>
         Скачать
       </a>
@@ -130,7 +131,7 @@
                 App Store
               </span>
             </a>
-            <a class="store-button" href="#" data-placeholder>
+            <a class="store-button" href="https://play.google.com/store/apps/details?id=net.vzaimno.app" target="_blank" rel="noopener">
               <span class="store-icon play"></span>
               <span>
                 <small>Доступно в</small>
@@ -276,6 +277,73 @@
             <h3>Оставьте отзыв</h3>
             <p>Статус закрыт, у сторон появляется история</p>
           </article>
+        </div>
+      </section>
+
+      <section class="section guide-section" id="guide" aria-labelledby="guide-title">
+        <div class="section-head reveal">
+          <p class="eyebrow">Инструкция</p>
+          <h2 id="guide-title">Как пользоваться приложением без лишних догадок</h2>
+          <p>
+            Выберите нужный вопрос: инструкция покажет только те экраны, которые нужны
+            для конкретного действия, и подсветит главное место на каждом шаге
+          </p>
+        </div>
+
+        <div class="guide-shell" data-guide>
+          <div class="guide-panel">
+            <div class="guide-tabs" role="tablist" aria-label="Сценарии инструкции">
+              <button class="active" type="button" data-guide-tab="find">
+                <svg aria-hidden="true"><use href="#icon-map"></use></svg>
+                <span>Найти задание</span>
+              </button>
+              <button type="button" data-guide-tab="create">
+                <svg aria-hidden="true"><use href="#icon-send"></use></svg>
+                <span>Создать объявление</span>
+              </button>
+              <button type="button" data-guide-tab="manage">
+                <svg aria-hidden="true"><use href="#icon-user"></use></svg>
+                <span>Выбрать исполнителя</span>
+              </button>
+              <button type="button" data-guide-tab="route">
+                <svg aria-hidden="true"><use href="#icon-route"></use></svg>
+                <span>Маршрут</span>
+              </button>
+              <button type="button" data-guide-tab="chat">
+                <svg aria-hidden="true"><use href="#icon-chat"></use></svg>
+                <span>Чаты</span>
+              </button>
+              <button type="button" data-guide-tab="profile">
+                <svg aria-hidden="true"><use href="#icon-user"></use></svg>
+                <span>Профиль</span>
+              </button>
+            </div>
+
+            <div class="guide-copy">
+              <span class="guide-count" data-guide-count>1 из 4</span>
+              <h3 data-guide-title>Как найти задание</h3>
+              <p data-guide-lead>
+                Начните с карты: на ней видно, какие задания находятся рядом и какие можно взять по пути.
+              </p>
+            </div>
+
+            <ol class="guide-steps" data-guide-steps></ol>
+          </div>
+
+          <div class="guide-visual">
+            <div class="guide-phone" aria-live="polite">
+              <img data-guide-image src="assets/guide-map-overview.png" alt="Карта заданий в приложении Vzaimno">
+              <span class="guide-focus" data-guide-focus></span>
+              <span class="guide-focus-dot" data-guide-dot>1</span>
+            </div>
+            <div class="guide-caption">
+              <strong data-guide-step-title>Откройте карту</strong>
+              <span data-guide-step-text>
+                Первый экран показывает задания рядом. Масштабируйте карту, возвращайтесь к своей геопозиции
+                и переключайтесь между картой и списком.
+              </span>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -547,7 +615,7 @@
             </p>
             <div class="social-row">
               <a href="https://t.me/Murtazaev_Av" target="_blank" rel="noopener">Telegram</a>
-              <a href="mailto:murtazaevavazbek20@gmail.com">murtazaevavazbek20@gmail.com</a>
+              <a href="mailto:murtazaev.avazbek@vzaimno.net">murtazaev.avazbek@vzaimno.net</a>
             </div>
           </div>
         </div>
@@ -572,7 +640,7 @@
               <span class="store-icon"><svg><use href="#icon-phone"></use></svg></span>
               <span><small>Скачать в</small>App Store</span>
             </a>
-            <a class="store-button" href="#" data-placeholder>
+            <a class="store-button" href="https://play.google.com/store/apps/details?id=net.vzaimno.app" target="_blank" rel="noopener">
               <span class="store-icon play"></span>
               <span><small>Доступно в</small>Google Play</span>
             </a>
@@ -587,7 +655,7 @@
         <span>Помощь рядом. Заработок по пути</span>
       </div>
       <div class="footer-links">
-        <a href="mailto:murtazaevavazbek20@gmail.com">murtazaevavazbek20@gmail.com</a>
+        <a href="mailto:murtazaev.avazbek@vzaimno.net">murtazaev.avazbek@vzaimno.net</a>
         <a href="/account-deletion">Удаление данных</a>
         <a href="#" data-placeholder>Политика</a>
         <a href="#" data-placeholder>Поддержка</a>
