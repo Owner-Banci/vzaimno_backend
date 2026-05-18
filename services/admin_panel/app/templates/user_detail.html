@@ -62,20 +62,20 @@
     <div class="actions">
       {% if user.admin_access.is_active %}
       <form method="post" action="/admin/admin-accounts/{{ user.admin_access.admin_account_id }}/disable" class="inline-form">
-        <input type="hidden" name="csrf_token" value="{{ request.session.get('admin_csrf_token', '') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <input type="hidden" name="user_id" value="{{ user.id }}">
         <button type="submit">Отключить admin account</button>
       </form>
       {% else %}
       <form method="post" action="/admin/admin-accounts/{{ user.admin_access.admin_account_id }}/enable" class="inline-form">
-        <input type="hidden" name="csrf_token" value="{{ request.session.get('admin_csrf_token', '') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <input type="hidden" name="user_id" value="{{ user.id }}">
         <button type="submit">Включить admin account</button>
       </form>
       {% endif %}
 
       <form method="post" action="/admin/admin-accounts/{{ user.admin_access.admin_account_id }}/reset-credentials" class="stack">
-        <input type="hidden" name="csrf_token" value="{{ request.session.get('admin_csrf_token', '') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <input type="hidden" name="user_id" value="{{ user.id }}">
         <label>Новый пароль admin account
           <input type="password" name="password" minlength="8" required placeholder="Новый пароль для отдельного admin login">
@@ -89,7 +89,7 @@
 
     {% if is_admin %}
     <form method="post" action="/admin/users/{{ user.id }}/admin-access" class="stack">
-      <input type="hidden" name="csrf_token" value="{{ request.session.get('admin_csrf_token', '') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
       <label>Admin login
         <input type="text" name="login_identifier" minlength="3" maxlength="255" required placeholder="support-user-01">
       </label>

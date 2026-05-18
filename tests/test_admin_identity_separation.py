@@ -691,6 +691,108 @@ class AdminIdentitySeparationIntegrationTests(unittest.TestCase):
         self.assertEqual(public_item["description"], "Нужна аккуратная доставка документов")
         self.assertEqual(public_item["data"]["description"], "Нужна аккуратная доставка документов")
 
+    def test_create_announcement_preserves_client_provided_route_points(self) -> None:
+        owner = self._create_user("route-points-owner")
+        token = self._login_user(owner)
+
+        with patch("app.main.classify_text", return_value={"label": "LEGAL", "reason": "test"}), patch(
+            "app.main.geocode_address",
+            side_effect=AssertionError("client-provided points must not be geocoded again"),
+        ):
+            response = self.public_client.post(
+                "/announcements",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "category": "delivery",
+                    "title": "Забрать документы",
+                    "data": {
+                        "pickup_address": "Москва, Маросейка 8",
+                        "dropoff_address": "Москва, Проспект Мира 20",
+                        "pickup_point": {"lat": 55.7563, "lon": 37.6358},
+                        "dropoff_point": {"lat": 55.7796, "lon": 37.6328},
+                        "notes": "Нужно аккуратно забрать и привезти документы",
+                        "task": {
+                            "route": {
+                                "source": {
+                                    "address": "Москва, Маросейка 8",
+                                    "point": {"lat": 55.7563, "lon": 37.6358},
+                                },
+                                "destination": {
+                                    "address": "Москва, Проспект Мира 20",
+                                    "point": {"lat": 55.7796, "lon": 37.6328},
+                                },
+                            },
+                        },
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 201, response.text)
+        payload = response.json()
+        task_id = payload["id"]
+        self.task_ids.append(task_id)
+        self.assertEqual(payload["address_text"], "Москва, Маросейка 8")
+        self.assertEqual(payload["latitude"], 55.7563)
+        self.assertEqual(payload["longitude"], 37.6358)
+
+        task_row = fetch_one(
+            """
+            SELECT
+                address_text,
+                ST_Y(location_point::geometry),
+                ST_X(location_point::geometry),
+                extra
+            FROM tasks
+            WHERE id = %s::uuid
+            """,
+            (task_id,),
+        )
+        self.assertIsNotNone(task_row)
+        self.assertEqual(task_row[0], "Москва, Маросейка 8")
+        self.assertEqual(float(task_row[1]), 55.7563)
+        self.assertEqual(float(task_row[2]), 37.6358)
+        self.assertEqual(task_row[3]["pickup_point"], {"lat": 55.7563, "lon": 37.6358})
+        self.assertEqual(task_row[3]["dropoff_point"], {"lat": 55.7796, "lon": 37.6328})
+        self.assertEqual(task_row[3]["task"]["route"]["source"]["point"], {"lat": 55.7563, "lon": 37.6358})
+        self.assertEqual(task_row[3]["task"]["route"]["destination"]["point"], {"lat": 55.7796, "lon": 37.6328})
+
+        source_route_point = fetch_one(
+            """
+            SELECT address_text, ST_Y(point::geometry), ST_X(point::geometry), point_kind
+            FROM task_route_points
+            WHERE task_id = %s::uuid
+            ORDER BY point_order
+            LIMIT 1
+            """,
+            (task_id,),
+        )
+        destination_route_point = fetch_one(
+            """
+            SELECT address_text, ST_Y(point::geometry), ST_X(point::geometry), point_kind
+            FROM task_route_points
+            WHERE task_id = %s::uuid
+            ORDER BY point_order
+            OFFSET 1
+            LIMIT 1
+            """,
+            (task_id,),
+        )
+        self.assertEqual(source_route_point, ("Москва, Маросейка 8", 55.7563, 37.6358, "source"))
+        self.assertEqual(destination_route_point, ("Москва, Проспект Мира 20", 55.7796, 37.6328, "destination"))
+
+        legacy_row = fetch_one(
+            """
+            SELECT ST_Y(location_point::geometry), ST_X(location_point::geometry), data
+            FROM announcements
+            WHERE id::text = %s
+            """,
+            (task_id,),
+        )
+        self.assertIsNotNone(legacy_row)
+        self.assertEqual(float(legacy_row[0]), 55.7563)
+        self.assertEqual(float(legacy_row[1]), 37.6358)
+        self.assertEqual(legacy_row[2]["address_text"], "Москва, Маросейка 8")
+
     def test_public_announcements_support_map_search_and_hide_viewer_tasks(self) -> None:
         owner = self._create_user("map-owner")
         viewer = self._create_user("map-viewer")
@@ -756,6 +858,167 @@ class AdminIdentitySeparationIntegrationTests(unittest.TestCase):
         address_search_ids = {item["id"] for item in address_search.json()}
         self.assertIn(owner_task_id, address_search_ids)
         self.assertNotIn(viewer_task_id, address_search_ids)
+
+    def test_public_announcements_nearby_filter_uses_distance_order(self) -> None:
+        owner = self._create_user("nearby-owner")
+        near_task_id = str(uuid.uuid4())
+        farther_task_id = str(uuid.uuid4())
+        distant_task_id = str(uuid.uuid4())
+        self.task_ids.extend([near_task_id, farther_task_id, distant_task_id])
+
+        _insert_task(
+            near_task_id,
+            owner["id"],
+            "help",
+            "nearby-public-filter рядом",
+            "active",
+            {
+                "address": "Москва, Тверская 1",
+                "address_text": "Москва, Тверская 1",
+                "point": {"lat": 55.7559, "lon": 37.6174},
+                "notes": "nearby-public-filter",
+            },
+        )
+        _insert_task(
+            farther_task_id,
+            owner["id"],
+            "help",
+            "nearby-public-filter дальше",
+            "active",
+            {
+                "address": "Москва, Ленинский проспект 30",
+                "address_text": "Москва, Ленинский проспект 30",
+                "point": {"lat": 55.7062, "lon": 37.5873},
+                "notes": "nearby-public-filter",
+            },
+        )
+        _insert_task(
+            distant_task_id,
+            owner["id"],
+            "help",
+            "nearby-public-filter казань",
+            "active",
+            {
+                "address": "Казань, Баумана 5",
+                "address_text": "Казань, Баумана 5",
+                "point": {"lat": 55.7938, "lon": 49.1113},
+                "notes": "nearby-public-filter",
+            },
+        )
+
+        response = self.public_client.get(
+            "/announcements/public",
+            params={
+                "q": "nearby-public-filter",
+                "lat": 55.7558,
+                "lon": 37.6173,
+                "radius_m": 10_000,
+                "exclude_my": "false",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        ids = [item["id"] for item in response.json()]
+        self.assertEqual(ids, [near_task_id, farther_task_id])
+
+    def test_public_announcements_list_does_not_geocode_missing_points(self) -> None:
+        owner = self._create_user("nogeocode-owner")
+        task_id = str(uuid.uuid4())
+        self.task_ids.append(task_id)
+
+        _insert_task(
+            task_id,
+            owner["id"],
+            "help",
+            "nogeocode-public-list",
+            "active",
+            {
+                "address": "Москва, адрес без сохраненной точки",
+                "address_text": "Москва, адрес без сохраненной точки",
+                "point": {"lat": 55.7558, "lon": 37.6173},
+                "notes": "nogeocode-public-list",
+            },
+        )
+        execute(
+            """
+            UPDATE tasks
+            SET location_point = NULL,
+                extra = %s::jsonb
+            WHERE id = %s::uuid
+            """,
+            ('{"address_text":"Москва, адрес без сохраненной точки","notes":"nogeocode-public-list"}', task_id),
+        )
+        execute(
+            """
+            UPDATE announcements
+            SET location_point = NULL,
+                data = %s::jsonb
+            WHERE id::text = %s
+            """,
+            ('{"address_text":"Москва, адрес без сохраненной точки","notes":"nogeocode-public-list"}', task_id),
+        )
+
+        with patch("app.main.geocode_address", side_effect=AssertionError("GET list must not geocode")):
+            response = self.public_client.get(
+                "/announcements/public",
+                params={"q": "nogeocode-public-list", "exclude_my": "false"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual([item["id"] for item in payload], [task_id])
+        self.assertIsNone(payload[0]["latitude"])
+        self.assertIsNone(payload[0]["longitude"])
+
+    def test_public_announcements_nearby_skips_rows_without_location_point(self) -> None:
+        owner = self._create_user("missing-point-owner")
+        located_task_id = str(uuid.uuid4())
+        missing_point_task_id = str(uuid.uuid4())
+        self.task_ids.extend([located_task_id, missing_point_task_id])
+
+        _insert_task(
+            located_task_id,
+            owner["id"],
+            "help",
+            "missing-point-public-filter с точкой",
+            "active",
+            {
+                "address": "Москва, Арбат 1",
+                "address_text": "Москва, Арбат 1",
+                "point": {"lat": 55.7522, "lon": 37.5931},
+                "notes": "missing-point-public-filter",
+            },
+        )
+        _insert_task(
+            missing_point_task_id,
+            owner["id"],
+            "help",
+            "missing-point-public-filter без точки",
+            "active",
+            {
+                "address": "Москва, Никольская 1",
+                "address_text": "Москва, Никольская 1",
+                "point": {"lat": 55.7577, "lon": 37.6215},
+                "notes": "missing-point-public-filter",
+            },
+        )
+        execute(
+            "UPDATE tasks SET location_point = NULL WHERE id = %s::uuid",
+            (missing_point_task_id,),
+        )
+
+        response = self.public_client.get(
+            "/announcements/public",
+            params={
+                "q": "missing-point-public-filter",
+                "lat": 55.7558,
+                "lon": 37.6173,
+                "radius_m": 20_000,
+                "exclude_my": "false",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual([item["id"] for item in response.json()], [located_task_id])
 
 
 if __name__ == "__main__":

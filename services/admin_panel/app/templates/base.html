@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Vzaimno | Админ-панель</title>
-  <link rel="stylesheet" href="/static/admin.css">
+  <link rel="stylesheet" href="{{ request.url_for('admin-static', path='admin.css').path }}">
 </head>
 <body>
   <div class="app-shell">

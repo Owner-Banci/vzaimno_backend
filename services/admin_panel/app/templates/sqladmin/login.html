@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ admin.title }} | Вход</title>
-  <link rel="stylesheet" href="/static/admin.css">
+  <link rel="stylesheet" href="{{ request.url_for('admin-static', path='admin.css').path }}">
 </head>
 <body class="auth-screen">
   <div class="auth-layout">
@@ -22,7 +22,7 @@
     </section>
 
     <form class="auth-card auth-form" action="{{ url_for('admin:login') }}" method="POST" autocomplete="off">
-      <input type="hidden" name="csrf_token" value="{{ request.session.get('admin_csrf_token', '') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
       <div>
         <p class="eyebrow">Вход</p>
         <h1>{{ admin.title }}</h1>

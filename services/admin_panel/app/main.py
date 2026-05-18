@@ -67,6 +67,14 @@ class StaffAdmin(Admin):
         return RedirectResponse(url="/admin/users", status_code=302)
 
 
+def _join_url_path(base: str, suffix: str) -> str:
+    normalized_base = "/" + (base or "").strip("/")
+    normalized_suffix = "/" + (suffix or "").strip("/")
+    if normalized_base == "/":
+        return normalized_suffix
+    return normalized_base + normalized_suffix
+
+
 app = FastAPI(title=settings.title)
 require_production_env_values("admin", _PROD_REQUIRED_ENV)
 app.add_middleware(AdminCSRFMiddleware)
@@ -79,7 +87,8 @@ app.add_middleware(
     max_age=settings.session_max_age_seconds,
 )
 apply_http_hardening(app, service_name="admin", cors_origins_env="ADMIN_CORS_ALLOWED_ORIGINS")
-app.mount("/static", StaticFiles(directory=str(settings.static_dir)), name="admin-static")
+app.mount(_join_url_path(settings.admin_base_url, "static"), StaticFiles(directory=str(settings.static_dir)), name="admin-static")
+app.mount("/static", StaticFiles(directory=str(settings.static_dir)), name="legacy-admin-static")
 app.state.templates = Jinja2Templates(directory=str(settings.templates_dir))
 app.state.templates.env.globals["csrf_token"] = ensure_csrf_token
 
@@ -576,6 +585,7 @@ admin = StaffAdmin(
     title=settings.title,
     templates_dir=str(settings.templates_dir),
 )
+admin.templates.env.globals["csrf_token"] = ensure_csrf_token
 admin.add_view(UsersView)
 admin.add_view(AnnouncementsModerationView)
 admin.add_view(ReportsView)

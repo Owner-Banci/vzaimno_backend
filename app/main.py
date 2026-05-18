@@ -4810,10 +4810,15 @@ def my_announcements(user: UserOut = Depends(get_current_user)) -> List[Announce
     return [_task_row_to_announcement(r) for r in rows]
 
 
+DEFAULT_PUBLIC_ANNOUNCEMENT_RADIUS_M = 50_000
+MAX_PUBLIC_ANNOUNCEMENT_RADIUS_M = 250_000
+
+
 def _public_announcements_search_filters(
     *,
     task_query: Optional[str],
     address_query: Optional[str],
+    city_query: Optional[str] = None,
 ) -> tuple[list[str], list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
@@ -4859,6 +4864,29 @@ def _public_announcements_search_filters(
         )
         params.extend([like] * 11)
 
+    clean_city_query = _normalize_optional_text(city_query, collapse_spaces=True)
+    if clean_city_query:
+        like = f"%{clean_city_query}%"
+        clauses.append(
+            """
+            (
+                COALESCE(t.address_text, '') ILIKE %s
+                OR COALESCE(t.extra->>'city', '') ILIKE %s
+                OR COALESCE(t.extra->>'address_text', '') ILIKE %s
+                OR COALESCE(t.extra->>'address', '') ILIKE %s
+                OR COALESCE(t.extra->>'pickup_address', '') ILIKE %s
+                OR COALESCE(t.extra->>'dropoff_address', '') ILIKE %s
+                OR COALESCE(t.extra->>'start_address', '') ILIKE %s
+                OR COALESCE(t.extra->>'end_address', '') ILIKE %s
+                OR COALESCE(t.extra->>'to_address', '') ILIKE %s
+                OR COALESCE(t.extra->>'destination_address', '') ILIKE %s
+                OR COALESCE(t.extra #>> '{task,route,source,address}', '') ILIKE %s
+                OR COALESCE(t.extra #>> '{task,route,destination,address}', '') ILIKE %s
+            )
+            """
+        )
+        params.extend([like] * 12)
+
     return clauses, params
 
 
@@ -4868,18 +4896,62 @@ def public_announcements(
     q: Optional[str] = None,
     search: Optional[str] = None,
     address: Optional[str] = None,
+    city: Optional[str] = None,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
+    radius_m: Optional[int] = None,
     exclude_my: bool = True,
     user: Optional[UserPrincipal] = Depends(get_optional_current_user),
 ) -> List[AnnouncementOut]:
     lim = max(1, min(int(limit), 500))
+    has_lat = lat is not None
+    has_lon = lon is not None
+    if has_lat != has_lon:
+        raise HTTPException(status_code=422, detail="lat and lon must be provided together")
+    if lat is not None and not -90 <= lat <= 90:
+        raise HTTPException(status_code=422, detail="lat must be between -90 and 90")
+    if lon is not None and not -180 <= lon <= 180:
+        raise HTTPException(status_code=422, detail="lon must be between -180 and 180")
+
+    nearby_radius_m = max(
+        1,
+        min(
+            int(radius_m or DEFAULT_PUBLIC_ANNOUNCEMENT_RADIUS_M),
+            MAX_PUBLIC_ANNOUNCEMENT_RADIUS_M,
+        ),
+    )
     task_query = q if q is not None else search
     extra_clauses, extra_params = _public_announcements_search_filters(
         task_query=task_query,
         address_query=address,
+        city_query=city,
     )
     if exclude_my and user is not None:
         extra_clauses.append("t.customer_id::text <> %s")
         extra_params.append(user.id)
+
+    order_params: list[Any] = []
+    order_by = "t.created_at DESC"
+    if lat is not None and lon is not None:
+        extra_clauses.append("t.location_point IS NOT NULL")
+        extra_clauses.append(
+            """
+            ST_DWithin(
+                t.location_point,
+                ST_SetSRID(ST_MakePoint(%s::double precision, %s::double precision), 4326)::geography,
+                %s::double precision
+            )
+            """
+        )
+        extra_params.extend([lon, lat, nearby_radius_m])
+        order_by = """
+            ST_Distance(
+                t.location_point,
+                ST_SetSRID(ST_MakePoint(%s::double precision, %s::double precision), 4326)::geography
+            ) ASC,
+            t.created_at DESC
+        """
+        order_params.extend([lon, lat])
 
     extra_where = ""
     if extra_clauses:
@@ -4899,12 +4971,11 @@ def public_announcements(
                 AND ta.assignment_status IN ('assigned', 'in_progress')
           )
           {extra_where}
-        ORDER BY t.created_at DESC
+        ORDER BY {order_by}
         LIMIT %s
         """,
-        (*extra_params, lim),
+        (*extra_params, *order_params, lim),
     )
-    rows = [_repair_announcement_row_if_needed(row) for row in rows]
     return [_task_row_to_announcement(r) for r in rows]
 
 

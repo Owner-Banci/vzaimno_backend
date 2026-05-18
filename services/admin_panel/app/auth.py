@@ -516,6 +516,10 @@ def _load_staff_user(token: str) -> Optional[StaffUser]:
 class AdminAuth(AuthenticationBackend):
     def __init__(self, secret_key: str) -> None:
         super().__init__(secret_key=secret_key)
+        # The admin FastAPI app already owns SessionMiddleware with a custom
+        # cookie name. SQLAdmin adds another "session" cookie by default, which
+        # makes form CSRF values and middleware checks read different sessions.
+        self.middlewares = []
 
     async def login(self, request: Request) -> bool:
         form = await request.form()

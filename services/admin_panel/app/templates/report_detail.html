@@ -119,7 +119,7 @@
 <section class="panel">
   <h3>Решение по жалобе</h3>
   <form method="post" action="/admin/reports/{{ report.id }}/resolve" class="stack">
-    <input type="hidden" name="csrf_token" value="{{ request.session.get('admin_csrf_token', '') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
     <label>Решение
       <select name="resolution" required>
         <option value="no_action">Без санкции</option>
